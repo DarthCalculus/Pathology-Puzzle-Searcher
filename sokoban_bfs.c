@@ -22,76 +22,78 @@ static const int8_t adj[NCELLS][4] = {
     {13, 19, -1, 17}, {14, -1, -1, 18},
 };
 
-/* ---- Per-thread solver state ----
- *
- * Uses a direct-indexed uint16_t visited array with generation counter
- * instead of the old 192 MB hash table.  The mixed-radix state encoding
- * maps each (player, blocks, hole_mask) tuple to a unique index in
- * [0, state_space).
- *
- * Memory per thread (3 blocks, 3 holes):
- *   visited: 2.83 MB   qs: 5.66 MB   qused: 5.66 MB   total: ~14 MB
- * The visited array fits in L2 cache (~3 ns access vs ~100 ns DRAM).
+/* State space size: 20 * 21^nb * 2^nh (as int64_t to detect overflow) */
+static int64_t state_space_size(int nb, int nh) {
+    int64_t s = 20;
+    for (int i = 0; i < nb; i++) s *= 21;
+    for (int i = 0; i < nh; i++) s *= 2;
+    return s;
+}
+
+/* ---- Threshold: direct indexing vs hash table ----
+ * Direct indexing is used when the state space fits comfortably in memory.
+ * 8M states = 16 MB visited array — fits well within realistic working sets.
+ * Above this, the original hash table approach is used.
  */
+#define DIRECT_LIMIT (1 << 23)   /* 8 M states */
+
+/* ========================================================================
+ * DIRECT-INDEXED SOLVER  (small state spaces, nb <= ~3)
+ *
+ * Mixed-radix encoding maps each state to a unique array index.
+ * uint16_t visited array with generation counter — fits in L2 cache
+ * for 3 blocks (~2.8 MB).  No hashing, no collisions.
+ * ======================================================================== */
+
 typedef struct {
     uint16_t *visited;  /* generation-counter visited array */
     uint32_t *qs;       /* BFS queue: packed states */
     uint32_t *qused;    /* BFS queue: used push direction bitmasks */
     uint16_t  gen;      /* current generation counter */
     int       vis_cap;  /* allocated visited array capacity */
-} SolverState;
+} DirectState;
 
-static _Thread_local SolverState *ss_tls;
+static _Thread_local DirectState *ds_tls;
 
-static SolverState *ss_get(int state_space) {
-    if (!ss_tls) {
-        ss_tls = calloc(1, sizeof(SolverState));
-        ss_tls->gen = 1;
+static DirectState *ds_get(int state_space) {
+    if (!ds_tls) {
+        ds_tls = calloc(1, sizeof(DirectState));
+        ds_tls->gen = 1;
     }
-    if (state_space > ss_tls->vis_cap) {
-        free(ss_tls->visited);
-        free(ss_tls->qs);
-        free(ss_tls->qused);
-        ss_tls->visited = calloc(state_space, sizeof(uint16_t));
-        ss_tls->qs      = malloc(state_space * sizeof(uint32_t));
-        ss_tls->qused   = malloc(state_space * sizeof(uint32_t));
-        ss_tls->vis_cap = state_space;
+    if (state_space > ds_tls->vis_cap) {
+        free(ds_tls->visited);
+        free(ds_tls->qs);
+        free(ds_tls->qused);
+        ds_tls->visited = calloc(state_space, sizeof(uint16_t));
+        ds_tls->qs      = malloc(state_space * sizeof(uint32_t));
+        ds_tls->qused   = malloc(state_space * sizeof(uint32_t));
+        ds_tls->vis_cap = state_space;
     }
-    return ss_tls;
+    return ds_tls;
 }
 
-/* Advance generation counter; full reset on 16-bit wrap. */
-static void vis_clear(SolverState *ss) {
-    if (++ss->gen == 0) {
-        memset(ss->visited, 0, ss->vis_cap * sizeof(uint16_t));
-        ss->gen = 1;
+static void ds_clear(DirectState *ds) {
+    if (++ds->gen == 0) {
+        memset(ds->visited, 0, ds->vis_cap * sizeof(uint16_t));
+        ds->gen = 1;
     }
 }
 
-/* Mark state as visited. Returns 1 if newly visited, 0 if already seen. */
-static inline int vis_mark(SolverState *ss, uint32_t state) {
-    if (ss->visited[state] == ss->gen) return 0;
-    ss->visited[state] = ss->gen;
+static inline int ds_mark(DirectState *ds, uint32_t state) {
+    if (ds->visited[state] == ds->gen) return 0;
+    ds->visited[state] = ds->gen;
     return 1;
 }
 
-/* ---- Mixed-radix state encoding ----
- *
- * state = player + 20 * (block[0] + 21 * (block[1] + 21 * (... + 21 * hole_mask)))
- *
- * Player: 0-19 (20 values), Block: 0-20 (21 values, CONSUMED=20),
- * Hole mask: 0 to 2^nh - 1.
- *
- * 3 blocks, 3 holes: 20 * 21^3 * 8 = 1,481,760 states (2.83 MB visited array).
- */
-static inline uint32_t pack(int pl, const int *bp, int nb, int hm) {
+/* Mixed-radix packing: state = player + 20*(block[0] + 21*(block[1] + ...)) */
+static inline uint32_t mr_pack(int pl, const int *bp, int nb, int hm) {
     uint32_t s = (uint32_t)hm;
     for (int i = nb - 1; i >= 0; i--)
         s = s * 21 + (uint32_t)bp[i];
     return s * 20 + (uint32_t)pl;
 }
 
-static inline void unpack(uint32_t s, int *pl, int *bp, int nb, int *hm) {
+static inline void mr_unpack(uint32_t s, int *pl, int *bp, int nb, int *hm) {
     *pl = (int)(s % 20);
     s /= 20;
     for (int i = 0; i < nb; i++) {
@@ -101,27 +103,9 @@ static inline void unpack(uint32_t s, int *pl, int *bp, int nb, int *hm) {
     *hm = (int)s;
 }
 
-/* State space size: 20 * 21^nb * 2^nh */
-static int state_space_size(int nb, int nh) {
-    int s = 20;
-    for (int i = 0; i < nb; i++) s *= 21;
-    for (int i = 0; i < nh; i++) s *= 2;
-    return s;
-}
-
-/* ---- Solver ----
- *
- * Optimisations on the hot path:
- *   (a) block_occ bitmask     — O(1) "is there a block here?" check
- *   (b) merged blocked mask   — walls | active_holes, one check per direction
- *   (c) neighbor table        — no division/modulo/bounds arithmetic
- *   (d) incremental updates   — arithmetic delta instead of full pack()
- *   (e) direct-indexed visited — no hash, no collision probing
- */
-int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
+static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
     int nb = pz->num_blocks;
     int nh = pz->num_holes;
-    int ss_size = state_space_size(nb, nh);
 
     /* Precompute strides for incremental state updates.
      * stride[i] = 20 * 21^i  (coefficient of block i in packed state)
@@ -134,20 +118,19 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
     }
     int hm_stride = (nb > 0) ? stride[nb - 1] * 21 : 20;
 
-    SolverState *ss = ss_get(ss_size);
-    vis_clear(ss);
+    DirectState *ds = ds_get(ss_size);
+    ds_clear(ds);
 
-    /* Initial state */
     int ib[MAX_BLOCKS];
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
     int ihm = (1 << nh) - 1;
 
-    uint32_t st = pack(pz->player_start, ib, nb, ihm);
-    vis_mark(ss, st);
+    uint32_t st = mr_pack(pz->player_start, ib, nb, ihm);
+    ds_mark(ds, st);
 
     int qh = 0, qt = 0, ql = 0, dist = -1;
-    ss->qs[qt] = st;
-    if (used_dirs) ss->qused[qt] = 0;
+    ds->qs[qt] = st;
+    if (used_dirs) ds->qused[qt] = 0;
     qt++;
 
     const int      exit_pos = pz->exit_pos;
@@ -155,35 +138,30 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
 
     while (qh < qt) {
         if (qh == ql) { dist++; ql = qt; }
-        uint32_t cur = ss->qs[qh];
-        uint32_t cur_used = used_dirs ? ss->qused[qh] : 0;
+        uint32_t cur = ds->qs[qh];
+        uint32_t cur_used = used_dirs ? ds->qused[qh] : 0;
         qh++;
 
-        /* Unpack current state */
         int pl, bp[MAX_BLOCKS], hm;
-        unpack(cur, &pl, bp, nb, &hm);
+        mr_unpack(cur, &pl, bp, nb, &hm);
 
-        /* (a) Block occupancy bitmask */
         uint32_t block_occ = 0;
         for (int i = 0; i < nb; i++)
             if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
 
-        /* Active-hole bitmask */
         uint32_t active_holes = 0;
         for (int h = 0; h < nh; h++)
             if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
 
-        /* (b) Merged blocked mask for player movement */
         uint32_t blocked = walls | active_holes;
 
         for (int d = 0; d < 4; d++) {
-            /* (c) Neighbor table lookup — no div/mod/bounds check */
             int np = adj[pl][d];
             if (np < 0) continue;
             if (blocked & (1u << np)) continue;
 
             if (block_occ & (1u << np)) {
-                /* Push — rare path */
+                /* Push */
                 int bi = -1;
                 for (int b = 0; b < nb; b++)
                     if (bp[b] == np) { bi = b; break; }
@@ -203,7 +181,6 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
                     return dist + 1;
                 }
 
-                /* (d) Incremental state update */
                 int delta = (np - pl);
                 int ih = 0;
                 if (active_holes & (1u << bnp)) {
@@ -218,17 +195,16 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
                 }
                 if (!ih) delta += (bnp - bp[bi]) * stride[bi];
 
-                /* (e) Direct-indexed visited check */
                 uint32_t ns = (uint32_t)((int)cur + delta);
-                if (vis_mark(ss, ns)) {
-                    ss->qs[qt] = ns;
+                if (ds_mark(ds, ns)) {
+                    ds->qs[qt] = ns;
                     if (used_dirs)
-                        ss->qused[qt] = cur_used | (1u << (bi * 4 + d));
+                        ds->qused[qt] = cur_used | (1u << (bi * 4 + d));
                     qt++;
                 }
 
             } else {
-                /* Free move — hot path */
+                /* Free move */
                 if (np == exit_pos) {
                     if (used_dirs) {
                         for (int i = 0; i < nb; i++)
@@ -237,15 +213,207 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
                     return dist + 1;
                 }
 
-                /* (d) Incremental: just swap player digit */
                 uint32_t ns = (uint32_t)((int)cur + (np - pl));
-                if (vis_mark(ss, ns)) {
-                    ss->qs[qt] = ns;
-                    if (used_dirs) ss->qused[qt] = cur_used;
+                if (ds_mark(ds, ns)) {
+                    ds->qs[qt] = ns;
+                    if (used_dirs) ds->qused[qt] = cur_used;
                     qt++;
                 }
             }
         }
     }
     return -1;
+}
+
+/* ========================================================================
+ * HASH TABLE SOLVER  (large state spaces, nb >= 4)
+ *
+ * Original 5-bit packing with splitmix64 hash + linear probing.
+ * 384 MB per thread but handles arbitrarily large state spaces.
+ * Still benefits from adj table and merged blocked mask.
+ * ======================================================================== */
+
+#define HT_SIZE  (1 << 24)          /* 16 M slots   */
+#define HT_MASK  (HT_SIZE - 1)
+#define QSZ      (1 << 24)          /* 16 M entries */
+
+typedef struct {
+    uint64_t htk   [HT_SIZE];   /* stored keys        — 128 MB */
+    uint32_t ht_gen[HT_SIZE];   /* generation stamps  —  64 MB */
+    uint32_t ht_seq;
+    uint64_t qs    [QSZ];       /* BFS queue: states  — 128 MB */
+    uint32_t qused [QSZ];       /* BFS queue: used push dirs —  64 MB */
+} HashState;
+
+static _Thread_local HashState *hs_tls;
+
+static HashState *hs_get(void) {
+    if (!hs_tls) { hs_tls = calloc(1, sizeof *hs_tls); hs_tls->ht_seq = 1; }
+    return hs_tls;
+}
+
+static void hs_clear(HashState *hs) {
+    if (++hs->ht_seq == 0) {
+        memset(hs->ht_gen, 0, sizeof(hs->ht_gen));
+        hs->ht_seq = 1;
+    }
+}
+
+static inline uint64_t h64(uint64_t x) {
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static inline int hs_mark(HashState *hs, uint64_t k) {
+    uint64_t h = h64(k) & HT_MASK;
+    for (int i = 0; i < 128; i++) {
+        uint32_t idx = (uint32_t)((h + i) & HT_MASK);
+        if (hs->ht_gen[idx] != hs->ht_seq) {
+            hs->ht_gen[idx] = hs->ht_seq; hs->htk[idx] = k; return 1;
+        }
+        if (hs->htk[idx] == k) return 0;
+    }
+    return 0;  /* table full — treat as already visited */
+}
+
+/* 5-bit packing: player[4:0] block0[9:5] block1[14:10] ... hm[last] */
+static inline uint64_t pack5(int pl, const int *bp, int nb, int hm) {
+    uint64_t s = (uint64_t)pl;
+    int sh = 5;
+    for (int i = 0; i < nb; i++) { s |= ((uint64_t)bp[i] << sh); sh += 5; }
+    s |= ((uint64_t)hm << sh);
+    return s;
+}
+
+static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
+    HashState *hs = hs_get();
+    hs_clear(hs);
+
+    int nb = pz->num_blocks;
+    int nh = pz->num_holes;
+
+    int ib[MAX_BLOCKS];
+    for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
+    int ihm = (1 << nh) - 1;
+
+    uint64_t st = pack5(pz->player_start, ib, nb, ihm);
+    hs_mark(hs, st);
+
+    int qh = 0, qt = 0, ql = 0, dist = -1;
+    hs->qs[qt] = st;
+    if (used_dirs) hs->qused[qt] = 0;
+    qt++;
+
+    const int      exit_pos = pz->exit_pos;
+    const uint32_t walls    = pz->walls;
+
+    while (qh < qt) {
+        if (qh == ql) { dist++; ql = qt; }
+        uint64_t cur = hs->qs[qh];
+        uint32_t cur_used = used_dirs ? hs->qused[qh] : 0;
+        qh++;
+
+        /* Unpack */
+        int pl = (int)(cur & 0x1F), sh = 5, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & 0x1F); sh += 5; }
+        int hm = (int)((cur >> sh) & 0x1F);
+
+        uint32_t block_occ = 0;
+        for (int i = 0; i < nb; i++)
+            if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
+
+        uint32_t active_holes = 0;
+        for (int h = 0; h < nh; h++)
+            if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
+
+        uint32_t blocked = walls | active_holes;
+
+        for (int d = 0; d < 4; d++) {
+            int np = adj[pl][d];
+            if (np < 0) continue;
+            if (blocked & (1u << np)) continue;
+
+            if (block_occ & (1u << np)) {
+                /* Push */
+                int bi = -1;
+                for (int b = 0; b < nb; b++)
+                    if (bp[b] == np) { bi = b; break; }
+                if (!(pz->block_pushable[bi] & (1 << d))) continue;
+
+                int bnp = adj[np][d];
+                if (bnp < 0) continue;
+                if (walls     & (1u << bnp)) continue;
+                if (block_occ & (1u << bnp)) continue;
+
+                if (np == exit_pos) {
+                    if (used_dirs) {
+                        uint32_t u = cur_used | (1u << (bi * 4 + d));
+                        for (int i = 0; i < nb; i++)
+                            used_dirs[i] = (u >> (i * 4)) & 0xF;
+                    }
+                    return dist + 1;
+                }
+
+                /* Build new state via in-place bit modification */
+                int new_bpos = bnp;
+                int nhm = hm;
+                if (active_holes & (1u << bnp)) {
+                    for (int h = 0; h < nh; h++) {
+                        if (pz->hole_pos[h] == bnp && (hm & (1 << h))) {
+                            new_bpos = CONSUMED;
+                            nhm &= ~(1 << h);
+                            break;
+                        }
+                    }
+                }
+                uint64_t ns = (cur & ~0x1FULL) | (uint64_t)np;
+                int bsh = 5 * (bi + 1);
+                ns = (ns & ~(0x1FULL << bsh)) | ((uint64_t)new_bpos << bsh);
+                if (nhm != hm) {
+                    int hmsh = 5 * (nb + 1);
+                    ns = (ns & ~(0x1FULL << hmsh)) | ((uint64_t)nhm << hmsh);
+                }
+
+                if (hs_mark(hs, ns)) {
+                    if (qt >= QSZ) return -2;
+                    hs->qs[qt] = ns;
+                    if (used_dirs)
+                        hs->qused[qt] = cur_used | (1u << (bi * 4 + d));
+                    qt++;
+                }
+
+            } else {
+                /* Free move */
+                if (np == exit_pos) {
+                    if (used_dirs) {
+                        for (int i = 0; i < nb; i++)
+                            used_dirs[i] = (cur_used >> (i * 4)) & 0xF;
+                    }
+                    return dist + 1;
+                }
+
+                uint64_t ns = (cur & ~0x1FULL) | (uint64_t)np;
+                if (hs_mark(hs, ns)) {
+                    if (qt >= QSZ) return -2;
+                    hs->qs[qt] = ns;
+                    if (used_dirs) hs->qused[qt] = cur_used;
+                    qt++;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* ========================================================================
+ * DISPATCHER
+ * ======================================================================== */
+
+int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
+    int64_t ss = state_space_size(pz->num_blocks, pz->num_holes);
+    if (ss <= DIRECT_LIMIT)
+        return solve_direct(pz, used_dirs, (int)ss);
+    else
+        return solve_hash(pz, used_dirs);
 }
