@@ -36,7 +36,7 @@
 #include <pthread.h>
 #include <time.h>
 
-#define NUM_THREADS 6   /* worker threads; can be raised independently of exit count */
+#define NUM_THREADS 14  /* worker threads; can be raised independently of exit count */
 
 /*
  * Six canonical exit positions — the D4 fundamental domain for a 5×5 grid.
@@ -681,9 +681,11 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 if (comp_id[vi] == vi) comp_ga[vi].count = 0;
 
             /* proc_K[vi] = best solution distance found for valid start vi.
-             * -1 means unsolvable (no bitmask yielded a solution). */
+             * -1 means unsolvable (no bitmask yielded a solution).
+             * INT_MIN means this start was skipped (not yet processed).
+             * Indexed by vi (valid start index) to stay aligned with vwalk[]. */
             int proc_K[NCELLS];
-            int n_proc = 0;
+            for (int vi = 0; vi < n_valid; vi++) proc_K[vi] = INT_MIN;
 
             /* --- Enumerate player starting positions --- */
             for (int vi = 0; vi < n_valid; vi++) {
@@ -693,10 +695,13 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                  * player start ps0 with result K0 gives K0 + walk(ps0→ps)
                  * ≤ g_best, then no bitmask can yield a better result from
                  * ps (since from ps you can walk to ps0 in walk(ps0→ps)
-                 * steps and follow ps0's solution). Skip ps in that case. */
+                 * steps and follow ps0's solution). Skip ps in that case.
+                 * proc_K and vwalk are both indexed by vi so skipped starts
+                 * (proc_K[pv]==INT_MIN) are excluded without index drift. */
                 int bound = INT_MAX;
-                for (int pv = 0; pv < n_proc; pv++) {
-                    if (proc_K[pv] < 0) continue;   /* unsolvable: no bound */
+                for (int pv = 0; pv < vi; pv++) {
+                    if (proc_K[pv] == INT_MIN) continue; /* skipped: no result */
+                    if (proc_K[pv] < 0) continue;        /* unsolvable: no bound */
                     int8_t d = vwalk[pv][ps];
                     if (d < 0) continue;             /* ps unreachable from pv */
                     int b = proc_K[pv] + (int)d;
@@ -728,7 +733,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 uint32_t imm_blocked = occ & ~(1u << ep);
                 int d0 = fast_reachable(imm_blocked, ps, ep);
                 if (d0 > g_best) update_best(d0, &pz);
-                if (d0 >= 0) { proc_K[n_proc++] = d0; continue; }
+                if (d0 >= 0) { proc_K[vi] = d0; continue; }
 
                 /* All-immovable unsolvable: full bitmask search.
                  * try_bitmasks starts top-down (max valid first).
@@ -741,7 +746,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 uint8_t unsolv0[MAX_UNSOLV]; int n0 = 0;
                 int k_bitmask = try_bitmasks(&pz, 0, unsolv0, &n0,
                                              &comp_ga[comp_id[vi]], &ks);
-                proc_K[n_proc++] = k_bitmask;
+                proc_K[vi] = k_bitmask;
             }
         } while (comb_next(&wsc));
     } while (comb_next(&bc));
