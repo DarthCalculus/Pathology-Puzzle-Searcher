@@ -411,13 +411,194 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
 }
 
 /* ========================================================================
+ * WIDE HASH TABLE SOLVER  (5 + 5*nb + nh > 64 bits)
+ *
+ * Uses __uint128_t for state keys and used-direction bitmask.
+ * Smaller table (4 M slots) — crowded boards have tiny reachable spaces.
+ * 208 MB per thread, allocated on first use.
+ * ======================================================================== */
+
+#define HT128_SIZE  (1 << 22)
+#define HT128_MASK  (HT128_SIZE - 1)
+#define QSZ128      (1 << 22)
+
+typedef struct {
+    __uint128_t htk   [HT128_SIZE];   /* stored keys       —  64 MB */
+    uint32_t    ht_gen[HT128_SIZE];   /* generation stamps —  16 MB */
+    uint32_t    ht_seq;
+    __uint128_t qs    [QSZ128];       /* BFS queue: states —  64 MB */
+    __uint128_t qused [QSZ128];       /* BFS queue: dirs   —  64 MB */
+} HashState128;
+
+static _Thread_local HashState128 *hs128_tls;
+
+static HashState128 *hs128_get(void) {
+    if (!hs128_tls) { hs128_tls = calloc(1, sizeof *hs128_tls); hs128_tls->ht_seq = 1; }
+    return hs128_tls;
+}
+
+static void hs128_clear(HashState128 *hs) {
+    if (++hs->ht_seq == 0) {
+        memset(hs->ht_gen, 0, sizeof(hs->ht_gen));
+        hs->ht_seq = 1;
+    }
+}
+
+static inline uint64_t h128(__uint128_t x) {
+    return h64((uint64_t)x ^ (uint64_t)(x >> 64));
+}
+
+static inline int hs128_mark(HashState128 *hs, __uint128_t k) {
+    uint64_t h = h128(k) & HT128_MASK;
+    for (int i = 0; i < 128; i++) {
+        uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
+        if (hs->ht_gen[idx] != hs->ht_seq) {
+            hs->ht_gen[idx] = hs->ht_seq; hs->htk[idx] = k; return 1;
+        }
+        if (hs->htk[idx] == k) return 0;
+    }
+    return 0;
+}
+
+static inline __uint128_t pack128(int pl, const int *bp, int nb, int hm) {
+    __uint128_t s = (__uint128_t)pl;
+    int sh = 5;
+    for (int i = 0; i < nb; i++) { s |= ((__uint128_t)bp[i] << sh); sh += 5; }
+    s |= ((__uint128_t)hm << sh);
+    return s;
+}
+
+static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
+    HashState128 *hs = hs128_get();
+    hs128_clear(hs);
+
+    int nb = pz->num_blocks;
+    int nh = pz->num_holes;
+
+    int ib[MAX_BLOCKS];
+    for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
+    int ihm = (1 << nh) - 1;
+
+    __uint128_t st = pack128(pz->player_start, ib, nb, ihm);
+    hs128_mark(hs, st);
+
+    int qh = 0, qt = 0, ql = 0, dist = -1;
+    hs->qs[qt] = st;
+    if (used_dirs) hs->qused[qt] = 0;
+    qt++;
+
+    const int      exit_pos = pz->exit_pos;
+    const uint32_t walls    = pz->walls;
+
+    while (qh < qt) {
+        if (qh == ql) { dist++; ql = qt; }
+        __uint128_t cur      = hs->qs[qh];
+        __uint128_t cur_used = used_dirs ? hs->qused[qh] : 0;
+        qh++;
+
+        /* Unpack */
+        int pl = (int)(cur & 0x1F), sh = 5, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & 0x1F); sh += 5; }
+        int hm = (int)(cur >> sh);   /* hm at the top — no mask needed */
+
+        uint32_t block_occ = 0;
+        for (int i = 0; i < nb; i++)
+            if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
+
+        uint32_t active_holes = 0;
+        for (int h = 0; h < nh; h++)
+            if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
+
+        uint32_t blocked = walls | active_holes;
+
+        for (int d = 0; d < 4; d++) {
+            int np = adj[pl][d];
+            if (np < 0) continue;
+            if (blocked & (1u << np)) continue;
+
+            if (block_occ & (1u << np)) {
+                /* Push */
+                int bi = -1;
+                for (int b = 0; b < nb; b++)
+                    if (bp[b] == np) { bi = b; break; }
+                if (!(pz->block_pushable[bi] & (1 << d))) continue;
+
+                int bnp = adj[np][d];
+                if (bnp < 0) continue;
+                if (walls     & (1u << bnp)) continue;
+                if (block_occ & (1u << bnp)) continue;
+
+                if (np == exit_pos) {
+                    if (used_dirs) {
+                        __uint128_t u = cur_used | ((__uint128_t)1 << (bi * 4 + d));
+                        for (int i = 0; i < nb; i++)
+                            used_dirs[i] = (uint8_t)((u >> (i * 4)) & 0xF);
+                    }
+                    return dist + 1;
+                }
+
+                /* Build new state via in-place bit modification */
+                int new_bpos = bnp;
+                int nhm = hm;
+                if (active_holes & (1u << bnp)) {
+                    for (int h = 0; h < nh; h++) {
+                        if (pz->hole_pos[h] == bnp && (hm & (1 << h))) {
+                            new_bpos = CONSUMED;
+                            nhm &= ~(1 << h);
+                            break;
+                        }
+                    }
+                }
+                __uint128_t ns = (cur & ~(__uint128_t)0x1F) | (__uint128_t)np;
+                int bsh = 5 * (bi + 1);
+                ns = (ns & ~((__uint128_t)0x1F << bsh)) | ((__uint128_t)new_bpos << bsh);
+                if (nhm != hm) {
+                    int hmsh = 5 * (nb + 1);
+                    __uint128_t hm_mask = ((__uint128_t)((1 << nh) - 1)) << hmsh;
+                    ns = (ns & ~hm_mask) | ((__uint128_t)nhm << hmsh);
+                }
+
+                if (hs128_mark(hs, ns)) {
+                    if (qt >= QSZ128) return -2;
+                    hs->qs[qt] = ns;
+                    if (used_dirs)
+                        hs->qused[qt] = cur_used | ((__uint128_t)1 << (bi * 4 + d));
+                    qt++;
+                }
+
+            } else {
+                /* Free move */
+                if (np == exit_pos) {
+                    if (used_dirs) {
+                        for (int i = 0; i < nb; i++)
+                            used_dirs[i] = (uint8_t)((cur_used >> (i * 4)) & 0xF);
+                    }
+                    return dist + 1;
+                }
+
+                __uint128_t ns = (cur & ~(__uint128_t)0x1F) | (__uint128_t)np;
+                if (hs128_mark(hs, ns)) {
+                    if (qt >= QSZ128) return -2;
+                    hs->qs[qt] = ns;
+                    if (used_dirs) hs->qused[qt] = cur_used;
+                    qt++;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* ========================================================================
  * DISPATCHER
  * ======================================================================== */
 
 int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
-    int64_t ss = state_space_size(pz->num_blocks, pz->num_holes);
+    int nb = pz->num_blocks, nh = pz->num_holes;
+    if (5 + 5 * nb + nh > 64)
+        return solve_hash128(pz, used_dirs);
+    int64_t ss = state_space_size(nb, nh);
     if (ss <= DIRECT_LIMIT)
         return solve_direct(pz, used_dirs, (int)ss);
-    else
-        return solve_hash(pz, used_dirs);
+    return solve_hash(pz, used_dirs);
 }

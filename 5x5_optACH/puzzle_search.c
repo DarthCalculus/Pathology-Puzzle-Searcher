@@ -36,7 +36,7 @@
 #include <pthread.h>
 #include <time.h>
 
-#define NUM_THREADS 14  /* worker threads; can be raised independently of exit count */
+#define NUM_THREADS 6   /* worker threads; can be raised independently of exit count */
 
 /*
  * Six canonical exit positions — the D4 fundamental domain for a 5×5 grid.
@@ -466,8 +466,95 @@ static void ga_add(GlobalAntichain *ga, const uint8_t *masks, int nb) {
     }
 }
 
+/*
+ * Computes per-block maximum pushable masks, tightened beyond valid_push_mask
+ * to account for frozen-block patterns and propagation.
+ *
+ * Three dead-block patterns are detected:
+ *   1. Corners: valid_push_mask already returns 0 for these.
+ *   2. Two adjacent movable blocks on the same edge row/column: each blocks
+ *      the other's landing cell and push-from cell for all remaining push
+ *      directions, so both are permanently immovable.
+ *   3. Four movable blocks forming a 2x2 square: each has its two remaining
+ *      landing cells and push-from cells occupied by the others.
+ *
+ * After detecting these patterns, the frozen set propagates: any movable
+ * block whose landing cell or push-from cell for direction d is occupied by
+ * a frozen block loses direction d, and may itself become frozen.
+ */
+static void compute_geo_masks(const int *mbp, int nb_mov, uint32_t wall_mask,
+                               uint8_t *geo_mask)
+{
+    for (int i = 0; i < nb_mov; i++)
+        geo_mask[i] = valid_push_mask(mbp[i]);
+
+    uint32_t mob_occ = 0;
+    for (int i = 0; i < nb_mov; i++) mob_occ |= (1u << mbp[i]);
+
+    /* frozen: cells permanently occupied (walls + frozen movable blocks) */
+    uint32_t frozen = wall_mask;
+
+    /* Pattern 1: corners (geo_mask already 0 from valid_push_mask) */
+    for (int i = 0; i < nb_mov; i++)
+        if (geo_mask[i] == 0) frozen |= (1u << mbp[i]);
+
+    /* Pattern 2: two adjacent movable blocks on the same edge */
+    for (int i = 0; i < nb_mov; i++) {
+        if (geo_mask[i] == 0) continue;
+        int r = mbp[i] / COLS, c = mbp[i] % COLS;
+        if ((r == 0 || r == ROWS-1) &&
+            ((c > 0      && (mob_occ & (1u << pos(r, c-1)))) ||
+             (c < COLS-1 && (mob_occ & (1u << pos(r, c+1)))))) {
+            geo_mask[i] = 0; frozen |= (1u << mbp[i]); continue;
+        }
+        if ((c == 0 || c == COLS-1) &&
+            ((r > 0      && (mob_occ & (1u << pos(r-1, c)))) ||
+             (r < ROWS-1 && (mob_occ & (1u << pos(r+1, c)))))) {
+            geo_mask[i] = 0; frozen |= (1u << mbp[i]);
+        }
+    }
+
+    /* Pattern 3: 2x2 squares of movable blocks */
+    for (int r = 0; r < ROWS-1; r++) {
+        for (int c = 0; c < COLS-1; c++) {
+            if (!((mob_occ >> pos(r,   c  )) & 1)) continue;
+            if (!((mob_occ >> pos(r,   c+1)) & 1)) continue;
+            if (!((mob_occ >> pos(r+1, c  )) & 1)) continue;
+            if (!((mob_occ >> pos(r+1, c+1)) & 1)) continue;
+            int ps[4] = { pos(r,c), pos(r,c+1), pos(r+1,c), pos(r+1,c+1) };
+            for (int i = 0; i < nb_mov; i++)
+                for (int k = 0; k < 4; k++)
+                    if (mbp[i] == ps[k])
+                        { geo_mask[i] = 0; frozen |= (1u << mbp[i]); }
+        }
+    }
+
+    /* Propagate: a block is frozen only when ALL its remaining directions are
+     * blocked by frozen neighbours.  Partial restrictions are not applied —
+     * the pushable mask is global, and a direction blocked from the initial
+     * position may become reachable once the block moves elsewhere. */
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < nb_mov; i++) {
+            if (geo_mask[i] == 0) continue;
+            int p = mbp[i];
+            uint8_t rem = geo_mask[i];
+            for (int d = 0; d < 4; d++) {
+                if (!(rem & (1u << d))) continue;
+                int lnd = adj[p][d], pfr = adj[p][d^2];
+                if ((lnd >= 0 && (frozen & (1u << lnd))) ||
+                    (pfr >= 0 && (frozen & (1u << pfr))))
+                    rem &= ~(1u << d);
+            }
+            if (rem == 0) { geo_mask[i] = 0; frozen |= (1u << p); changed = 1; }
+        }
+    }
+}
+
 static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
-                        GlobalAntichain *ga, KnownSolvable *ks) {
+                        GlobalAntichain *ga, KnownSolvable *ks,
+                        const uint8_t *geo_mask) {
     if (bi == pz->num_blocks) {
         if (ga_dominated(ga, pz->block_pushable, pz->num_blocks)) return -1;
         int nb = pz->num_blocks;
@@ -507,6 +594,7 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
 
     int            nm   = cell_nmasks[pz->block_pos[bi]];
     const uint8_t *ms   = cell_masks [pz->block_pos[bi]];
+    uint8_t        cap  = geo_mask[bi];   /* tighter ceiling from freeze analysis */
     int            best = -1;
 
     /* XC table indexed by thresh (4-bit mask, 0-15).
@@ -521,6 +609,7 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
 
     for (int mi = 0; mi < nm; mi++) {
         uint8_t m = ms[mi];
+        if (m & ~cap) continue;              /* m exceeds geo_mask ceiling */
 
         /* Skip if m is dominated by the current level's unsolvable antichain */
         int skip = 0;
@@ -544,7 +633,7 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
         int nb_seed = nb;
 
         pz->block_pushable[bi] = m;
-        int d = try_bitmasks(pz, bi + 1, b_unsolv, &nb, ga, ks);
+        int d = try_bitmasks(pz, bi + 1, b_unsolv, &nb, ga, ks, geo_mask);
 
         /* Record newly discovered unsolvable masks under thresh=m */
         for (int j = nb_seed; j < nb; j++)
@@ -676,6 +765,10 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 else            mbp[nb_mov++] = bp[i];
             }
 
+            /* Tighter per-block push ceilings: corners + edge-pairs + 2x2 freeze. */
+            uint8_t geo_mask[MAX_BLOCKS];
+            compute_geo_masks(mbp, nb_mov, wall_mask, geo_mask);
+
             /* Reset component antichains for this wall subset. */
             for (int vi = 0; vi < n_valid; vi++)
                 if (comp_id[vi] == vi) comp_ga[vi].count = 0;
@@ -745,7 +838,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 KnownSolvable   ks; ks.count = 0;
                 uint8_t unsolv0[MAX_UNSOLV]; int n0 = 0;
                 int k_bitmask = try_bitmasks(&pz, 0, unsolv0, &n0,
-                                             &comp_ga[comp_id[vi]], &ks);
+                                             &comp_ga[comp_id[vi]], &ks, geo_mask);
                 proc_K[vi] = k_bitmask;
             }
         } while (comb_next(&wsc));
@@ -834,7 +927,9 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
      * ensures g_best is as high as possible before large nh items begin,
      * maximising the walk-distance pruning (Approach C) on those items. */
     int nh_lo = (only_nh >= 0) ? only_nh : 0;
-    int nh_hi = (only_nh >= 0) ? only_nh : total;
+    int max_nh = total - nw;
+    if (max_nh > NCELLS - 2 - total) max_nh = NCELLS - 2 - total;  /* 23 - total */
+    int nh_hi = (only_nh >= 0) ? only_nh : max_nh;
     int ei_lo = (only_ei >= 0) ? only_ei : 0;
     int ei_hi = (only_ei >= 0) ? only_ei : NUM_EXIT_CELLS - 1;
 
@@ -949,8 +1044,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--nholes") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --nholes requires a value\n"); return 1; }
             only_nh = atoi(argv[i]);
-            if (only_nh < 0 || only_nh > MAX_HOLES) {
-                fprintf(stderr, "error: --nholes must be between 0 and %d\n", MAX_HOLES);
+            if (only_nh < 0) {
+                fprintf(stderr, "error: --nholes must be non-negative\n");
                 return 1;
             }
         } else if (strcmp(argv[i], "--exitloc") == 0) {
@@ -981,6 +1076,11 @@ int main(int argc, char **argv) {
 
     if (nw > total) {
         fprintf(stderr, "error: --nwalls (%d) cannot exceed num_blocks (%d)\n", nw, total);
+        return 1;
+    }
+    if (only_nh >= 0 && only_nh > NCELLS - 2 - total) {
+        fprintf(stderr, "error: --nholes (%d) cannot exceed 23 - num_blocks (%d)\n",
+                only_nh, NCELLS - 2 - total);
         return 1;
     }
 
