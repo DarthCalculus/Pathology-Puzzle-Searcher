@@ -255,6 +255,9 @@ static int fast_reachable(uint32_t blocked, int start, int target) {
 static int    g_best   = -1;
 static Puzzle g_best_pz;
 
+static int    g_skipped    = 0;
+static Puzzle g_skipped_pz;
+
 static pthread_mutex_t g_best_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void print_block_info(int i, uint8_t m) {
@@ -292,6 +295,13 @@ static void print_puzzle(const Puzzle *pz) {
     }
     printf("  exit=%d  player_start=%d  walls=%05x\n",
            pz->exit_pos, pz->player_start, pz->walls);
+}
+
+static void record_skip(const Puzzle *pz) {
+    pthread_mutex_lock(&g_best_mutex);
+    if (g_skipped == 0) g_skipped_pz = *pz;
+    g_skipped++;
+    pthread_mutex_unlock(&g_best_mutex);
 }
 
 static void update_best(int d, const Puzzle *pz) {
@@ -576,9 +586,8 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
         uint8_t used[MAX_BLOCKS] = {0};
         int d = sokoban_solve(pz, used);
         if (d == -2) {
-            fprintf(stderr, "fatal: BFS queue overflow (out of memory) — "
-                    "search results are incomplete. Increase QSZ in sokoban_bfs.c.\n");
-            exit(1);
+            record_skip(pz);
+            return -2;
         }
         if (d > g_best) update_best(d, pz);
         if (d >= 0 && ks->count < MAX_KS) {
@@ -596,6 +605,7 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
     const uint8_t *ms   = cell_masks [pz->block_pos[bi]];
     uint8_t        cap  = geo_mask[bi];   /* tighter ceiling from freeze analysis */
     int            best = -1;
+    int            had_skip = 0;
 
     /* XC table indexed by thresh (4-bit mask, 0-15).
      * xc_masks[t] holds unsolvable masks for block bi+1 when block bi = t.
@@ -639,10 +649,11 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
         for (int j = nb_seed; j < nb; j++)
             if (xc_cnt[m] < 16) xc_masks[m][xc_cnt[m]++] = b_unsolv[j];
 
-        if (d < 0) unsolv[(*pn)++] = m;
+        if (d == -1) unsolv[(*pn)++] = m;
+        if (d == -2) had_skip = 1;
         if (d > best) best = d;
     }
-    return best;
+    return (best == -1 && had_skip) ? -2 : best;
 }
 
 /* -------------------------------------------------------------------------
@@ -1016,6 +1027,11 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
 
     printf("\n=== Search complete ===\n");
     print_time_calls(elapsed_s(t0, t1), total_ncalls);
+    if (g_skipped > 0) {
+        printf("Skipped: %d puzzles (heap overflow — state space too large)\n", g_skipped);
+        printf("Example skipped puzzle:\n");
+        print_puzzle(&g_skipped_pz);
+    }
     if (g_best >= 0) {
         printf("Best solution: %d moves\n", g_best);
         print_puzzle(&g_best_pz);
