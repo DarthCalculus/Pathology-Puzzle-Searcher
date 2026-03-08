@@ -35,8 +35,10 @@
 #include <limits.h>
 #include <pthread.h>
 #include <time.h>
+#include <stdatomic.h>
 
-#define NUM_THREADS 6   /* worker threads; can be raised independently of exit count */
+#define NUM_THREADS 14   /* default worker threads; overridden at runtime by --nthreads */
+static int g_num_threads = NUM_THREADS;
 
 /*
  * Six canonical exit positions — the D4 fundamental domain for a 5×5 grid.
@@ -258,7 +260,9 @@ static Puzzle g_best_pz;
 static int    g_skipped    = 0;
 static Puzzle g_skipped_pz;
 
-static pthread_mutex_t g_best_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_best_mutex  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_print_mutex = PTHREAD_MUTEX_INITIALIZER;
+static char            g_last_progress[256] = "";
 
 static void print_block_info(int i, uint8_t m) {
     printf("block %c push=%x [%s%s%s%s]", 'A'+i, m,
@@ -310,9 +314,19 @@ static void update_best(int d, const Puzzle *pz) {
     if (d > g_best) {
         g_best    = d;
         g_best_pz = *pz;
+        pthread_mutex_lock(&g_print_mutex);
+        if (g_last_progress[0]) {       /* erase progress bar if visible */
+            fprintf(stderr, "\r%80s\r", "");
+            fflush(stderr);
+        }
         printf("New best: %d moves\n", d);
         print_puzzle(pz);
         fflush(stdout);
+        if (g_last_progress[0]) {       /* reprint progress bar */
+            fprintf(stderr, "%s", g_last_progress);
+            fflush(stderr);
+        }
+        pthread_mutex_unlock(&g_print_mutex);
     }
     pthread_mutex_unlock(&g_best_mutex);
 }
@@ -878,7 +892,7 @@ static void print_time_calls(double elapsed, long long ncalls) {
  * expensive large-nh work starts, maximising walk-distance pruning.
  * ------------------------------------------------------------------------- */
 
-typedef struct { int ei, nh; int hp[MAX_HOLES]; } WorkItem;
+typedef struct { int ei, nh; int hp[MAX_HOLES]; int bp[MAX_BLOCKS]; } WorkItem;
 
 static WorkItem       *g_wq       = NULL;
 static int             g_wq_cap   = 0;
@@ -886,11 +900,109 @@ static int             g_wq_count = 0;
 static int             g_wq_next  = 0;
 static pthread_mutex_t g_wq_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static _Atomic int     g_items_done    = 0;
+static int             g_items_total   = 0;
+static _Atomic int     g_progress_stop = 0;
+
 typedef struct {
     int        total;
     int        nw;
     long long  ncalls;
 } ThreadArg;
+
+/* -------------------------------------------------------------------------
+ * Per-(exit, block-combo) work item — nh=0 case only.
+ *
+ * Equivalent to the inner block-combo iteration of process_hole_config with
+ * nh=0 and holes_mask=0, but called directly so that each canonical block
+ * combo is a separate work-queue item and can run on its own thread.
+ * This gives C(pool,total)/symmetry items instead of just 1–6 for nh=0,
+ * keeping all threads busy even when --exitloc and --nholes 0 are both set.
+ * ------------------------------------------------------------------------- */
+static void process_block_combo(int ei, int nw, const int *bp, int total) {
+    int ep = EXIT_CELLS[ei];
+
+    uint32_t occ = (1u << ep);
+    for (int i = 0; i < total; i++) occ |= (1u << bp[i]);
+
+    uint32_t walk_blocked = occ & ~(1u << ep);
+    int8_t  vwalk[NCELLS][NCELLS];
+    int     vpi  [NCELLS];
+    int     n_valid = 0;
+    for (int cell = 0; cell < NCELLS; cell++) {
+        if (occ & (1u << cell)) continue;
+        vpi[n_valid] = cell;
+        walk_all_distances(walk_blocked, cell, vwalk[n_valid]);
+        n_valid++;
+    }
+
+    int comp_id[NCELLS];
+    for (int vi = 0; vi < n_valid; vi++) {
+        comp_id[vi] = vi;
+        for (int vj = 0; vj < vi; vj++) {
+            if (vwalk[vj][vpi[vi]] >= 0) { comp_id[vi] = comp_id[vj]; break; }
+        }
+    }
+    GlobalAntichain comp_ga[NCELLS];
+
+    Comb wsc; comb_init(&wsc, total, nw);
+    do {
+        int is_wall[MAX_BLOCKS] = {0};
+        for (int j = 0; j < nw; j++) is_wall[wsc.idx[j]] = 1;
+        uint32_t wall_mask = 0;
+        int mbp[MAX_BLOCKS], nb_mov = 0;
+        for (int i = 0; i < total; i++) {
+            if (is_wall[i]) wall_mask |= (1u << bp[i]);
+            else            mbp[nb_mov++] = bp[i];
+        }
+
+        uint8_t geo_mask[MAX_BLOCKS];
+        compute_geo_masks(mbp, nb_mov, wall_mask, geo_mask);
+
+        for (int vi = 0; vi < n_valid; vi++)
+            if (comp_id[vi] == vi) comp_ga[vi].count = 0;
+
+        int proc_K[NCELLS];
+        for (int vi = 0; vi < n_valid; vi++) proc_K[vi] = INT_MIN;
+
+        for (int vi = 0; vi < n_valid; vi++) {
+            int ps = vpi[vi];
+
+            int bound = INT_MAX;
+            for (int pv = 0; pv < vi; pv++) {
+                if (proc_K[pv] == INT_MIN) continue;
+                if (proc_K[pv] < 0) continue;
+                int8_t d = vwalk[pv][ps];
+                if (d < 0) continue;
+                int b = proc_K[pv] + (int)d;
+                if (b < bound) bound = b;
+            }
+            if (bound <= g_best) continue;
+
+            Puzzle pz;
+            memset(&pz, 0, sizeof pz);
+            pz.exit_pos     = ep;
+            pz.player_start = ps;
+            pz.walls        = wall_mask;
+            pz.num_blocks   = nb_mov;
+            pz.num_holes    = 0;
+            for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
+
+            for (int i = 0; i < nb_mov; i++) pz.block_pushable[i] = 0;
+            tl_ncalls++;
+            uint32_t imm_blocked = occ & ~(1u << ep);
+            int d0 = fast_reachable(imm_blocked, ps, ep);
+            if (d0 > g_best) update_best(d0, &pz);
+            if (d0 >= 0) { proc_K[vi] = d0; continue; }
+
+            KnownSolvable   ks; ks.count = 0;
+            uint8_t unsolv0[MAX_UNSOLV]; int n0 = 0;
+            int k_bitmask = try_bitmasks(&pz, 0, unsolv0, &n0,
+                                         &comp_ga[comp_id[vi]], &ks, geo_mask);
+            proc_K[vi] = k_bitmask;
+        }
+    } while (comb_next(&wsc));
+}
 
 static void *worker_thread(void *arg) {
     ThreadArg *a = (ThreadArg *)arg;
@@ -904,10 +1016,68 @@ static void *worker_thread(void *arg) {
         WorkItem item = g_wq[g_wq_next++];
         pthread_mutex_unlock(&g_wq_mutex);
 
-        process_hole_config(item.ei, a->nw, item.nh, item.hp, a->total);
+        if (item.nh == 0)
+            process_block_combo(item.ei, a->nw, item.bp, a->total);
+        else
+            process_hole_config(item.ei, a->nw, item.nh, item.hp, a->total);
+        atomic_fetch_add(&g_items_done, 1);
     }
 
     a->ncalls = tl_ncalls;
+    return NULL;
+}
+
+/* -------------------------------------------------------------------------
+ * Progress bar thread: wakes every 10 s, prints % + ETA to stderr,
+ * overwriting the previous line with \r.
+ * ------------------------------------------------------------------------- */
+typedef struct { struct timespec t0; int nh; } ProgressArg;
+
+static void fmt_time(char *buf, int sz, int secs) {
+    if (secs < 3600) snprintf(buf, sz, "%d:%02d",   secs / 60,   secs % 60);
+    else             snprintf(buf, sz, "%dh%02dm", secs / 3600, (secs % 3600) / 60);
+}
+
+static void *progress_thread_func(void *arg) {
+    ProgressArg *pa = (ProgressArg *)arg;
+    int ticks = 0;
+    while (!atomic_load(&g_progress_stop)) {
+        struct timespec req = {1, 0};
+        nanosleep(&req, NULL);
+        if (++ticks % 10 != 0) continue;
+
+        int done  = atomic_load(&g_items_done);
+        int total = g_items_total;
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = elapsed_s(pa->t0, now);
+
+        double pct = total > 0 ? 100.0 * done / total : 0.0;
+
+        char elap_buf[32], eta_buf[32];
+        fmt_time(elap_buf, sizeof(elap_buf), (int)elapsed);
+        if (done > 0 && done < total)
+            fmt_time(eta_buf, sizeof(eta_buf), (int)(elapsed / done * (total - done)));
+        else
+            snprintf(eta_buf, sizeof(eta_buf), done >= total ? "done" : "---");
+
+        snprintf(g_last_progress, sizeof(g_last_progress),
+                 "\r  [nh=%d] %d/%d  %.1f%%  elapsed %s  ETA %s       ",
+                 pa->nh, done, total, pct, elap_buf, eta_buf);
+        pthread_mutex_lock(&g_print_mutex);
+        fprintf(stderr, "%s", g_last_progress);
+        fflush(stderr);
+        pthread_mutex_unlock(&g_print_mutex);
+    }
+    /* Clear the progress line when done (only if we printed one) */
+    pthread_mutex_lock(&g_print_mutex);
+    if (g_last_progress[0]) {
+        g_last_progress[0] = '\0';
+        fprintf(stderr, "\r%80s\r", "");
+        fflush(stderr);
+    }
+    pthread_mutex_unlock(&g_print_mutex);
     return NULL;
 }
 
@@ -925,13 +1095,13 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
     }
     precompute_tables();
     printf("Searching: blocks = %d,  walls = %d,  grid = %d×%d,  threads = %d\n\n",
-           total, nw, ROWS, COLS, NUM_THREADS);
+           total, nw, ROWS, COLS, g_num_threads);
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    pthread_t threads[NUM_THREADS];
-    ThreadArg args[NUM_THREADS];
+    pthread_t threads[g_num_threads];
+    ThreadArg args[g_num_threads];
     long long total_ncalls = 0;
 
     /* Process hole counts one level at a time.  Building the queue per-level
@@ -952,33 +1122,75 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
         g_wq_count = 0;
         g_wq_next  = 0;
 
-        for (int ei = ei_lo; ei <= ei_hi; ei++) {
-            int ep = EXIT_CELLS[ei];
+        if (nh == 0) {
+            /* Fine-grained parallelism: one work item per canonical block combo.
+             * With nh=0 the old (exit, hole-config) granularity yields at most 6
+             * items (one per exit), starving threads when --exitloc is set.
+             * Enumerating block combos here gives C(pool,total)/~symmetry items,
+             * keeping all threads busy regardless of --exitloc or --nholes 0. */
+            for (int ei = ei_lo; ei <= ei_hi; ei++) {
+                int ep = EXIT_CELLS[ei];
 
-            int hpool[NCELLS], nhpool = 0;
-            for (int c = 0; c < NCELLS; c++)
-                if (c != ep) hpool[nhpool++] = c;
-            if (nh > nhpool) continue;
+                int bpool[NCELLS], nbpool = 0;
+                for (int c = 0; c < NCELLS; c++)
+                    if (c != ep) bpool[nbpool++] = c;
+                if (total > nbpool) continue;
 
-            Comb hc;
-            comb_init(&hc, nhpool, nh);
-            do {
-                int hp[MAX_HOLES];
-                for (int i = 0; i < nh; i++) hp[i] = hpool[hc.idx[i]];
+                /* Block canonicality transforms: nh=0 means the full exit
+                 * stabilizer applies (no holes to restrict it). */
+                const int8_t *bt[7]; int nbt = 0;
+                switch (ei) {
+                case 0: case 3: bt[nbt++] = t_flip_d; break;
+                case 2: case 4: bt[nbt++] = t_flip_h; break;
+                case 5:
+                    bt[nbt++] = t_rot90;  bt[nbt++] = t_rot180; bt[nbt++] = t_rot270;
+                    bt[nbt++] = t_flip_h; bt[nbt++] = t_flip_v;
+                    bt[nbt++] = t_flip_d; bt[nbt++] = t_flip_a;
+                    break;
+                default: break; /* ei=1: trivial */
+                }
 
-                /*
-                 * Hole canonicality check: keep only the lex-min hole combo
-                 * under the stabilizer of this exit cell.  hpool is built in
-                 * ascending order so hc produces sorted combos — satisfying
-                 * holes_lex_min_under's precondition.
-                 *
-                 * Stabilizer per exit index:
-                 *   ei=0,3  — flip_d
-                 *   ei=2,4  — flip_h
-                 *   ei=1    — trivial (no check)
-                 *   ei=5    — full D4 (7 non-identity elements)
-                 */
-                if (nh > 0) {
+                Comb bc; comb_init(&bc, nbpool, total);
+                do {
+                    int bp[MAX_BLOCKS];
+                    for (int i = 0; i < total; i++) bp[i] = bpool[bc.idx[i]];
+
+                    int skip = 0;
+                    for (int si = 0; si < nbt && !skip; si++)
+                        if (!holes_lex_min_under(bp, total, bt[si])) skip = 1;
+                    if (skip) continue;
+
+                    if (g_wq_count >= g_wq_cap) {
+                        g_wq_cap = g_wq_cap ? g_wq_cap * 2 : 65536;
+                        g_wq = realloc(g_wq, (size_t)g_wq_cap * sizeof(WorkItem));
+                        if (!g_wq) { perror("realloc g_wq"); exit(1); }
+                    }
+                    g_wq[g_wq_count].ei = ei;
+                    g_wq[g_wq_count].nh = 0;
+                    memcpy(g_wq[g_wq_count].bp, bp, total * sizeof(int));
+                    g_wq_count++;
+                } while (comb_next(&bc));
+            }
+        } else {
+            /* Coarse-grained path (nh>0): one item per canonical (exit, hole-config). */
+            for (int ei = ei_lo; ei <= ei_hi; ei++) {
+                int ep = EXIT_CELLS[ei];
+
+                int hpool[NCELLS], nhpool = 0;
+                for (int c = 0; c < NCELLS; c++)
+                    if (c != ep) hpool[nhpool++] = c;
+                if (nh > nhpool) continue;
+
+                Comb hc;
+                comb_init(&hc, nhpool, nh);
+                do {
+                    int hp[MAX_HOLES];
+                    for (int i = 0; i < nh; i++) hp[i] = hpool[hc.idx[i]];
+
+                    /* Hole canonicality: keep only lex-min under the exit stabilizer.
+                     * Stabilizer per exit index:
+                     *   ei=0,3  — flip_d;  ei=2,4 — flip_h
+                     *   ei=1    — trivial;  ei=5   — full D4 (7 elements) */
                     switch (ei) {
                     case 0: case 3:
                         if (!holes_lex_min_under(hp, nh, t_flip_d)) continue;
@@ -997,30 +1209,41 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
                         break;
                     default: break; /* ei=1: no check */
                     }
-                }
 
-                if (g_wq_count >= g_wq_cap) {
-                    g_wq_cap = g_wq_cap ? g_wq_cap * 2 : 65536;
-                    g_wq = realloc(g_wq, (size_t)g_wq_cap * sizeof(WorkItem));
-                    if (!g_wq) { perror("realloc g_wq"); exit(1); }
-                }
-                g_wq[g_wq_count].ei = ei;
-                g_wq[g_wq_count].nh = nh;
-                memcpy(g_wq[g_wq_count].hp, hp, nh * sizeof(int));
-                g_wq_count++;
-            } while (comb_next(&hc));
+                    if (g_wq_count >= g_wq_cap) {
+                        g_wq_cap = g_wq_cap ? g_wq_cap * 2 : 65536;
+                        g_wq = realloc(g_wq, (size_t)g_wq_cap * sizeof(WorkItem));
+                        if (!g_wq) { perror("realloc g_wq"); exit(1); }
+                    }
+                    g_wq[g_wq_count].ei = ei;
+                    g_wq[g_wq_count].nh = nh;
+                    memcpy(g_wq[g_wq_count].hp, hp, nh * sizeof(int));
+                    g_wq_count++;
+                } while (comb_next(&hc));
+            }
         }
 
-        for (int t = 0; t < NUM_THREADS; t++) {
+        atomic_store(&g_items_done, 0);
+        atomic_store(&g_progress_stop, 0);
+        g_items_total = g_wq_count;
+
+        pthread_t prog_thread;
+        ProgressArg prog_arg = { .t0 = t0, .nh = nh };
+        pthread_create(&prog_thread, NULL, progress_thread_func, &prog_arg);
+
+        for (int t = 0; t < g_num_threads; t++) {
             args[t].total  = total;
             args[t].nw     = nw;
             args[t].ncalls = 0;
             pthread_create(&threads[t], NULL, worker_thread, &args[t]);
         }
-        for (int t = 0; t < NUM_THREADS; t++) {
+        for (int t = 0; t < g_num_threads; t++) {
             pthread_join(threads[t], NULL);
             total_ncalls += args[t].ncalls;
         }
+
+        atomic_store(&g_progress_stop, 1);
+        pthread_join(prog_thread, NULL);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1040,15 +1263,38 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
     }
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s <num_blocks> [options]\n"
+        "\n"
+        "  <num_blocks>      number of movable blocks on the 5x5 grid (1-%d)\n"
+        "\n"
+        "Options:\n"
+        "  --nholes  <n>     restrict search to exactly n holes (default: all counts)\n"
+        "  --exitloc <cell>  restrict to one exit cell in {0,1,2,6,7,12} (default: all)\n"
+        "  --nwalls  <n>     designate n of the block positions as immovable walls (default: 0)\n"
+        "  --nthreads <n>    number of worker threads to use (default: %d)\n"
+        "  --help, -h        show this help message\n"
+        "\n"
+        "Exit cell layout (cell numbers on 5x5 grid, row-major):\n"
+        "  0  1  2  3  4\n"
+        "  5  6  7  8  9\n"
+        " 10 11 12 13 14\n"
+        " 15 16 17 18 19\n"
+        " 20 21 22 23 24\n"
+        "Valid exit cells (top-left quadrant + centre, up to symmetry): 0 1 2 6 7 12\n",
+        prog, MAX_BLOCKS, NUM_THREADS);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr,
-                "Usage: %s <num_blocks> [--nholes <n>] [--exitloc <cell>] [--nwalls <n>]\n"
-                "  --nholes  <n>   : restrict search to exactly n holes (default: all)\n"
-                "  --exitloc <cell>: restrict to one exit cell in {0,1,2,6,7,12} (default: all)\n"
-                "  --nwalls  <n>   : designate n of the block positions as walls (default: 0)\n",
-                argv[0]);
+        print_usage(argv[0]);
         return 1;
+    }
+
+    if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+        print_usage(argv[0]);
+        return 0;
     }
 
     int total   = atoi(argv[1]);
@@ -1057,7 +1303,10 @@ int main(int argc, char **argv) {
     int nw      = 0;
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--nholes") == 0) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--nholes") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --nholes requires a value\n"); return 1; }
             only_nh = atoi(argv[i]);
             if (only_nh < 0) {
@@ -1082,6 +1331,13 @@ int main(int argc, char **argv) {
             nw = atoi(argv[i]);
             if (nw < 0) {
                 fprintf(stderr, "error: --nwalls must be non-negative\n");
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--nthreads") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --nthreads requires a value\n"); return 1; }
+            g_num_threads = atoi(argv[i]);
+            if (g_num_threads < 1 || g_num_threads > 1024) {
+                fprintf(stderr, "error: --nthreads must be between 1 and 1024\n");
                 return 1;
             }
         } else {
