@@ -911,18 +911,23 @@ typedef struct {
 } ThreadArg;
 
 /* -------------------------------------------------------------------------
- * Per-(exit, block-combo) work item — nh=0 case only.
+ * Per-(exit, hole-config, block-combo) work item — nh=0 and nh=1.
  *
- * Equivalent to the inner block-combo iteration of process_hole_config with
- * nh=0 and holes_mask=0, but called directly so that each canonical block
- * combo is a separate work-queue item and can run on its own thread.
- * This gives C(pool,total)/symmetry items instead of just 1–6 for nh=0,
- * keeping all threads busy even when --exitloc and --nholes 0 are both set.
+ * For nh=0: equivalent to the inner block-combo iteration of
+ * process_hole_config with holes_mask=0, giving C(pool,total)/symmetry
+ * items per exit instead of just 1.
+ * For nh=1: same idea but with a fixed hole baked into the item, giving
+ * C(pool,total)/symmetry items per (exit, hole) pair, which distributes
+ * hard hole placements (near the exit) across all threads evenly.
  * ------------------------------------------------------------------------- */
-static void process_block_combo(int ei, int nw, const int *bp, int total) {
+static void process_block_combo(int ei, int nw, int nh, const int *hp,
+                                const int *bp, int total) {
     int ep = EXIT_CELLS[ei];
 
-    uint32_t occ = (1u << ep);
+    uint32_t holes_mask = 0;
+    for (int i = 0; i < nh; i++) holes_mask |= (1u << hp[i]);
+
+    uint32_t occ = (1u << ep) | holes_mask;
     for (int i = 0; i < total; i++) occ |= (1u << bp[i]);
 
     uint32_t walk_blocked = occ & ~(1u << ep);
@@ -985,7 +990,8 @@ static void process_block_combo(int ei, int nw, const int *bp, int total) {
             pz.player_start = ps;
             pz.walls        = wall_mask;
             pz.num_blocks   = nb_mov;
-            pz.num_holes    = 0;
+            pz.num_holes    = nh;
+            for (int i = 0; i < nh;     i++) pz.hole_pos[i]  = hp[i];
             for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
 
             for (int i = 0; i < nb_mov; i++) pz.block_pushable[i] = 0;
@@ -1016,8 +1022,8 @@ static void *worker_thread(void *arg) {
         WorkItem item = g_wq[g_wq_next++];
         pthread_mutex_unlock(&g_wq_mutex);
 
-        if (item.nh == 0)
-            process_block_combo(item.ei, a->nw, item.bp, a->total);
+        if (item.nh <= 1)
+            process_block_combo(item.ei, a->nw, item.nh, item.hp, item.bp, a->total);
         else
             process_hole_config(item.ei, a->nw, item.nh, item.hp, a->total);
         atomic_fetch_add(&g_items_done, 1);
@@ -1171,8 +1177,89 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
                     g_wq_count++;
                 } while (comb_next(&bc));
             }
+        } else if (nh == 1) {
+            /* Fine-grained path for nh=1: one item per canonical (exit, hole, block-combo).
+             * Like the nh=0 path, this distributes work at block-combo granularity so that
+             * expensive hole placements (near the exit) don't bottleneck a single thread. */
+            for (int ei = ei_lo; ei <= ei_hi; ei++) {
+                int ep = EXIT_CELLS[ei];
+
+                int hpool[NCELLS], nhpool = 0;
+                for (int c = 0; c < NCELLS; c++)
+                    if (c != ep) hpool[nhpool++] = c;
+
+                Comb hc; comb_init(&hc, nhpool, 1);
+                do {
+                    int hp[1]; hp[0] = hpool[hc.idx[0]];
+
+                    /* Hole canonicality: same checks as coarse path. */
+                    switch (ei) {
+                    case 0: case 3:
+                        if (!holes_lex_min_under(hp, 1, t_flip_d)) continue;
+                        break;
+                    case 2: case 4:
+                        if (!holes_lex_min_under(hp, 1, t_flip_h)) continue;
+                        break;
+                    case 5:
+                        if (!holes_lex_min_under(hp, 1, t_rot90 )) continue;
+                        if (!holes_lex_min_under(hp, 1, t_rot180)) continue;
+                        if (!holes_lex_min_under(hp, 1, t_rot270)) continue;
+                        if (!holes_lex_min_under(hp, 1, t_flip_h)) continue;
+                        if (!holes_lex_min_under(hp, 1, t_flip_v)) continue;
+                        if (!holes_lex_min_under(hp, 1, t_flip_d)) continue;
+                        if (!holes_lex_min_under(hp, 1, t_flip_a)) continue;
+                        break;
+                    default: break;
+                    }
+
+                    /* Block pool: not exit, not the hole. */
+                    int bpool[NCELLS], nbpool = 0;
+                    for (int c = 0; c < NCELLS; c++)
+                        if (c != ep && c != hp[0]) bpool[nbpool++] = c;
+                    if (total > nbpool) continue;
+
+                    /* Filtered stabilizer for block canonicality: exit stabilizer
+                     * elements that also fix this hole position. */
+                    const int8_t *bt[7]; int nbt = 0;
+                    #define ADD_BT(t) if (transform_fixes_holes(hp, 1, t)) bt[nbt++] = (t)
+                    switch (ei) {
+                    case 0: case 3: ADD_BT(t_flip_d); break;
+                    case 2: case 4: ADD_BT(t_flip_h); break;
+                    case 5:
+                        ADD_BT(t_rot90); ADD_BT(t_rot180); ADD_BT(t_rot270);
+                        ADD_BT(t_flip_h); ADD_BT(t_flip_v);
+                        ADD_BT(t_flip_d); ADD_BT(t_flip_a);
+                        break;
+                    default: break;
+                    }
+                    #undef ADD_BT
+
+                    /* Enumerate canonical block combos for this (exit, hole) pair. */
+                    Comb bc; comb_init(&bc, nbpool, total);
+                    do {
+                        int bp[MAX_BLOCKS];
+                        for (int i = 0; i < total; i++) bp[i] = bpool[bc.idx[i]];
+
+                        int skip = 0;
+                        for (int si = 0; si < nbt && !skip; si++)
+                            if (!holes_lex_min_under(bp, total, bt[si])) skip = 1;
+                        if (skip) continue;
+
+                        if (g_wq_count >= g_wq_cap) {
+                            g_wq_cap = g_wq_cap ? g_wq_cap * 2 : 65536;
+                            g_wq = realloc(g_wq, (size_t)g_wq_cap * sizeof(WorkItem));
+                            if (!g_wq) { perror("realloc g_wq"); exit(1); }
+                        }
+                        g_wq[g_wq_count].ei    = ei;
+                        g_wq[g_wq_count].nh    = 1;
+                        g_wq[g_wq_count].hp[0] = hp[0];
+                        memcpy(g_wq[g_wq_count].bp, bp, total * sizeof(int));
+                        g_wq_count++;
+                    } while (comb_next(&bc));
+                } while (comb_next(&hc));
+            }
         } else {
-            /* Coarse-grained path (nh>0): one item per canonical (exit, hole-config). */
+            /* Coarse-grained path (nh>1): one item per canonical (exit, hole-config). */
             for (int ei = ei_lo; ei <= ei_hi; ei++) {
                 int ep = EXIT_CELLS[ei];
 
@@ -1187,10 +1274,6 @@ static void puzzle_search(int total, int nw, int only_nh, int only_ei) {
                     int hp[MAX_HOLES];
                     for (int i = 0; i < nh; i++) hp[i] = hpool[hc.idx[i]];
 
-                    /* Hole canonicality: keep only lex-min under the exit stabilizer.
-                     * Stabilizer per exit index:
-                     *   ei=0,3  — flip_d;  ei=2,4 — flip_h
-                     *   ei=1    — trivial;  ei=5   — full D4 (7 elements) */
                     switch (ei) {
                     case 0: case 3:
                         if (!holes_lex_min_under(hp, nh, t_flip_d)) continue;
