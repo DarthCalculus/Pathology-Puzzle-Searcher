@@ -462,9 +462,9 @@ static void walk_dists_from(uint32_t blocked, int start, int8_t *out) {
  * ~352 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HTP_SIZE  (1 << 24)    /* 16 M hash-table slots              */
+#define HTP_SIZE  (1 << 22)    /* 4 M hash-table slots               */
 #define HTP_MASK  (HTP_SIZE - 1)
-#define HP64_SIZE (1 << 22)    /* 4 M heap entries                   */
+#define HP64_SIZE (1 << 20)    /* 1 M heap entries                   */
 
 typedef struct {
     int      prio;        /* priority: total cost (walks + pushes)  */

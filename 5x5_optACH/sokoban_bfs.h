@@ -31,9 +31,10 @@ static inline int col_(int p)       { return p % COLS; }
  * sokoban_solve(pz, used_dirs)
  *
  * Runs optimised BFS on the puzzle.  Returns the minimum number of moves
- * to reach exit_pos, -1 if unsolvable, or -2 if the BFS queue overflowed
- * (out of memory — caller must handle this as a fatal error, not as
- * unsolvable, since the state space was not fully explored).
+ * to reach exit_pos, -1 if unsolvable, -2 if the BFS queue overflowed
+ * (out of memory), or -3 if the hash table probe limit was exceeded.
+ * Callers must treat -2 and -3 as fatal errors (state space not fully
+ * explored), not as unsolvable.
  *
  * used_dirs: if non-NULL and the puzzle is solvable, filled with the
  *   per-block bitmask of push directions that were actually used on the
