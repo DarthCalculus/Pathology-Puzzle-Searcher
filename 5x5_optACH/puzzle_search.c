@@ -269,6 +269,7 @@ static uint32_t g_fixed_empty_mask  = 0;   /* always empty — no block/wall/hol
 static uint32_t g_fixed_blocks_mask = 0;   /* always has a movable block */
 static int      g_fixed_block_pos[MAX_BLOCKS];
 static int      g_fixed_nblocks     = 0;
+static uint8_t  g_fixed_mask[NCELLS];      /* per-cell geo_mask ceiling (default 0xF) */
 
 static pthread_mutex_t g_best_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_print_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -824,6 +825,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
             /* Tighter per-block push ceilings: corners + edge-pairs + 2x2 freeze. */
             uint8_t geo_mask[MAX_BLOCKS];
             compute_geo_masks(mbp, nb_mov, wall_mask, geo_mask);
+            for (int i = 0; i < nb_mov; i++) geo_mask[i] &= g_fixed_mask[mbp[i]];
 
             /* Reset component antichains for this wall subset. */
             for (int vi = 0; vi < n_valid; vi++)
@@ -996,6 +998,7 @@ static void process_block_combo(int ei, int nw, int nh, const int *hp,
 
         uint8_t geo_mask[MAX_BLOCKS];
         compute_geo_masks(mbp, nb_mov, wall_mask, geo_mask);
+        for (int i = 0; i < nb_mov; i++) geo_mask[i] &= g_fixed_mask[mbp[i]];
 
         for (int vi = 0; vi < n_valid; vi++)
             if (comp_id[vi] == vi) comp_ga[vi].count = 0;
@@ -1416,6 +1419,8 @@ static void print_usage(const char *prog) {
         "  --fixedholes  <c,c,...>     cells that are always holes (e.g. 3,8)\n"
         "  --fixedblocks <c,c,...>     cells that always have a movable block\n"
         "  --fixedempty  <c,c,...>     cells that are always empty (no block/wall/hole)\n"
+        "  --fixedmask   <c=m,...>     per-cell pushability ceiling, ANDed into geo_mask\n"
+        "                             (e.g. 5=3 limits cell 5 to UD only; 12=0 forces immovable)\n"
         "  --exitloc    <cell>         restrict to one exit cell in {0,1,2,6,7,12} (default: all)\n"
         "  --nthreads   <n>            number of worker threads (default: %d)\n"
         "  --help, -h                  show this help message\n"
@@ -1451,6 +1456,25 @@ static int parse_cell_list(const char *s, uint32_t *mask, int *pos, int *count) 
     return 1;
 }
 
+/* Parse "cell=mask,..." pairs (e.g. "5=3,12=0") into g_fixed_mask[].
+ * mask must be 0–15.  Returns 1 on success, 0 on error. */
+static int parse_cell_mask_list(const char *s) {
+    if (!*s) return 1;
+    while (*s) {
+        char *end;
+        long cell = strtol(s, &end, 10);
+        if (end == s || cell < 0 || cell >= NCELLS || *end != '=') return 0;
+        s = end + 1;
+        long mask = strtol(s, &end, 10);
+        if (end == s || mask < 0 || mask > 0xF) return 0;
+        g_fixed_mask[cell] = (uint8_t)mask;
+        s = end;
+        if (*s == ',') s++;
+        else if (*s) return 0;
+    }
+    return 1;
+}
+
 /* Parse "N" or "lo-hi" into *lo and *hi.  Returns 1 on success, 0 on error. */
 static int parse_range(const char *s, int *lo, int *hi) {
     const char *dash = strchr(s, '-');
@@ -1477,6 +1501,7 @@ static int prompt(const char *msg, char *buf, int sz) {
 }
 
 int main(int argc, char **argv) {
+    memset(g_fixed_mask, 0xF, sizeof g_fixed_mask);
     int nb_lo = -1, nb_hi = -1;   /* -1 = search all block counts */
     int nw_lo =  0, nw_hi =  0;
     int nh_lo = -1, nh_hi = -1;   /* -1 = search all hole counts  */
@@ -1597,6 +1622,11 @@ int main(int argc, char **argv) {
                 if (++i >= argc) { fprintf(stderr, "error: --fixedempty requires a value\n"); return 1; }
                 if (!parse_cell_list(argv[i], &g_fixed_empty_mask, NULL, NULL)) {
                     fprintf(stderr, "error: invalid cell list for --fixedempty: '%s'\n", argv[i]); return 1;
+                }
+            } else if (strcmp(argv[i], "--fixedmask") == 0) {
+                if (++i >= argc) { fprintf(stderr, "error: --fixedmask requires a value\n"); return 1; }
+                if (!parse_cell_mask_list(argv[i])) {
+                    fprintf(stderr, "error: invalid cell=mask list for --fixedmask: '%s'\n", argv[i]); return 1;
                 }
             } else if (strcmp(argv[i], "--nthreads") == 0) {
                 if (++i >= argc) { fprintf(stderr, "error: --nthreads requires a value\n"); return 1; }
