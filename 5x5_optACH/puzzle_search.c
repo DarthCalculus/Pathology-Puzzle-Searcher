@@ -1132,8 +1132,8 @@ static void *progress_thread_func(void *arg) {
  * only_nh: restrict to a single hole count (-1 = all counts).
  * only_ei: restrict to a single exit index into EXIT_CELLS (-1 = all exits). */
 static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int only_ei, int print_summary) {
-    if (total < 1 || total > MAX_BLOCKS) {
-        fprintf(stderr, "num_blocks must be between 1 and %d\n", MAX_BLOCKS);
+    if (total < 0 || total > MAX_BLOCKS) {
+        fprintf(stderr, "num_blocks must be between 0 and %d\n", MAX_BLOCKS);
         return;
     }
     precompute_tables();
@@ -1679,7 +1679,7 @@ int main(int argc, char **argv) {
     for (int cw = nw_lo; cw <= nw_hi; cw++) {
         for (int cb = real_nb_lo; cb <= real_nb_hi; cb++) {
             int total = cb + cw;
-            if (total < 1 || total > MAX_BLOCKS) continue;
+            if (total < 0 || total > MAX_BLOCKS) continue;
             if (nh_lo >= 0 && nh_lo > NCELLS - 2 - total) continue;
             last_nw = cw; last_nb = cb;
         }
@@ -1688,7 +1688,7 @@ int main(int argc, char **argv) {
     for (int cur_nw = nw_lo; cur_nw <= nw_hi; cur_nw++) {
         for (int cur_nb = real_nb_lo; cur_nb <= real_nb_hi; cur_nb++) {
             int total = cur_nb + cur_nw;
-            if (total < 1 || total > MAX_BLOCKS) continue;
+            if (total < 0 || total > MAX_BLOCKS) continue;
             if (nh_lo >= 0 && nh_lo > NCELLS - 2 - total) {
                 if (nb_lo >= 0 && nb_lo == nb_hi && nw_lo == nw_hi) {
                     fprintf(stderr,
