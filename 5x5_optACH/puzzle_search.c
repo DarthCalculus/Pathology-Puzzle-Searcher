@@ -260,11 +260,15 @@ static Puzzle g_best_pz;
 static int    g_skipped    = 0;
 static Puzzle g_skipped_pz;
 
-/* Fixed walls and holes: specified by the user, present in every configuration. */
+/* Fixed cells: specified by the user, present in every configuration. */
 static uint32_t g_fixed_walls      = 0;
 static uint32_t g_fixed_holes_mask = 0;
 static int      g_fixed_hole_pos[MAX_HOLES];
 static int      g_fixed_nholes     = 0;
+static uint32_t g_fixed_empty_mask  = 0;   /* always empty — no block/wall/hole here */
+static uint32_t g_fixed_blocks_mask = 0;   /* always has a movable block */
+static int      g_fixed_block_pos[MAX_BLOCKS];
+static int      g_fixed_nblocks     = 0;
 
 static pthread_mutex_t g_best_mutex  = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_print_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -696,8 +700,10 @@ static int transform_fixes_mask(uint32_t mask, const int8_t *t) {
 /* Returns 1 if transform t is compatible with the fixed walls and holes
  * (i.e. applying t would not change the fixed layout). */
 static int transform_ok_fixed(const int8_t *t) {
-    return (g_fixed_walls == 0      || transform_fixes_mask(g_fixed_walls,      t))
-        && (g_fixed_nholes == 0     || transform_fixes_holes(g_fixed_hole_pos, g_fixed_nholes, t));
+    return (g_fixed_walls == 0        || transform_fixes_mask(g_fixed_walls,        t))
+        && (g_fixed_nholes == 0       || transform_fixes_holes(g_fixed_hole_pos, g_fixed_nholes, t))
+        && (g_fixed_empty_mask == 0   || transform_fixes_mask(g_fixed_empty_mask,   t))
+        && (g_fixed_nblocks == 0      || transform_fixes_mask(g_fixed_blocks_mask,  t));
 }
 
 static void process_hole_config(int ei, int nw, int nh, const int *hp, int total) {
@@ -706,10 +712,11 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
     uint32_t holes_mask = g_fixed_holes_mask;
     for (int i = 0; i < nh; i++) holes_mask |= (1u << hp[i]);
 
-    /* Pool for blocks: not exit, not a hole, not a fixed wall. */
+    /* Pool for blocks: not exit, not a hole/wall/fixed-block/fixed-empty. */
     int bpool[NCELLS], nbpool = 0;
     for (int c = 0; c < NCELLS; c++)
-        if (c != ep && !(holes_mask & (1u << c)) && !(g_fixed_walls & (1u << c)))
+        if (c != ep && !(holes_mask & (1u << c)) && !(g_fixed_walls & (1u << c))
+                    && !(g_fixed_blocks_mask & (1u << c)) && !(g_fixed_empty_mask & (1u << c)))
             bpool[nbpool++] = c;
 
     if (total > nbpool) return;
@@ -757,7 +764,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
          * Holes are included: the player cannot start on one.
          * All block positions (both wall-designated and movable) are included
          * so that occ correctly blocks the player in all wall subsets. */
-        uint32_t occ = (1u << ep) | holes_mask | g_fixed_walls;
+        uint32_t occ = (1u << ep) | holes_mask | g_fixed_walls | g_fixed_blocks_mask;
         for (int i = 0; i < total; i++) occ |= (1u << bp[i]);
 
         /* Precompute walk distances from each valid player start to all
@@ -812,6 +819,7 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
                 if (is_wall[i]) wall_mask |= (1u << bp[i]);
                 else            mbp[nb_mov++] = bp[i];
             }
+            for (int i = 0; i < g_fixed_nblocks; i++) mbp[nb_mov++] = g_fixed_block_pos[i];
 
             /* Tighter per-block push ceilings: corners + edge-pairs + 2x2 freeze. */
             uint8_t geo_mask[MAX_BLOCKS];
@@ -951,7 +959,7 @@ static void process_block_combo(int ei, int nw, int nh, const int *hp,
     uint32_t holes_mask = g_fixed_holes_mask;
     for (int i = 0; i < nh; i++) holes_mask |= (1u << hp[i]);
 
-    uint32_t occ = (1u << ep) | holes_mask | g_fixed_walls;
+    uint32_t occ = (1u << ep) | holes_mask | g_fixed_walls | g_fixed_blocks_mask;
     for (int i = 0; i < total; i++) occ |= (1u << bp[i]);
 
     uint32_t walk_blocked = occ & ~(1u << ep);
@@ -984,6 +992,7 @@ static void process_block_combo(int ei, int nw, int nh, const int *hp,
             if (is_wall[i]) wall_mask |= (1u << bp[i]);
             else            mbp[nb_mov++] = bp[i];
         }
+        for (int i = 0; i < g_fixed_nblocks; i++) mbp[nb_mov++] = g_fixed_block_pos[i];
 
         uint8_t geo_mask[MAX_BLOCKS];
         compute_geo_masks(mbp, nb_mov, wall_mask, geo_mask);
@@ -1173,7 +1182,8 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
 
                 int bpool[NCELLS], nbpool = 0;
                 for (int c = 0; c < NCELLS; c++)
-                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c)))
+                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c))
+                                && !(g_fixed_blocks_mask & (1u<<c)) && !(g_fixed_empty_mask & (1u<<c)))
                         bpool[nbpool++] = c;
                 if (total > nbpool) continue;
 
@@ -1222,7 +1232,8 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
 
                 int hpool[NCELLS], nhpool = 0;
                 for (int c = 0; c < NCELLS; c++)
-                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c)))
+                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c))
+                                && !(g_fixed_blocks_mask & (1u<<c)) && !(g_fixed_empty_mask & (1u<<c)))
                         hpool[nhpool++] = c;
 
                 Comb hc; comb_init(&hc, nhpool, 1);
@@ -1249,10 +1260,11 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
                     default: break;
                     }
 
-                    /* Block pool: not exit, not the hole, not fixed walls/holes. */
+                    /* Block pool: not exit, not the hole, not fixed walls/holes/blocks/empty. */
                     int bpool[NCELLS], nbpool = 0;
                     for (int c = 0; c < NCELLS; c++)
-                        if (c != ep && c != hp[0] && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c)))
+                        if (c != ep && c != hp[0] && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c))
+                                                  && !(g_fixed_blocks_mask & (1u<<c)) && !(g_fixed_empty_mask & (1u<<c)))
                             bpool[nbpool++] = c;
                     if (total > nbpool) continue;
 
@@ -1303,7 +1315,8 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
 
                 int hpool[NCELLS], nhpool = 0;
                 for (int c = 0; c < NCELLS; c++)
-                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c)))
+                    if (c != ep && !(g_fixed_walls & (1u<<c)) && !(g_fixed_holes_mask & (1u<<c))
+                                && !(g_fixed_blocks_mask & (1u<<c)) && !(g_fixed_empty_mask & (1u<<c)))
                         hpool[nhpool++] = c;
                 if (nh > nhpool) continue;
 
@@ -1399,8 +1412,10 @@ static void print_usage(const char *prog) {
         "  --nwalls     <n|lo-hi>      additional random wall blocks (default: 0)\n"
         "  --nholes     <n|lo-hi>      additional random holes; omit to search all counts\n"
         "                               (default range: 0 to min(nblocks, 23-nblocks-nwalls))\n"
-        "  --fixedwalls <c,c,...>      cells that are always walls (e.g. 5,10,15)\n"
-        "  --fixedholes <c,c,...>      cells that are always holes (e.g. 3,8)\n"
+        "  --fixedwalls  <c,c,...>     cells that are always walls (e.g. 5,10,15)\n"
+        "  --fixedholes  <c,c,...>     cells that are always holes (e.g. 3,8)\n"
+        "  --fixedblocks <c,c,...>     cells that always have a movable block\n"
+        "  --fixedempty  <c,c,...>     cells that are always empty (no block/wall/hole)\n"
         "  --exitloc    <cell>         restrict to one exit cell in {0,1,2,6,7,12} (default: all)\n"
         "  --nthreads   <n>            number of worker threads (default: %d)\n"
         "  --help, -h                  show this help message\n"
@@ -1502,6 +1517,18 @@ int main(int argc, char **argv) {
             }
         }
 
+        if (prompt("Fixed block cells (e.g. 6,12, Enter = none): ", buf, sizeof buf)) {
+            if (!parse_cell_list(buf, &g_fixed_blocks_mask, g_fixed_block_pos, &g_fixed_nblocks)) {
+                fprintf(stderr, "error: invalid cell list '%s'\n", buf); return 1;
+            }
+        }
+
+        if (prompt("Fixed empty cells (e.g. 4,9, Enter = none): ", buf, sizeof buf)) {
+            if (!parse_cell_list(buf, &g_fixed_empty_mask, NULL, NULL)) {
+                fprintf(stderr, "error: invalid cell list '%s'\n", buf); return 1;
+            }
+        }
+
         if (prompt("Exit cell (Enter = all valid) [0 1 2 6 7 12]: ", buf, sizeof buf)) {
             int exit_cell = atoi(buf);
             for (int j = 0; j < NUM_EXIT_CELLS; j++)
@@ -1561,6 +1588,16 @@ int main(int argc, char **argv) {
                 if (!parse_cell_list(argv[i], &g_fixed_holes_mask, g_fixed_hole_pos, &g_fixed_nholes)) {
                     fprintf(stderr, "error: invalid cell list for --fixedholes: '%s'\n", argv[i]); return 1;
                 }
+            } else if (strcmp(argv[i], "--fixedblocks") == 0) {
+                if (++i >= argc) { fprintf(stderr, "error: --fixedblocks requires a value\n"); return 1; }
+                if (!parse_cell_list(argv[i], &g_fixed_blocks_mask, g_fixed_block_pos, &g_fixed_nblocks)) {
+                    fprintf(stderr, "error: invalid cell list for --fixedblocks: '%s'\n", argv[i]); return 1;
+                }
+            } else if (strcmp(argv[i], "--fixedempty") == 0) {
+                if (++i >= argc) { fprintf(stderr, "error: --fixedempty requires a value\n"); return 1; }
+                if (!parse_cell_list(argv[i], &g_fixed_empty_mask, NULL, NULL)) {
+                    fprintf(stderr, "error: invalid cell list for --fixedempty: '%s'\n", argv[i]); return 1;
+                }
             } else if (strcmp(argv[i], "--nthreads") == 0) {
                 if (++i >= argc) { fprintf(stderr, "error: --nthreads requires a value\n"); return 1; }
                 g_num_threads = atoi(argv[i]);
@@ -1576,20 +1613,23 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Validate fixed walls/holes */
-    if (g_fixed_walls & g_fixed_holes_mask) {
-        fprintf(stderr, "error: fixed walls and fixed holes overlap\n"); return 1;
+    /* Validate fixed cells — all four masks must be mutually disjoint */
+    {
+        uint32_t all = g_fixed_walls | g_fixed_holes_mask | g_fixed_blocks_mask | g_fixed_empty_mask;
+        if (__builtin_popcount(all) !=
+            __builtin_popcount(g_fixed_walls) + __builtin_popcount(g_fixed_holes_mask) +
+            __builtin_popcount(g_fixed_blocks_mask) + __builtin_popcount(g_fixed_empty_mask)) {
+            fprintf(stderr, "error: fixed cell lists overlap\n"); return 1;
+        }
     }
     {
         int j0 = (only_ei >= 0) ? only_ei : 0;
         int j1 = (only_ei >= 0) ? only_ei : NUM_EXIT_CELLS - 1;
         for (int j = j0; j <= j1; j++) {
             uint32_t eb = 1u << EXIT_CELLS[j];
-            if (g_fixed_walls & eb) {
-                fprintf(stderr, "error: fixed wall at cell %d conflicts with a valid exit cell\n", EXIT_CELLS[j]); return 1;
-            }
-            if (g_fixed_holes_mask & eb) {
-                fprintf(stderr, "error: fixed hole at cell %d conflicts with a valid exit cell\n", EXIT_CELLS[j]); return 1;
+            uint32_t conflict = (g_fixed_walls | g_fixed_holes_mask | g_fixed_blocks_mask | g_fixed_empty_mask) & eb;
+            if (conflict) {
+                fprintf(stderr, "error: fixed cell %d conflicts with a valid exit cell\n", EXIT_CELLS[j]); return 1;
             }
         }
     }
