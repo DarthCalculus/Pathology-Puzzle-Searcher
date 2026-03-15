@@ -1675,8 +1675,12 @@ int main(int argc, char **argv) {
     }
 
     /* Resolve unrestrained ranges */
-    int real_nb_lo = (nb_lo >= 0) ? nb_lo : 1;
-    int real_nb_hi = (nb_hi >= 0) ? nb_hi : MAX_BLOCKS;
+    int real_nb_lo = (nb_lo >= 0) ? nb_lo : (g_fixed_nblocks > 0 ? 0 : 1);
+    int pool_avail = NCELLS - 1 - g_fixed_nblocks - g_fixed_nholes
+                   - __builtin_popcount(g_fixed_walls)
+                   - __builtin_popcount(g_fixed_empty_mask);
+    if (pool_avail < 0) pool_avail = 0;
+    int real_nb_hi = (nb_hi >= 0) ? nb_hi : (pool_avail < MAX_BLOCKS ? pool_avail : MAX_BLOCKS);
 
     /* Pre-compute last valid (nw, nb) combo so we know when to print summary */
     int last_nw = nw_lo, last_nb = real_nb_lo;
