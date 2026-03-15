@@ -1160,7 +1160,11 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
      * ensures g_best is as high as possible before large nh items begin,
      * maximising the walk-distance pruning (Approach C) on those items. */
     int max_nh = total - nw + g_fixed_nblocks;
-    if (max_nh > NCELLS - 2 - total) max_nh = NCELLS - 2 - total;  /* 23 - total */
+    int fixed_occupied = g_fixed_nblocks + g_fixed_nholes
+                       + __builtin_popcount(g_fixed_walls)
+                       + __builtin_popcount(g_fixed_empty_mask);
+    if (max_nh > NCELLS - 1 - total - fixed_occupied)
+        max_nh = NCELLS - 1 - total - fixed_occupied;
     int nh_lo = (nh_lo_arg >= 0) ? nh_lo_arg : 0;
     int nh_hi = (nh_hi_arg >= 0) ? (nh_hi_arg < max_nh ? nh_hi_arg : max_nh) : max_nh;
     int ei_lo = (only_ei >= 0) ? only_ei : 0;
