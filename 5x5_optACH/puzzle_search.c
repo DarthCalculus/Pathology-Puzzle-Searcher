@@ -343,10 +343,21 @@ static void update_best(int d, const Puzzle *pz) {
 }
 
 /* -------------------------------------------------------------------------
- * Per-thread call counter
+ * Per-thread call counter and BFS profiling (--profile)
  * ------------------------------------------------------------------------- */
 
 static _Thread_local long long tl_ncalls = 0;
+
+#define PROF_TBUCKETS 34   /* 2^0 ns .. 2^33 ns (~8 s) */
+#define PROF_HBUCKETS 21   /* 2^0 .. 2^20 entries (1M cap) */
+
+typedef struct {
+    long long time_cnt[PROF_TBUCKETS][2];  /* [log2(ns)][solvable] */
+    long long heap_cnt[PROF_HBUCKETS][2];  /* [log2(peak_heap)][solvable] */
+} ProfData;
+
+static int           g_profile_mode = 0;
+static _Thread_local ProfData tl_prof;
 
 /* -------------------------------------------------------------------------
  * Bitmask enumeration
@@ -609,7 +620,29 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
 
         tl_ncalls++;
         uint8_t used[MAX_BLOCKS] = {0};
-        int d = sokoban_solve(pz, used);
+        int d;
+        if (g_profile_mode) {
+            struct timespec _t0, _t1;
+            BfsProfile bprof = {0};
+            clock_gettime(CLOCK_MONOTONIC, &_t0);
+            d = sokoban_solve(pz, used, &bprof);
+            clock_gettime(CLOCK_MONOTONIC, &_t1);
+            long long ns = (_t1.tv_sec - _t0.tv_sec) * 1000000000LL
+                         + (_t1.tv_nsec - _t0.tv_nsec);
+            if (ns < 1) ns = 1;
+            int sol = (d >= 0) ? 1 : 0;
+            int tb = 63 - __builtin_clzll((unsigned long long)ns);
+            if (tb < 0) tb = 0;
+            if (tb >= PROF_TBUCKETS) tb = PROF_TBUCKETS - 1;
+            tl_prof.time_cnt[tb][sol]++;
+            int hp = bprof.peak_heap_sz < 1 ? 1 : bprof.peak_heap_sz;
+            int hb = 63 - __builtin_clzll((unsigned long long)hp);
+            if (hb < 0) hb = 0;
+            if (hb >= PROF_HBUCKETS) hb = PROF_HBUCKETS - 1;
+            tl_prof.heap_cnt[hb][sol]++;
+        } else {
+            d = sokoban_solve(pz, used, NULL);
+        }
         if (d == -2) {
             record_skip(pz);
             return -2;
@@ -917,6 +950,53 @@ static void print_time_calls(double elapsed, long long ncalls) {
     printf("Total solver calls: %lld\n",   ncalls);
 }
 
+static void print_profile(const ProfData *p) {
+    /* Merge is already done by caller; just print. */
+    printf("\n=== BFS Profile ===\n");
+
+    /* Time distribution */
+    printf("\nCall time distribution:\n");
+    printf("  %-18s  %12s  %12s\n", "Range", "Solvable", "Unsolvable");
+    for (int b = 0; b < PROF_TBUCKETS; b++) {
+        long long s = p->time_cnt[b][1], u = p->time_cnt[b][0];
+        if (s + u == 0) continue;
+        long long lo_ns = 1LL << b, hi_ns = 1LL << (b + 1);
+        char lo_buf[24], hi_buf[24];
+        /* Format in most readable unit */
+        #define FMT_NS(buf, ns) do { \
+            if ((ns) >= 1000000000LL) snprintf(buf, sizeof(buf), "%.3g s",  (ns)/1e9); \
+            else if ((ns) >= 1000000LL) snprintf(buf, sizeof(buf), "%.3g ms", (ns)/1e6); \
+            else if ((ns) >= 1000LL)    snprintf(buf, sizeof(buf), "%.3g µs", (ns)/1e3); \
+            else                        snprintf(buf, sizeof(buf), "%lld ns", (long long)(ns)); \
+        } while(0)
+        FMT_NS(lo_buf, lo_ns);
+        FMT_NS(hi_buf, hi_ns);
+        #undef FMT_NS
+        char range[40];
+        snprintf(range, sizeof(range), "%s – %s", lo_buf, hi_buf);
+        printf("  %-18s  %12lld  %12lld\n", range, s, u);
+    }
+
+    /* Heap distribution */
+    printf("\nPeak heap distribution (cap = %d entries = 2^20):\n", 1 << 20);
+    printf("  %-18s  %12s  %12s  %8s\n", "Range", "Solvable", "Unsolvable", "% of cap");
+    for (int b = 0; b < PROF_HBUCKETS; b++) {
+        long long s = p->heap_cnt[b][1], u = p->heap_cnt[b][0];
+        if (s + u == 0) continue;
+        int lo = 1 << b, hi = (b + 1 < PROF_HBUCKETS) ? (1 << (b + 1)) - 1 : (1 << b);
+        double pct_lo = 100.0 * lo / (1 << 20);
+        double pct_hi = 100.0 * hi / (1 << 20);
+        char range[40];
+        if (b == PROF_HBUCKETS - 1)
+            snprintf(range, sizeof(range), "= %d (cap)", 1 << 20);
+        else
+            snprintf(range, sizeof(range), "%d – %d", lo, hi);
+        char pct_buf[16];
+        snprintf(pct_buf, sizeof(pct_buf), "%.2f–%.2f%%", pct_lo, pct_hi);
+        printf("  %-18s  %12lld  %12lld  %8s\n", range, s, u, pct_buf);
+    }
+}
+
 /* -------------------------------------------------------------------------
  * Work queue and thread pool
  *
@@ -942,6 +1022,7 @@ typedef struct {
     int        total;
     int        nw;
     long long  ncalls;
+    ProfData   prof;
 } ThreadArg;
 
 /* -------------------------------------------------------------------------
@@ -1067,6 +1148,7 @@ static void *worker_thread(void *arg) {
     }
 
     a->ncalls = tl_ncalls;
+    if (g_profile_mode) a->prof = tl_prof;
     return NULL;
 }
 
@@ -1379,6 +1461,7 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
             args[t].total  = total;
             args[t].nw     = nw;
             args[t].ncalls = 0;
+            memset(&args[t].prof, 0, sizeof args[t].prof);
             pthread_create(&threads[t], NULL, worker_thread, &args[t]);
         }
         for (int t = 0; t < g_num_threads; t++) {
@@ -1406,6 +1489,20 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
         } else {
             printf("No solvable puzzles found.\n");
         }
+        if (g_profile_mode) {
+            ProfData merged = {0};
+            for (int t = 0; t < g_num_threads; t++)
+                for (int b = 0; b < PROF_TBUCKETS; b++) {
+                    merged.time_cnt[b][0] += args[t].prof.time_cnt[b][0];
+                    merged.time_cnt[b][1] += args[t].prof.time_cnt[b][1];
+                }
+            for (int t = 0; t < g_num_threads; t++)
+                for (int b = 0; b < PROF_HBUCKETS; b++) {
+                    merged.heap_cnt[b][0] += args[t].prof.heap_cnt[b][0];
+                    merged.heap_cnt[b][1] += args[t].prof.heap_cnt[b][1];
+                }
+            print_profile(&merged);
+        }
     }
 }
 
@@ -1427,6 +1524,7 @@ static void print_usage(const char *prog) {
         "                             (e.g. 5=3 limits cell 5 to UD only; 12=0 forces immovable)\n"
         "  --exitloc    <cell>         restrict to one exit cell in {0,1,2,6,7,12} (default: all)\n"
         "  --nthreads   <n>            number of worker threads (default: %d)\n"
+        "  --profile                   print BFS call-time and peak-heap distributions\n"
         "  --help, -h                  show this help message\n"
         "\n"
         "Exit cell layout (cell numbers on 5x5 grid, row-major):\n"
@@ -1639,6 +1737,8 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "error: --nthreads must be between 1 and 1024\n");
                     return 1;
                 }
+            } else if (strcmp(argv[i], "--profile") == 0) {
+                g_profile_mode = 1;
             } else {
                 fprintf(stderr, "error: unknown argument '%s'\n", argv[i]);
                 print_usage(argv[0]);

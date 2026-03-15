@@ -28,7 +28,7 @@ static inline int row_(int p)       { return p / COLS; }
 static inline int col_(int p)       { return p % COLS; }
 
 /*
- * sokoban_solve(pz, used_dirs)
+ * sokoban_solve(pz, used_dirs, prof)
  *
  * Runs optimised BFS on the puzzle.  Returns the minimum number of moves
  * to reach exit_pos, -1 if unsolvable, -2 if the BFS queue overflowed
@@ -40,5 +40,12 @@ static inline int col_(int p)       { return p % COLS; }
  *   per-block bitmask of push directions that were actually used on the
  *   optimal path (U=1 R=2 D=4 L=8).  A block that was never pushed gets 0.
  *   Pass NULL to skip path tracking.
+ *
+ * prof: if non-NULL, filled with profiling data for this call.
+ *   Pass NULL for normal operation.
  */
-int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs);
+typedef struct {
+    int peak_heap_sz;  /* max heap entries live at any point during the solve */
+} BfsProfile;
+
+int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof);

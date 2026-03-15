@@ -568,9 +568,10 @@ static inline HeapEntry64 heap64_pop(HashStatePush64 *hs) {
     return top;
 }
 
-static int solve_push64(const Puzzle *pz, uint8_t *used_dirs) {
+static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush64 *hs = hsp64_get();
     hsp64_clear(hs);
+    int peak_heap = 1;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -657,16 +658,21 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs) {
                 uint32_t nu = e.used | (1u << (bi * 4 + d));
 
                 if (hsp64_update(hs, ns, nc)) {
-                    if (hs->heap_sz >= HP64_SIZE) return -2;
+                    if (hs->heap_sz >= HP64_SIZE) {
+                        if (prof) prof->peak_heap_sz = HP64_SIZE;
+                        return -2;
+                    }
                     HeapEntry64 ne;
                     ne.prio = nc; ne.player_pos = bpos;
                     ne.used = nu; ne._pad = 0; ne.state = ns;
                     heap64_push(hs, ne);
+                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
                 }
             }
         }
     }
 
+    if (prof) prof->peak_heap_sz = peak_heap;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)
@@ -956,9 +962,10 @@ static inline HeapEntry128 heap128_pop(HashStatePush128 *hs) {
     return top;
 }
 
-static int solve_push128(const Puzzle *pz, uint8_t *used_dirs) {
+static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush128 *hs = hsp128_get();
     hsp128_clear(hs);
+    int peak_heap = 1;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -1038,16 +1045,21 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs) {
                 __uint128_t nu = e.used | ((__uint128_t)1 << (bi * 4 + d));
 
                 if (hsp128_update(hs, ns, nc)) {
-                    if (hs->heap_sz >= HP128_SIZE) return -2;
+                    if (hs->heap_sz >= HP128_SIZE) {
+                        if (prof) prof->peak_heap_sz = HP128_SIZE;
+                        return -2;
+                    }
                     HeapEntry128 ne;
                     ne.state = ns; ne.used = nu;
                     ne.prio = nc; ne.player_pos = bpos;
                     heap128_push(hs, ne);
+                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
                 }
             }
         }
     }
 
+    if (prof) prof->peak_heap_sz = peak_heap;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)
@@ -1059,9 +1071,9 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs) {
  * DISPATCHER
  * ======================================================================== */
 
-int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs) {
+int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     int nb = pz->num_blocks, nh = pz->num_holes;
     if (5 + 5 * nb + nh > 64)
-        return solve_push128(pz, used_dirs);
-    return solve_push64(pz, used_dirs);
+        return solve_push128(pz, used_dirs, prof);
+    return solve_push64(pz, used_dirs, prof);
 }
