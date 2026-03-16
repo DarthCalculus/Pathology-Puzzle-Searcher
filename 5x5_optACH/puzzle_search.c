@@ -354,6 +354,8 @@ static _Thread_local long long tl_ncalls = 0;
 typedef struct {
     long long time_cnt[PROF_TBUCKETS][2];  /* [log2(ns)][solvable] */
     long long heap_cnt[PROF_HBUCKETS][2];  /* [log2(peak_heap)][solvable] */
+    double    ps_time[NCELLS];             /* total try_bitmasks time per player start (s) */
+    long long ps_calls[NCELLS];            /* BFS calls issued per player start */
 } ProfData;
 
 static int           g_profile_mode = 0;
@@ -598,65 +600,114 @@ static void compute_geo_masks(const int *mbp, int nb_mov, uint32_t wall_mask,
     }
 }
 
-static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
-                        GlobalAntichain *ga, KnownSolvable *ks,
-                        const uint8_t *geo_mask) {
+/*
+ * Multi-start try_bitmasks.  Instead of one player_start, evaluates all
+ * starts in a walkable component at each bitmask leaf.  Per-mask walk-
+ * distance bounds let most starts be skipped after one BFS call.
+ *
+ * ps_cells[0..n_ps-1]: cell indices of player starts needing bitmask search
+ * ps_vis[0..n_ps-1]:   corresponding vi indices into vwalk[]
+ * vwalk[vi][cell]:      walk distance from valid start vi to cell
+ * ks_arr[0..n_ps-1]:   per-start KnownSolvable caches
+ */
+static int try_bitmasks_ms(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
+                           GlobalAntichain *ga, const uint8_t *geo_mask,
+                           const int *ps_cells, const int *ps_vis, int n_ps,
+                           int8_t (*vwalk)[NCELLS], KnownSolvable *ks_arr) {
     if (bi == pz->num_blocks) {
         if (ga_dominated(ga, pz->block_pushable, pz->num_blocks)) return -1;
         int nb = pz->num_blocks;
 
-        /* KS lookup: pack current masks; if any stored used-dirs is a subset,
-         * the stored solution works here too — same distance, no BFS needed. */
         uint32_t cur_packed = 0;
         for (int i = 0; i < nb; i++)
             cur_packed |= ((uint32_t)pz->block_pushable[i] << (i*4));
-        for (int k = 0; k < ks->count; k++) {
-            if ((cur_packed & ks->packed[k]) == ks->packed[k]) {
-                int d = ks->dist[k];
-                if (d > g_best) update_best(d, pz);
-                return d;
-            }
-        }
 
-        tl_ncalls++;
-        uint8_t used[MAX_BLOCKS] = {0};
-        int d;
-        if (g_profile_mode) {
-            struct timespec _t0, _t1;
-            BfsProfile bprof = {0};
-            clock_gettime(CLOCK_MONOTONIC, &_t0);
-            d = sokoban_solve(pz, used, &bprof);
-            clock_gettime(CLOCK_MONOTONIC, &_t1);
-            long long ns = (_t1.tv_sec - _t0.tv_sec) * 1000000000LL
-                         + (_t1.tv_nsec - _t0.tv_nsec);
-            if (ns < 1) ns = 1;
-            int sol = (d >= 0) ? 1 : 0;
-            int tb = 63 - __builtin_clzll((unsigned long long)ns);
-            if (tb < 0) tb = 0;
-            if (tb >= PROF_TBUCKETS) tb = PROF_TBUCKETS - 1;
-            tl_prof.time_cnt[tb][sol]++;
-            int hp = bprof.peak_heap_sz < 1 ? 1 : bprof.peak_heap_sz;
-            int hb = 63 - __builtin_clzll((unsigned long long)hp);
-            if (hb < 0) hb = 0;
-            if (hb >= PROF_HBUCKETS) hb = PROF_HBUCKETS - 1;
-            tl_prof.heap_cnt[hb][sol]++;
-        } else {
-            d = sokoban_solve(pz, used, NULL);
+        int leaf_best = -1;
+        int leaf_d[NCELLS];
+        int had_skip = 0;
+
+        for (int si = 0; si < n_ps; si++) {
+            int ps = ps_cells[si];
+
+            /* Per-mask walk-distance bound: if any earlier start sj got d,
+             * from ps the result is at most d + walk(sj→ps).  If that
+             * cannot beat g_best, skip this start for this mask. */
+            int skip = 0;
+            for (int sj = 0; sj < si && !skip; sj++) {
+                if (leaf_d[sj] < 0) continue;
+                int8_t w = vwalk[ps_vis[sj]][ps];
+                if (w < 0) continue;
+                if (leaf_d[sj] + (int)w <= g_best) skip = 1;
+            }
+            if (skip) { leaf_d[si] = -3; continue; }
+
+            /* KS lookup for this start */
+            KnownSolvable *ks = &ks_arr[si];
+            int ks_hit = 0;
+            for (int k = 0; k < ks->count; k++) {
+                if ((cur_packed & ks->packed[k]) == ks->packed[k]) {
+                    int d = ks->dist[k];
+                    if (d > g_best) { pz->player_start = ps; update_best(d, pz); }
+                    leaf_d[si] = d;
+                    if (d > leaf_best) leaf_best = d;
+                    ks_hit = 1;
+                    break;
+                }
+            }
+            if (ks_hit) continue;
+
+            /* BFS call */
+            pz->player_start = ps;
+            tl_ncalls++;
+            uint8_t used[MAX_BLOCKS] = {0};
+            int d;
+            if (g_profile_mode) {
+                struct timespec _t0, _t1;
+                BfsProfile bprof = {0};
+                clock_gettime(CLOCK_MONOTONIC, &_t0);
+                d = sokoban_solve(pz, used, &bprof);
+                clock_gettime(CLOCK_MONOTONIC, &_t1);
+                long long ns = (_t1.tv_sec - _t0.tv_sec) * 1000000000LL
+                             + (_t1.tv_nsec - _t0.tv_nsec);
+                if (ns < 1) ns = 1;
+                int sol = (d >= 0) ? 1 : 0;
+                int tb = 63 - __builtin_clzll((unsigned long long)ns);
+                if (tb < 0) tb = 0;
+                if (tb >= PROF_TBUCKETS) tb = PROF_TBUCKETS - 1;
+                tl_prof.time_cnt[tb][sol]++;
+                int hp = bprof.peak_heap_sz < 1 ? 1 : bprof.peak_heap_sz;
+                int hb = 63 - __builtin_clzll((unsigned long long)hp);
+                if (hb < 0) hb = 0;
+                if (hb >= PROF_HBUCKETS) hb = PROF_HBUCKETS - 1;
+                tl_prof.heap_cnt[hb][sol]++;
+                tl_prof.ps_calls[ps]++;
+            } else {
+                d = sokoban_solve(pz, used, NULL);
+            }
+            if (d == -2) {
+                record_skip(pz);
+                leaf_d[si] = -2;
+                had_skip = 1;
+                continue;
+            }
+            leaf_d[si] = d;
+            if (d > g_best) update_best(d, pz);
+            if (d >= 0 && ks->count < MAX_KS) {
+                uint32_t u_packed = 0;
+                for (int i = 0; i < nb; i++) u_packed |= ((uint32_t)used[i] << (i*4));
+                ks->packed[ks->count] = u_packed;
+                ks->dist  [ks->count] = d;
+                ks->count++;
+            }
+            if (d == -1) {
+                /* Unsolvable from one start → unsolvable from all starts
+                 * in the same walkable component (player can walk between). */
+                ga_add(ga, pz->block_pushable, nb);
+                return -1;
+            }
+            if (d > leaf_best) leaf_best = d;
         }
-        if (d == -2) {
-            record_skip(pz);
-            return -2;
-        }
-        if (d > g_best) update_best(d, pz);
-        if (d >= 0 && ks->count < MAX_KS) {
-            uint32_t u_packed = 0;
-            for (int i = 0; i < nb; i++) u_packed |= ((uint32_t)used[i] << (i*4));
-            ks->packed[ks->count] = u_packed;
-            ks->dist  [ks->count] = d;
-            ks->count++;
-        }
-        if (d == -1) ga_add(ga, pz->block_pushable, nb);
-        return d;
+        return (leaf_best == -1 && had_skip) ? -2 : leaf_best;
     }
 
     int            nm   = cell_nmasks[pz->block_pos[bi]];
@@ -665,46 +716,38 @@ static int try_bitmasks(Puzzle *pz, int bi, uint8_t *unsolv, int *pn,
     int            best = -1;
     int            had_skip = 0;
 
-    /* XC table indexed by thresh (4-bit mask, 0-15).
-     * xc_masks[t] holds unsolvable masks for block bi+1 when block bi = t.
-     * Seeding uses superset_list[m] to visit only relevant buckets:
-     * for m ⊆ t, the bi+1 mask was also unsolvable when bi=m (Fact 2).
-     * With 16 buckets of ≤16 entries each, the hot high-popcount masks
-     * (1-2 supersets) check 16-32 entries instead of scanning all 256. */
     uint8_t xc_masks[16][16];
     int     xc_cnt[16];
     memset(xc_cnt, 0, sizeof xc_cnt);
 
     for (int mi = 0; mi < nm; mi++) {
         uint8_t m = ms[mi];
-        if (m & ~cap) continue;              /* m exceeds geo_mask ceiling */
+        if (m & ~cap) continue;
 
-        /* Skip if m is dominated by the current level's unsolvable antichain */
         int skip = 0;
         for (int j = 0; j < *pn && !skip; j++)
             if ((m & unsolv[j]) == m) skip = 1;
         if (skip) continue;
 
-        /* Seed next level's antichain from XC buckets at thresh ⊇ m */
-        uint8_t b_unsolv[MAX_UNSOLV]; int nb = 0;
+        uint8_t b_unsolv[MAX_UNSOLV]; int nbx = 0;
         int ns = superset_cnt[m];
         for (int si = 0; si < ns; si++) {
             int t = superset_list[m][si];
             for (int xi = 0; xi < xc_cnt[t]; xi++) {
                 uint8_t x = xc_masks[t][xi];
                 int dominated = 0;
-                for (int k = 0; k < nb && !dominated; k++)
+                for (int k = 0; k < nbx && !dominated; k++)
                     if ((x & b_unsolv[k]) == x) dominated = 1;
-                if (!dominated) b_unsolv[nb++] = x;
+                if (!dominated) b_unsolv[nbx++] = x;
             }
         }
-        int nb_seed = nb;
+        int nb_seed = nbx;
 
         pz->block_pushable[bi] = m;
-        int d = try_bitmasks(pz, bi + 1, b_unsolv, &nb, ga, ks, geo_mask);
+        int d = try_bitmasks_ms(pz, bi + 1, b_unsolv, &nbx, ga, geo_mask,
+                                ps_cells, ps_vis, n_ps, vwalk, ks_arr);
 
-        /* Record newly discovered unsolvable masks under thresh=m */
-        for (int j = nb_seed; j < nb; j++)
+        for (int j = nb_seed; j < nbx; j++)
             if (xc_cnt[m] < 16) xc_masks[m][xc_cnt[m]++] = b_unsolv[j];
 
         if (d == -1) unsolv[(*pn)++] = m;
@@ -864,74 +907,73 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
             for (int vi = 0; vi < n_valid; vi++)
                 if (comp_id[vi] == vi) comp_ga[vi].count = 0;
 
-            /* proc_K[vi] = best solution distance found for valid start vi.
-             * -1 means unsolvable (no bitmask yielded a solution).
-             * INT_MIN means this start was skipped (not yet processed).
-             * Indexed by vi (valid start index) to stay aligned with vwalk[]. */
-            int proc_K[NCELLS];
-            for (int vi = 0; vi < n_valid; vi++) proc_K[vi] = INT_MIN;
-
-            /* --- Enumerate player starting positions --- */
+            /* Phase 1: all-immovable check for every valid start. */
+            uint32_t imm_blocked = occ & ~(1u << ep);
+            int imm_d[NCELLS];
             for (int vi = 0; vi < n_valid; vi++) {
                 int ps = vpi[vi];
-
-                /* Walk-distance upper bound: if every previously processed
-                 * player start ps0 with result K0 gives K0 + walk(ps0→ps)
-                 * ≤ g_best, then no bitmask can yield a better result from
-                 * ps (since from ps you can walk to ps0 in walk(ps0→ps)
-                 * steps and follow ps0's solution). Skip ps in that case.
-                 * proc_K and vwalk are both indexed by vi so skipped starts
-                 * (proc_K[pv]==INT_MIN) are excluded without index drift. */
-                int bound = INT_MAX;
-                for (int pv = 0; pv < vi; pv++) {
-                    if (proc_K[pv] == INT_MIN) continue; /* skipped: no result */
-                    if (proc_K[pv] < 0) continue;        /* unsolvable: no bound */
-                    int8_t d = vwalk[pv][ps];
-                    if (d < 0) continue;             /* ps unreachable from pv */
-                    int b = proc_K[pv] + (int)d;
-                    if (b < bound) bound = b;
+                tl_ncalls++;
+                imm_d[vi] = fast_reachable(imm_blocked, ps, ep);
+                if (imm_d[vi] > g_best) {
+                    Puzzle pz; memset(&pz, 0, sizeof pz);
+                    pz.exit_pos = ep; pz.player_start = ps; pz.walls = wall_mask;
+                    pz.num_blocks = nb_mov;
+                    pz.num_holes = g_fixed_nholes + nh;
+                    for (int i = 0; i < g_fixed_nholes; i++) pz.hole_pos[i] = g_fixed_hole_pos[i];
+                    for (int i = 0; i < nh; i++) pz.hole_pos[g_fixed_nholes + i] = hp[i];
+                    for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
+                    for (int i = 0; i < nb_mov; i++) pz.block_pushable[i] = 0;
+                    update_best(imm_d[vi], &pz);
                 }
-                if (bound <= g_best) continue;       /* cannot beat global best */
+            }
 
-                Puzzle pz;
-                memset(&pz, 0, sizeof pz);
-                pz.exit_pos     = ep;
-                pz.player_start = ps;
-                pz.walls        = wall_mask;
-                pz.num_blocks   = nb_mov;
-                pz.num_holes    = g_fixed_nholes + nh;
+            /* Phase 2: per-component bitmask search. */
+            for (int ci = 0; ci < n_valid; ci++) {
+                if (comp_id[ci] != ci) continue;
+
+                int ps_cells[NCELLS], ps_vis[NCELLS], n_ps = 0;
+                for (int vj = 0; vj < n_valid; vj++) {
+                    if (comp_id[vj] != ci) continue;
+                    if (imm_d[vj] >= 0) continue;
+                    int bounded = 0;
+                    for (int vk = 0; vk < n_valid && !bounded; vk++) {
+                        if (comp_id[vk] != ci || imm_d[vk] < 0) continue;
+                        int8_t w = vwalk[vk][vpi[vj]];
+                        if (w >= 0 && imm_d[vk] + (int)w <= g_best) bounded = 1;
+                    }
+                    if (bounded) continue;
+                    ps_cells[n_ps] = vpi[vj];
+                    ps_vis[n_ps]   = vj;
+                    n_ps++;
+                }
+                if (n_ps == 0) continue;
+
+                Puzzle pz; memset(&pz, 0, sizeof pz);
+                pz.exit_pos   = ep;
+                pz.walls      = wall_mask;
+                pz.num_blocks = nb_mov;
+                pz.num_holes  = g_fixed_nholes + nh;
                 for (int i = 0; i < g_fixed_nholes; i++) pz.hole_pos[i] = g_fixed_hole_pos[i];
                 for (int i = 0; i < nh; i++) pz.hole_pos[g_fixed_nholes + i] = hp[i];
-                for (int i = 0; i < nb_mov; i++)
-                    pz.block_pos[i] = mbp[i];
+                for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
 
-                /* All-immovable check: mask=0 is the lattice bottom,
-                 * a subset of every mask vector.  By Fact 1, if it is
-                 * solvable with d steps, no other mask vector can give
-                 * more than d steps — d is the maximum for this position.
-                 * imm_blocked uses occ which covers all block positions
-                 * (both wall-designated and movable), so wall cells are
-                 * correctly treated as obstacles here. */
-                for (int i = 0; i < nb_mov; i++)
-                    pz.block_pushable[i] = 0;
-                tl_ncalls++;
-                uint32_t imm_blocked = occ & ~(1u << ep);
-                int d0 = fast_reachable(imm_blocked, ps, ep);
-                if (d0 > g_best) update_best(d0, &pz);
-                if (d0 >= 0) { proc_K[vi] = d0; continue; }
+                KnownSolvable ks_arr[NCELLS];
+                for (int s = 0; s < n_ps; s++) ks_arr[s].count = 0;
 
-                /* All-immovable unsolvable: full bitmask search.
-                 * try_bitmasks starts top-down (max valid first).
-                 * Uses the shared component GlobalAntichain so that
-                 * unsolvable bitmask vectors found for any prior player
-                 * start in the same free-walking component are immediately
-                 * pruned without a BFS call. KnownSolvable is kept
-                 * per-player-start as distances differ across starts. */
-                KnownSolvable   ks; ks.count = 0;
                 uint8_t unsolv0[MAX_UNSOLV]; int n0 = 0;
-                int k_bitmask = try_bitmasks(&pz, 0, unsolv0, &n0,
-                                             &comp_ga[comp_id[vi]], &ks, geo_mask);
-                proc_K[vi] = k_bitmask;
+                struct timespec _ps_t0, _ps_t1;
+                if (g_profile_mode) clock_gettime(CLOCK_MONOTONIC, &_ps_t0);
+
+                try_bitmasks_ms(&pz, 0, unsolv0, &n0, &comp_ga[ci], geo_mask,
+                                ps_cells, ps_vis, n_ps, vwalk, ks_arr);
+
+                if (g_profile_mode) {
+                    clock_gettime(CLOCK_MONOTONIC, &_ps_t1);
+                    double dt = (_ps_t1.tv_sec - _ps_t0.tv_sec)
+                              + (_ps_t1.tv_nsec - _ps_t0.tv_nsec) * 1e-9;
+                    for (int s = 0; s < n_ps; s++)
+                        tl_prof.ps_time[ps_cells[s]] += dt / n_ps;
+                }
             }
         } while (comb_next(&wsc));
     } while (comb_next(&bc));
@@ -994,6 +1036,29 @@ static void print_profile(const ProfData *p) {
         char pct_buf[16];
         snprintf(pct_buf, sizeof(pct_buf), "%.2f–%.2f%%", pct_lo, pct_hi);
         printf("  %-18s  %12lld  %12lld  %8s\n", range, s, u, pct_buf);
+    }
+
+    /* Per-player-start breakdown */
+    printf("\nTime per player start (sorted by time):\n");
+    printf("  %4s  %4s  %4s  %12s  %12s\n", "cell", "row", "col", "time (s)", "BFS calls");
+    /* collect non-zero entries and sort by time descending */
+    int order[NCELLS];
+    int n_ps = 0;
+    for (int c = 0; c < NCELLS; c++)
+        if (p->ps_calls[c] > 0) order[n_ps++] = c;
+    /* insertion sort descending by time */
+    for (int i = 1; i < n_ps; i++) {
+        int key = order[i];
+        int j = i - 1;
+        while (j >= 0 && p->ps_time[order[j]] < p->ps_time[key]) {
+            order[j + 1] = order[j]; j--;
+        }
+        order[j + 1] = key;
+    }
+    for (int i = 0; i < n_ps; i++) {
+        int c = order[i];
+        printf("  %4d  %4d  %4d  %12.3f  %12lld\n",
+               c, c / COLS, c % COLS, p->ps_time[c], p->ps_calls[c]);
     }
 }
 
@@ -1084,46 +1149,77 @@ static void process_block_combo(int ei, int nw, int nh, const int *hp,
         for (int vi = 0; vi < n_valid; vi++)
             if (comp_id[vi] == vi) comp_ga[vi].count = 0;
 
-        int proc_K[NCELLS];
-        for (int vi = 0; vi < n_valid; vi++) proc_K[vi] = INT_MIN;
-
+        /* Phase 1: all-immovable check for every valid start. */
+        uint32_t imm_blocked = occ & ~(1u << ep);
+        int imm_d[NCELLS];
         for (int vi = 0; vi < n_valid; vi++) {
             int ps = vpi[vi];
-
-            int bound = INT_MAX;
-            for (int pv = 0; pv < vi; pv++) {
-                if (proc_K[pv] == INT_MIN) continue;
-                if (proc_K[pv] < 0) continue;
-                int8_t d = vwalk[pv][ps];
-                if (d < 0) continue;
-                int b = proc_K[pv] + (int)d;
-                if (b < bound) bound = b;
+            tl_ncalls++;
+            imm_d[vi] = fast_reachable(imm_blocked, ps, ep);
+            if (imm_d[vi] > g_best) {
+                Puzzle pz; memset(&pz, 0, sizeof pz);
+                pz.exit_pos = ep; pz.player_start = ps; pz.walls = wall_mask;
+                pz.num_blocks = nb_mov;
+                pz.num_holes = g_fixed_nholes + nh;
+                for (int i = 0; i < g_fixed_nholes; i++) pz.hole_pos[i] = g_fixed_hole_pos[i];
+                for (int i = 0; i < nh; i++) pz.hole_pos[g_fixed_nholes + i] = hp[i];
+                for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
+                for (int i = 0; i < nb_mov; i++) pz.block_pushable[i] = 0;
+                update_best(imm_d[vi], &pz);
             }
-            if (bound <= g_best) continue;
+        }
 
-            Puzzle pz;
-            memset(&pz, 0, sizeof pz);
-            pz.exit_pos     = ep;
-            pz.player_start = ps;
-            pz.walls        = wall_mask;
-            pz.num_blocks   = nb_mov;
-            pz.num_holes    = g_fixed_nholes + nh;
+        /* Phase 2: per-component bitmask search.
+         * Collect starts where fast_reachable failed, bounded away by neither
+         * the immovable result nor the walk-distance bound from other starts. */
+        for (int ci = 0; ci < n_valid; ci++) {
+            if (comp_id[ci] != ci) continue; /* not a component root */
+
+            int ps_cells[NCELLS], ps_vis[NCELLS], n_ps = 0;
+            for (int vj = 0; vj < n_valid; vj++) {
+                if (comp_id[vj] != ci) continue;
+                if (imm_d[vj] >= 0) continue; /* fast_reachable solved it */
+                /* Walk-distance bound from immovable results */
+                int bounded = 0;
+                for (int vk = 0; vk < n_valid && !bounded; vk++) {
+                    if (comp_id[vk] != ci || imm_d[vk] < 0) continue;
+                    int8_t w = vwalk[vk][vpi[vj]];
+                    if (w >= 0 && imm_d[vk] + (int)w <= g_best) bounded = 1;
+                }
+                if (bounded) continue;
+                ps_cells[n_ps] = vpi[vj];
+                ps_vis[n_ps]   = vj;
+                n_ps++;
+            }
+            if (n_ps == 0) continue;
+
+            Puzzle pz; memset(&pz, 0, sizeof pz);
+            pz.exit_pos   = ep;
+            pz.walls      = wall_mask;
+            pz.num_blocks = nb_mov;
+            pz.num_holes  = g_fixed_nholes + nh;
             for (int i = 0; i < g_fixed_nholes; i++) pz.hole_pos[i] = g_fixed_hole_pos[i];
-            for (int i = 0; i < nh;     i++) pz.hole_pos[g_fixed_nholes + i] = hp[i];
+            for (int i = 0; i < nh; i++) pz.hole_pos[g_fixed_nholes + i] = hp[i];
             for (int i = 0; i < nb_mov; i++) pz.block_pos[i] = mbp[i];
 
-            for (int i = 0; i < nb_mov; i++) pz.block_pushable[i] = 0;
-            tl_ncalls++;
-            uint32_t imm_blocked = occ & ~(1u << ep);
-            int d0 = fast_reachable(imm_blocked, ps, ep);
-            if (d0 > g_best) update_best(d0, &pz);
-            if (d0 >= 0) { proc_K[vi] = d0; continue; }
+            KnownSolvable ks_arr[NCELLS];
+            for (int s = 0; s < n_ps; s++) ks_arr[s].count = 0;
 
-            KnownSolvable   ks; ks.count = 0;
             uint8_t unsolv0[MAX_UNSOLV]; int n0 = 0;
-            int k_bitmask = try_bitmasks(&pz, 0, unsolv0, &n0,
-                                         &comp_ga[comp_id[vi]], &ks, geo_mask);
-            proc_K[vi] = k_bitmask;
+            long long ncalls_before = tl_ncalls;
+            struct timespec _ps_t0, _ps_t1;
+            if (g_profile_mode) clock_gettime(CLOCK_MONOTONIC, &_ps_t0);
+
+            try_bitmasks_ms(&pz, 0, unsolv0, &n0, &comp_ga[ci], geo_mask,
+                            ps_cells, ps_vis, n_ps, vwalk, ks_arr);
+
+            if (g_profile_mode) {
+                clock_gettime(CLOCK_MONOTONIC, &_ps_t1);
+                double dt = (_ps_t1.tv_sec - _ps_t0.tv_sec)
+                          + (_ps_t1.tv_nsec - _ps_t0.tv_nsec) * 1e-9;
+                for (int s = 0; s < n_ps; s++)
+                    tl_prof.ps_time[ps_cells[s]] += dt / n_ps;
+            }
         }
     } while (comb_next(&wsc));
 }
@@ -1500,6 +1596,11 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
                 for (int b = 0; b < PROF_HBUCKETS; b++) {
                     merged.heap_cnt[b][0] += args[t].prof.heap_cnt[b][0];
                     merged.heap_cnt[b][1] += args[t].prof.heap_cnt[b][1];
+                }
+            for (int t = 0; t < g_num_threads; t++)
+                for (int c = 0; c < NCELLS; c++) {
+                    merged.ps_time[c]  += args[t].prof.ps_time[c];
+                    merged.ps_calls[c] += args[t].prof.ps_calls[c];
                 }
             print_profile(&merged);
         }
