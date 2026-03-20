@@ -3,11 +3,11 @@
 
 /* Grid dimensions */
 #define ROWS       5
-#define COLS       5
-#define NCELLS     25   /* ROWS * COLS */
-#define MAX_BLOCKS 24
-#define MAX_HOLES  23
-#define CONSUMED   25   /* sentinel: block fell into a hole */
+#define COLS       6
+#define NCELLS     30   /* ROWS * COLS */
+#define MAX_BLOCKS 28
+#define MAX_HOLES  27
+#define CONSUMED   30   /* sentinel: block fell into a hole */
 
 /* Pushable-direction bits stored in block_pushable[]:  U=1 R=2 D=4 L=8 */
 

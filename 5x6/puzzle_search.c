@@ -41,48 +41,40 @@
 static int g_num_threads = NUM_THREADS;
 
 /*
- * Six canonical exit positions — the D4 fundamental domain for a 5×5 grid.
- * The full symmetry group of the square (D4, order 8: 4 rotations + 4
- * reflections) maps any exit cell to one of these six representatives:
+ * Nine canonical exit positions — the D2 fundamental domain for a 5×6 grid.
+ * The symmetry group of a rectangle (D2, order 4: identity + 180° rotation +
+ * horizontal flip + vertical flip) maps any exit cell to one of these nine
+ * representatives (rows 0-2, cols 0-2):
  *
  *   (0,0)=0   (0,1)=1   (0,2)=2
- *             (1,1)=6   (1,2)=7
- *                       (2,2)=12
+ *   (1,0)=6   (1,1)=7   (1,2)=8
+ *   (2,0)=12  (2,1)=13  (2,2)=14
  *
  * Symmetry reduction is applied to hole combinations: for each canonical exit,
  * the stabilizer subgroup (transforms fixing that exit) is used to keep only
  * the lexicographically-minimum hole combination in each orbit.
  *
  * Stabilizers (non-identity elements only):
- *   exit (0,0), (1,1)  — flip_d: (r,c)↔(c,r)
- *   exit (0,2), (1,2)  — flip_h: (r,c)↔(r,4-c)
- *   exit (0,1)         — trivial (no check needed)
- *   exit (2,2)         — full D4 (7 non-identity transforms checked)
+ *   exits in row 2: (2,0), (2,1), (2,2)  — flip_v: (r,c)↔(4-r,c)
+ *   all other exits                       — trivial (no check needed)
  *
  * Player starts are NOT restricted by symmetry; Approaches C (walk-distance
  * bounding) and A (free-component antichain sharing) handle pruning dynamically.
  */
-#define NUM_EXIT_CELLS 6
-static const int EXIT_CELLS[NUM_EXIT_CELLS] = { 0, 1, 2, 6, 7, 12 };
+#define NUM_EXIT_CELLS 9
+static const int EXIT_CELLS[NUM_EXIT_CELLS] = { 0, 1, 2, 6, 7, 8, 12, 13, 14 };
 
 /*
- * D4 cell transform tables — initialised in precompute_tables().
- * Each maps cell index p=(r*5+c) to its image under the named symmetry.
- *   rot90 : (r,c) → (c,   4-r)   [90° clockwise]
- *   rot180: (r,c) → (4-r, 4-c)
- *   rot270: (r,c) → (4-c, r  )   [270° clockwise]
- *   flip_h: (r,c) → (r,   4-c)   [horizontal flip]
+ * D2 cell transform tables — initialised in precompute_tables().
+ * Each maps cell index p=(r*6+c) to its image under the named symmetry.
+ *   rot180: (r,c) → (4-r, 5-c)   [180° rotation]
+ *   flip_h: (r,c) → (r,   5-c)   [horizontal flip]
  *   flip_v: (r,c) → (4-r, c  )   [vertical flip]
- *   flip_d: (r,c) → (c,   r  )   [main-diagonal flip]
- *   flip_a: (r,c) → (4-c, 4-r)   [anti-diagonal flip]
+ * (rot90/rot270/flip_d/flip_a do not apply to a non-square grid.)
  */
-static int8_t t_rot90 [NCELLS];
 static int8_t t_rot180[NCELLS];
-static int8_t t_rot270[NCELLS];
 static int8_t t_flip_h[NCELLS];
 static int8_t t_flip_v[NCELLS];
-static int8_t t_flip_d[NCELLS];
-static int8_t t_flip_a[NCELLS];
 
 /* -------------------------------------------------------------------------
  * Combination iterator
@@ -441,17 +433,13 @@ static void precompute_tables(void) {
         superset_cnt[m] = n;
     }
 
-    /* D4 cell transform tables.  All transforms act on a 5×5 grid where
-     * cell p encodes (r,c) as p = r*COLS + c with r,c in [0, ROWS-1]. */
+    /* D2 cell transform tables.  All transforms act on a 5×6 grid where
+     * cell p encodes (r,c) as p = r*COLS + c with r,c in [0, ROWS-1/COLS-1]. */
     for (int p = 0; p < NCELLS; p++) {
         int r = p / COLS, c = p % COLS;
-        t_rot90 [p] = (int8_t)(c        * COLS + (COLS-1-r));
         t_rot180[p] = (int8_t)((ROWS-1-r) * COLS + (COLS-1-c));
-        t_rot270[p] = (int8_t)((COLS-1-c) * COLS + r       );
         t_flip_h[p] = (int8_t)(r          * COLS + (COLS-1-c));
         t_flip_v[p] = (int8_t)((ROWS-1-r) * COLS + c       );
-        t_flip_d[p] = (int8_t)(c          * COLS + r       );
-        t_flip_a[p] = (int8_t)((COLS-1-c) * COLS + (ROWS-1-r));
     }
 }
 
@@ -809,14 +797,8 @@ static void process_hole_config(int ei, int nw, int nh, const int *hp, int total
         /* All transforms that are in the exit stabilizer and fix hp */
         #define ADD_BT(t) if (transform_ok_fixed(t) && (nh == 0 || transform_fixes_holes(hp, nh, t))) bt[nbt++] = (t)
         switch (ei) {
-        case 0: case 3: ADD_BT(t_flip_d); break;
-        case 2: case 4: ADD_BT(t_flip_h); break;
-        case 5:
-            ADD_BT(t_rot90); ADD_BT(t_rot180); ADD_BT(t_rot270);
-            ADD_BT(t_flip_h); ADD_BT(t_flip_v);
-            ADD_BT(t_flip_d); ADD_BT(t_flip_a);
-            break;
-        default: break; /* ei=1: trivial stabilizer */
+        case 6: case 7: case 8: ADD_BT(t_flip_v); break; /* row 2 exits */
+        default: break; /* trivial stabilizer */
         }
         #undef ADD_BT
     }
@@ -1378,13 +1360,7 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
                 const int8_t *bt[7]; int nbt = 0;
                 #define ADD_BT0(t) if (transform_ok_fixed(t)) bt[nbt++] = (t)
                 switch (ei) {
-                case 0: case 3: ADD_BT0(t_flip_d); break;
-                case 2: case 4: ADD_BT0(t_flip_h); break;
-                case 5:
-                    ADD_BT0(t_rot90);  ADD_BT0(t_rot180); ADD_BT0(t_rot270);
-                    ADD_BT0(t_flip_h); ADD_BT0(t_flip_v);
-                    ADD_BT0(t_flip_d); ADD_BT0(t_flip_a);
-                    break;
+                case 6: case 7: case 8: ADD_BT0(t_flip_v); break;
                 default: break;
                 }
                 #undef ADD_BT0
@@ -1429,20 +1405,8 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
 
                     /* Hole canonicality: only apply transforms compatible with fixed layout. */
                     switch (ei) {
-                    case 0: case 3:
-                        if (transform_ok_fixed(t_flip_d) && !holes_lex_min_under(hp, 1, t_flip_d)) continue;
-                        break;
-                    case 2: case 4:
-                        if (transform_ok_fixed(t_flip_h) && !holes_lex_min_under(hp, 1, t_flip_h)) continue;
-                        break;
-                    case 5:
-                        if (transform_ok_fixed(t_rot90 ) && !holes_lex_min_under(hp, 1, t_rot90 )) continue;
-                        if (transform_ok_fixed(t_rot180) && !holes_lex_min_under(hp, 1, t_rot180)) continue;
-                        if (transform_ok_fixed(t_rot270) && !holes_lex_min_under(hp, 1, t_rot270)) continue;
-                        if (transform_ok_fixed(t_flip_h) && !holes_lex_min_under(hp, 1, t_flip_h)) continue;
+                    case 6: case 7: case 8:
                         if (transform_ok_fixed(t_flip_v) && !holes_lex_min_under(hp, 1, t_flip_v)) continue;
-                        if (transform_ok_fixed(t_flip_d) && !holes_lex_min_under(hp, 1, t_flip_d)) continue;
-                        if (transform_ok_fixed(t_flip_a) && !holes_lex_min_under(hp, 1, t_flip_a)) continue;
                         break;
                     default: break;
                     }
@@ -1460,13 +1424,7 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
                     const int8_t *bt[7]; int nbt = 0;
                     #define ADD_BT(t) if (transform_ok_fixed(t) && transform_fixes_holes(hp, 1, t)) bt[nbt++] = (t)
                     switch (ei) {
-                    case 0: case 3: ADD_BT(t_flip_d); break;
-                    case 2: case 4: ADD_BT(t_flip_h); break;
-                    case 5:
-                        ADD_BT(t_rot90); ADD_BT(t_rot180); ADD_BT(t_rot270);
-                        ADD_BT(t_flip_h); ADD_BT(t_flip_v);
-                        ADD_BT(t_flip_d); ADD_BT(t_flip_a);
-                        break;
+                    case 6: case 7: case 8: ADD_BT(t_flip_v); break;
                     default: break;
                     }
                     #undef ADD_BT
@@ -1514,20 +1472,8 @@ static void puzzle_search(int total, int nw, int nh_lo_arg, int nh_hi_arg, int o
                     for (int i = 0; i < nh; i++) hp[i] = hpool[hc.idx[i]];
 
                     switch (ei) {
-                    case 0: case 3:
-                        if (transform_ok_fixed(t_flip_d) && !holes_lex_min_under(hp, nh, t_flip_d)) continue;
-                        break;
-                    case 2: case 4:
-                        if (transform_ok_fixed(t_flip_h) && !holes_lex_min_under(hp, nh, t_flip_h)) continue;
-                        break;
-                    case 5:
-                        if (transform_ok_fixed(t_rot90 ) && !holes_lex_min_under(hp, nh, t_rot90 )) continue;
-                        if (transform_ok_fixed(t_rot180) && !holes_lex_min_under(hp, nh, t_rot180)) continue;
-                        if (transform_ok_fixed(t_rot270) && !holes_lex_min_under(hp, nh, t_rot270)) continue;
-                        if (transform_ok_fixed(t_flip_h) && !holes_lex_min_under(hp, nh, t_flip_h)) continue;
+                    case 6: case 7: case 8:
                         if (transform_ok_fixed(t_flip_v) && !holes_lex_min_under(hp, nh, t_flip_v)) continue;
-                        if (transform_ok_fixed(t_flip_d) && !holes_lex_min_under(hp, nh, t_flip_d)) continue;
-                        if (transform_ok_fixed(t_flip_a) && !holes_lex_min_under(hp, nh, t_flip_a)) continue;
                         break;
                     default: break;
                     }
@@ -1630,13 +1576,13 @@ static void print_usage(const char *prog) {
         "  --profile                   print BFS call-time and peak-heap distributions\n"
         "  --help, -h                  show this help message\n"
         "\n"
-        "Exit cell layout (cell numbers on 5x5 grid, row-major):\n"
-        "  0  1  2  3  4\n"
-        "  5  6  7  8  9\n"
-        " 10 11 12 13 14\n"
-        " 15 16 17 18 19\n"
-        " 20 21 22 23 24\n"
-        "Valid exit cells (top-left quadrant + centre, up to symmetry): 0 1 2 6 7 12\n",
+        "Exit cell layout (cell numbers on 5x6 grid, row-major):\n"
+        "  0  1  2  3  4  5\n"
+        "  6  7  8  9 10 11\n"
+        " 12 13 14 15 16 17\n"
+        " 18 19 20 21 22 23\n"
+        " 24 25 26 27 28 29\n"
+        "Valid exit cells (top-left quadrant, up to symmetry): 0 1 2 6 7 8 12 13 14\n",
         prog, prog, MAX_BLOCKS, NUM_THREADS);
 }
 
@@ -1759,7 +1705,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (prompt("Exit cell (Enter = all valid) [0 1 2 6 7 12]: ", buf, sizeof buf)) {
+        if (prompt("Exit cell (Enter = all valid) [0 1 2 6 7 8 12 13 14]: ", buf, sizeof buf)) {
             int exit_cell = atoi(buf);
             for (int j = 0; j < NUM_EXIT_CELLS; j++)
                 if (EXIT_CELLS[j] == exit_cell) { only_ei = j; break; }
@@ -1799,7 +1745,7 @@ int main(int argc, char **argv) {
                     if (EXIT_CELLS[j] == exit_cell) { only_ei = j; break; }
                 if (only_ei < 0) {
                     fprintf(stderr,
-                            "error: %d is not a valid exit cell (valid: 0 1 2 6 7 12)\n",
+                            "error: %d is not a valid exit cell (valid: 0 1 2 6 7 8 12 13 14)\n",
                             exit_cell);
                     return 1;
                 }

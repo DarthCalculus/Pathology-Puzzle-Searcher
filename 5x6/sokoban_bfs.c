@@ -9,21 +9,21 @@
  * Directions: 0=Up, 1=Right, 2=Down, 3=Left
  */
 static const int8_t adj[NCELLS][4] = {
-    /* row 0 */
-    {-1,  1,  5, -1}, {-1,  2,  6,  0}, {-1,  3,  7,  1},
-    {-1,  4,  8,  2}, {-1, -1,  9,  3},
-    /* row 1 */
-    { 0,  6, 10, -1}, { 1,  7, 11,  5}, { 2,  8, 12,  6},
-    { 3,  9, 13,  7}, { 4, -1, 14,  8},
-    /* row 2 */
-    { 5, 11, 15, -1}, { 6, 12, 16, 10}, { 7, 13, 17, 11},
-    { 8, 14, 18, 12}, { 9, -1, 19, 13},
-    /* row 3 */
-    {10, 16, 20, -1}, {11, 17, 21, 15}, {12, 18, 22, 16},
-    {13, 19, 23, 17}, {14, -1, 24, 18},
-    /* row 4 */
-    {15, 21, -1, -1}, {16, 22, -1, 20}, {17, 23, -1, 21},
-    {18, 24, -1, 22}, {19, -1, -1, 23},
+    /* row 0: cells 0-5 */
+    {-1,  1,  6, -1}, {-1,  2,  7,  0}, {-1,  3,  8,  1},
+    {-1,  4,  9,  2}, {-1,  5, 10,  3}, {-1, -1, 11,  4},
+    /* row 1: cells 6-11 */
+    { 0,  7, 12, -1}, { 1,  8, 13,  6}, { 2,  9, 14,  7},
+    { 3, 10, 15,  8}, { 4, 11, 16,  9}, { 5, -1, 17, 10},
+    /* row 2: cells 12-17 */
+    { 6, 13, 18, -1}, { 7, 14, 19, 12}, { 8, 15, 20, 13},
+    { 9, 16, 21, 14}, {10, 17, 22, 15}, {11, -1, 23, 16},
+    /* row 3: cells 18-23 */
+    {12, 19, 24, -1}, {13, 20, 25, 18}, {14, 21, 26, 19},
+    {15, 22, 27, 20}, {16, 23, 28, 21}, {17, -1, 29, 22},
+    /* row 4: cells 24-29 */
+    {18, 25, -1, -1}, {19, 26, -1, 24}, {20, 27, -1, 25},
+    {21, 28, -1, 26}, {22, 29, -1, 27}, {23, -1, -1, 28},
 };
 
 /* ========================================================================
@@ -472,9 +472,9 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
  *   Left  — shift right by 1, masking col 0 to prevent row wraparound
  * ======================================================================== */
 
-#define COL0_MASK  0x108421u   /* bits 0,5,10,15,20  — column 0 */
-#define COL4_MASK  0x1084210u  /* bits 4,9,14,19,24  — column 4 */
-#define ALL_CELLS  0x1FFFFFFu  /* bits 0-24          — all 25 cells */
+#define COL0_MASK  0x1041041u   /* bits 0,6,12,18,24  — column 0 */
+#define COL5_MASK  0x20820820u  /* bits 5,11,17,23,29 — column 5 */
+#define ALL_CELLS  0x3FFFFFFFu  /* bits 0-29          — all 30 cells */
 
 /* walk_dists_from: BFS distances from start to all reachable cells.
  * out[i] = distance, or -1 if unreachable. */
@@ -488,9 +488,9 @@ static void walk_dists_from(uint32_t blocked, int start, int8_t *out) {
     int8_t dist = 0;
     while (frontier) {
         dist++;
-        uint32_t nxt = (frontier >> 5)
-                     | (frontier << 5)
-                     | ((frontier & ~COL4_MASK) << 1)
+        uint32_t nxt = (frontier >> 6)
+                     | (frontier << 6)
+                     | ((frontier & ~COL5_MASK) << 1)
                      | ((frontier & ~COL0_MASK) >> 1);
         frontier = nxt & free_mask & ~reached;
         reached |= frontier;
