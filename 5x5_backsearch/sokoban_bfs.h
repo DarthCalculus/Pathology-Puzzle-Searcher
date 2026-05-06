@@ -1,0 +1,68 @@
+#pragma once
+#include <stdint.h>
+
+/* Grid dimensions */
+#define ROWS       5
+#define COLS       5
+#define NCELLS     25   /* ROWS * COLS */
+#define MAX_BLOCKS 24
+#define MAX_HOLES  23
+#define CONSUMED   25   /* sentinel: block fell into a hole */
+
+/* Pushable-direction bits stored in block_pushable[]:  U=1 R=2 D=4 L=8 */
+
+typedef struct {
+    uint32_t walls;               /* bitmask: bit i set → cell i is a wall    */
+    int      exit_pos;            /* cell index the block must reach           */
+    int      player_start;        /* cell index where the player begins        */
+    int      num_blocks;
+    int      block_pos[MAX_BLOCKS];      /* current cell index, or CONSUMED    */
+    uint8_t  block_pushable[MAX_BLOCKS]; /* direction bitmask per block        */
+    int      num_holes;
+    int      hole_pos[MAX_HOLES];        /* cell indices of holes              */
+} Puzzle;
+
+/* Returns the cell index for row r, column c */
+static inline int pos(int r, int c) { return r * COLS + c; }
+static inline int row_(int p)       { return p / COLS; }
+static inline int col_(int p)       { return p % COLS; }
+
+/*
+ * sokoban_solve(pz, used_dirs, prof)
+ *
+ * Runs optimised BFS on the puzzle.  Returns the minimum number of moves
+ * to reach exit_pos, -1 if unsolvable, -2 if the BFS queue overflowed
+ * (out of memory), or -3 if the hash table probe limit was exceeded.
+ * Callers must treat -2 and -3 as fatal errors (state space not fully
+ * explored), not as unsolvable.
+ *
+ * used_dirs: if non-NULL and the puzzle is solvable, filled with the
+ *   per-block bitmask of push directions that were actually used on the
+ *   optimal path (U=1 R=2 D=4 L=8).  A block that was never pushed gets 0.
+ *   Pass NULL to skip path tracking.
+ *
+ * prof: if non-NULL, filled with profiling data for this call.
+ *   Pass NULL for normal operation.
+ */
+typedef struct {
+    int peak_heap_sz;  /* max heap entries live at any point during the solve */
+} BfsProfile;
+
+int  sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof);
+
+/*
+ * sokoban_solve_cutoff(pz, used_dirs, prof, max_cost)
+ *
+ * Like sokoban_solve, but bounded by max_cost.  Returns:
+ *   x in [0, max_cost] : shortest forward solve length x.
+ *   -1                 : no path of length <= max_cost (or unsolvable).
+ *   -2                 : heap overflow.
+ *
+ * Useful when the caller knows answers above max_cost are uninteresting.
+ * E.g., a backward shortcut check at depth d+1 only cares whether some
+ * path of length <= d-1 exists (parity rules out length d), so it can
+ * pass max_cost = d-1 and skip the entire Dijkstra shell from d-1 to d+1.
+ */
+int  sokoban_solve_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost);
+
+void sokoban_init(void);   /* call once before spawning threads */

@@ -1,0 +1,192 @@
+#!/bin/bash
+# backsearch — parallel orchestrator.  Auto-enumerates tasks (one bucket per
+# exit × exit-adjacent-hole partition) and runs them concurrently.  All flags
+# are passed through to the C worker (backsearch_worker).
+
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKER="$SCRIPT_DIR/backsearch_worker"
+
+if [ ! -x "$WORKER" ]; then
+    echo "error: backsearch_worker not found or not executable at $WORKER" >&2
+    echo "       build with: cc -O3 -pthread -o backsearch_worker backsearch.c sokoban_bfs.c" >&2
+    exit 1
+fi
+
+# Extract --num-threads from argv (consume it; rest is forwarded to the worker).
+NUM_THREADS=6
+PASS_ARGS=()
+i=0
+while [ $i -lt $# ]; do
+    i=$((i+1))
+    a="${!i}"
+    case "$a" in
+        --help|-h) exec "$WORKER" --help ;;
+        --num-threads)
+            i=$((i+1))
+            NUM_THREADS="${!i}"
+            ;;
+        --num-threads=*) NUM_THREADS="${a#--num-threads=}" ;;
+        *)               PASS_ARGS+=("$a") ;;
+    esac
+done
+
+case "$NUM_THREADS" in
+    ''|*[!0-9]*) echo "error: --num-threads requires a positive integer (got '$NUM_THREADS')" >&2; exit 1 ;;
+esac
+if [ "$NUM_THREADS" -lt 1 ]; then
+    echo "error: --num-threads must be >= 1 (got $NUM_THREADS)" >&2
+    exit 1
+fi
+
+set -- "${PASS_ARGS[@]}"
+
+# Discover the task partition.  --list-tasks is an internal worker flag.
+TASK_LIST="$("$WORKER" "$@" --list-tasks 2>&1)"
+LIST_RC=$?
+if [ $LIST_RC -ne 0 ]; then
+    echo "$TASK_LIST" >&2
+    exit $LIST_RC
+fi
+
+N_TASKS="$(printf '%s\n' "$TASK_LIST" | awk '/^total: [0-9]+/ { print $2; exit }')"
+
+# Fall back to a single in-process run if partitioning yields 0 or 1 tasks.
+if [ -z "${N_TASKS:-}" ] || [ "$N_TASKS" -le 1 ]; then
+    exec "$WORKER" "$@"
+fi
+
+# Fan out: one worker process per task, with at most NUM_THREADS running
+# concurrently.  All workers' output is merged through a FIFO into a Python
+# filter that keeps only new GLOBAL-best blocks (debounced 1 s) and drops
+# per-task chatter.
+TMPDIR="$(mktemp -d -t backsearch.XXXXXX)"
+
+# Track every PID we spawn so the cleanup trap can kill them on abort.
+# SPAWNED holds direct children (subshells + the filter); each subshell has
+# its own pipeline children (worker, tee, awk) which we reach via pkill -P.
+SPAWNED=()
+
+kill_kids() {
+    # SIGTERM each subshell's pipeline kids (worker/tee/awk reachable via
+    # pkill -P), then the subshells themselves.  Brief grace period, then
+    # SIGKILL anything still hanging on.
+    if [ ${#SPAWNED[@]} -gt 0 ]; then
+        for pid in "${SPAWNED[@]}"; do
+            pkill -TERM -P "$pid" 2>/dev/null || true
+        done
+        kill -TERM "${SPAWNED[@]}" 2>/dev/null || true
+        sleep 0.2
+        for pid in "${SPAWNED[@]}"; do
+            pkill -KILL -P "$pid" 2>/dev/null || true
+        done
+        kill -KILL "${SPAWNED[@]}" 2>/dev/null || true
+    fi
+    rm -rf "${TMPDIR:-}"
+}
+
+# On signal: must exit explicitly — otherwise bash would keep going past
+# the interrupted `wait` and spawn MORE workers in the throttle loop.
+on_signal() {
+    trap '' EXIT INT TERM HUP
+    kill_kids
+    exit 130
+}
+
+# On normal exit: just cleanup; the trap fires after the script's last
+# command runs, so no explicit exit is needed.
+on_exit() {
+    trap '' EXIT
+    kill_kids
+}
+
+trap on_signal INT TERM HUP
+trap on_exit  EXIT
+
+# Total spawned workers = N_TASKS partition tasks + 1 shallow scan that
+# covers depths 0..2 (which the depth-3 partition seeds can't reach when
+# --num-walls is tight).
+TOTAL_WORKERS=$((N_TASKS + 1))
+SHALLOW_ID="$N_TASKS"
+
+EFFECTIVE_THREADS="$NUM_THREADS"
+if [ "$EFFECTIVE_THREADS" -gt "$TOTAL_WORKERS" ]; then EFFECTIVE_THREADS="$TOTAL_WORKERS"; fi
+echo "[backsearch] $N_TASKS partition tasks + 1 shallow scan, running up to $EFFECTIVE_THREADS concurrently" >&2
+
+# Set up merge FIFO + filter.
+MERGED="$TMPDIR/merged"
+mkfifo "$MERGED"
+python3 "$SCRIPT_DIR/_backsearch_filter.py" < "$MERGED" &
+FILTER_PID=$!
+SPAWNED+=("$FILTER_PID")
+# Hold the FIFO write end open in this shell so worker subshells can write
+# to fd 3 without the FIFO closing prematurely between subshell exits.
+exec 3>"$MERGED"
+
+# Spawn the shallow scan first.  No --task-id (full standard root + push-off
+# seeds across all exits), capped at depth 2.
+SHALLOW_OUT="$TMPDIR/task-shallow.out"
+(
+    "$WORKER" "$@" --max-depth 2 2>&1 | tee "$SHALLOW_OUT" \
+        | awk -v t="$SHALLOW_ID" '{ printf("[task %d] %s\n", t, $0); fflush() }'
+) >&3 &
+RUNNING=($!)
+SPAWNED+=($!)
+
+EXIT_RC=0
+for ((i=0; i<N_TASKS; i++)); do
+    # Throttle: when we're at the cap, block on the OLDEST running PID.
+    # Bash 3.2 (macOS /bin/bash) lacks `wait -n`, so we can't wait on
+    # "any of these"; we wait on a specific one.  PIDs that exit ahead
+    # of the oldest sit briefly as zombies and get reaped on later
+    # iterations.  Plain `wait` blocks (no busy loop).
+    while [ "${#RUNNING[@]}" -ge "$EFFECTIVE_THREADS" ]; do
+        wait "${RUNNING[0]}" 2>/dev/null || EXIT_RC=$?
+        RUNNING=("${RUNNING[@]:1}")
+    done
+
+    OUT="$TMPDIR/task-$i.out"
+    (
+        "$WORKER" "$@" --task-id "$i" 2>&1 | tee "$OUT" \
+            | awk -v t="$i" '{ printf("[task %d] %s\n", t, $0); fflush() }'
+    ) >&3 &
+    RUNNING+=($!)
+    SPAWNED+=($!)
+done
+
+# Drain remaining workers.
+for pid in "${RUNNING[@]}"; do
+    wait "$pid" || EXIT_RC=$?
+done
+
+# Close the FIFO write end so the filter sees EOF and drains.
+exec 3>&-
+wait "$FILTER_PID"
+
+# Aggregate global best across all tasks.
+BEST_LINE="$(grep -hE '^Best depth:[[:space:]]+[0-9]+' "$TMPDIR"/task-*.out 2>/dev/null \
+              | sort -k3 -n -r | head -1)"
+
+ELAPSED="$SECONDS"
+H=$(( ELAPSED / 3600 ))
+M=$(( (ELAPSED % 3600) / 60 ))
+S=$(( ELAPSED % 60 ))
+if [ "$H" -gt 0 ]; then
+    ELAPSED_FMT=$(printf '%dh%02dm%02ds (%ds)' "$H" "$M" "$S" "$ELAPSED")
+elif [ "$M" -gt 0 ]; then
+    ELAPSED_FMT=$(printf '%dm%02ds (%ds)' "$M" "$S" "$ELAPSED")
+else
+    ELAPSED_FMT="${ELAPSED}s"
+fi
+
+echo
+echo "============================================================"
+echo "  Parallel run: $N_TASKS tasks completed"
+if [ -n "$BEST_LINE" ]; then
+    echo "  Global $BEST_LINE"
+fi
+echo "  Total elapsed: $ELAPSED_FMT"
+echo "============================================================"
+
+exit $EXIT_RC
