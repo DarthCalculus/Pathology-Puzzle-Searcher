@@ -144,6 +144,152 @@ static int g_list_tasks  = 0;
 static int       g_dupe_threshold = INT_MAX;
 static long long g_skipped_dedup  = 0;
 
+/* D4 symmetry exploitation: the (exit_pos, walkable_mask,
+ * fixed_holes_mask) configuration has a symmetry subgroup (up to all of
+ * D4 for centered exits on square grids, down to just identity for
+ * generic edge cells).  Each first-backstep direction and each
+ * push-off-exit seed direction sits in an orbit under that subgroup;
+ * only one representative per orbit is enumerated.  Up to 8x speedup
+ * for centered exits, 2x for corner/edge exits, no impact otherwise.
+ *
+ * D4 cell + direction permutations.  Built once at startup from the
+ * grid dimensions: 4 transforms always (identity + h-reflect + v-reflect
+ * + 180°-rotation), 8 when the grid is square (adds 90°/270° rotations
+ * and the two diagonal reflections). */
+typedef struct {
+    int8_t cell[NCELLS];   /* cell[i] = where active cell i maps; -1 if i is inactive */
+    int8_t dir[4];         /* dir[d]  = where direction d maps */
+} Sym;
+
+static int g_n_d4 = 0;
+static Sym g_d4[8];
+
+/* Per-exit symmetry subgroup (refreshed at the start of each exit's search). */
+static int       g_n_exit_syms = 0;
+static const Sym *g_exit_syms[8];
+
+/* Bitmask of canonical first-direction representatives at the current
+ * exit (one bit per orbit under g_exit_syms). */
+static int g_canonical_dir_mask = 0xF;
+
+/* -------------------------------------------------------------------------
+ * D4 symmetry helpers (used only when --canonical-roots is set).
+ * ------------------------------------------------------------------------- */
+
+/* Build the up-to-eight D4 transforms acting on the active region.  The
+ * four "axis-aligned" elements (identity, h-reflect, v-reflect, 180°)
+ * always preserve the RxC active region.  The four "diagonal" elements
+ * (90° / 270° rotations, main / anti diagonal reflections) only
+ * preserve it when R == C — they swap the row/column counts otherwise. */
+static void build_d4(void) {
+    g_n_d4 = 0;
+    int R = g_grid_rows, C = g_grid_cols;
+    int square = (R == C);
+
+    /* code: 0=id, 1=rot90 CW, 2=rot180, 3=rot270 CW,
+     *       4=h-reflect (flip vertically), 5=v-reflect (flip horizontally),
+     *       6=main-diag, 7=anti-diag. */
+    static const int diag_codes[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const int needs_square[8] = {0, 1, 0, 1, 0, 0, 1, 1};
+
+    /* Direction permutations.  Direction encoding: 0=U, 1=R, 2=D, 3=L. */
+    static const int8_t dir_perm[8][4] = {
+        {0, 1, 2, 3},   /* identity */
+        {1, 2, 3, 0},   /* rot90 CW: U->R, R->D, D->L, L->U */
+        {2, 3, 0, 1},   /* rot180 */
+        {3, 0, 1, 2},   /* rot270 CW */
+        {2, 1, 0, 3},   /* h-reflect (flip vertically): U<->D */
+        {0, 3, 2, 1},   /* v-reflect (flip horizontally): R<->L */
+        {3, 2, 1, 0},   /* main diag: U<->L, R<->D */
+        {1, 0, 3, 2},   /* anti diag: U<->R, D<->L */
+    };
+
+    for (int it = 0; it < 8; it++) {
+        if (needs_square[it] && !square) continue;
+        Sym *s = &g_d4[g_n_d4++];
+        for (int idx = 0; idx < NCELLS; idx++) s->cell[idx] = -1;
+        for (int r = 0; r < R; r++) {
+            for (int c = 0; c < C; c++) {
+                int nr, nc;
+                switch (diag_codes[it]) {
+                    case 0: nr = r;             nc = c;             break;
+                    case 1: nr = c;             nc = R - 1 - r;     break;
+                    case 2: nr = R - 1 - r;     nc = C - 1 - c;     break;
+                    case 3: nr = C - 1 - c;     nc = r;             break;
+                    case 4: nr = R - 1 - r;     nc = c;             break;
+                    case 5: nr = r;             nc = C - 1 - c;     break;
+                    case 6: nr = c;             nc = r;             break;
+                    case 7: nr = C - 1 - c;     nc = R - 1 - r;     break;
+                    default: nr = r;            nc = c;             break;
+                }
+                s->cell[r * COLS + c] = (int8_t)(nr * COLS + nc);
+            }
+        }
+        for (int d = 0; d < 4; d++) s->dir[d] = dir_perm[it][d];
+    }
+}
+
+static uint32_t apply_sym_mask(const Sym *s, uint32_t m) {
+    uint32_t out = 0;
+    while (m) {
+        int b = __builtin_ctz(m);
+        out |= 1u << s->cell[b];
+        m &= m - 1;
+    }
+    return out;
+}
+
+/* Filter g_d4 to those that fix (exit_pos, g_walkable_mask, g_fixed_holes_mask). */
+static void compute_exit_syms(int exit_pos) {
+    g_n_exit_syms = 0;
+    for (int i = 0; i < g_n_d4; i++) {
+        const Sym *s = &g_d4[i];
+        if (s->cell[exit_pos] != exit_pos) continue;
+        if (apply_sym_mask(s, g_walkable_mask) != g_walkable_mask) continue;
+        if (apply_sym_mask(s, g_fixed_holes_mask) != g_fixed_holes_mask) continue;
+        g_exit_syms[g_n_exit_syms++] = s;
+    }
+}
+
+/* Compute g_canonical_dir_mask: one bit per orbit of {0,1,2,3} under
+ * g_exit_syms (smallest D in each orbit).  Defaults to 0xF when not
+ * canonicalising. */
+static void compute_canonical_dir_mask(void) {
+    int orbit_id[4] = {-1, -1, -1, -1};
+    int next_orbit = 0;
+    for (int D = 0; D < 4; D++) {
+        if (orbit_id[D] >= 0) continue;
+        orbit_id[D] = next_orbit;
+        int frontier[4]; int nf = 0;
+        frontier[nf++] = D;
+        while (nf > 0) {
+            int x = frontier[--nf];
+            for (int i = 0; i < g_n_exit_syms; i++) {
+                int y = g_exit_syms[i]->dir[x];
+                if (orbit_id[y] >= 0) continue;
+                orbit_id[y] = next_orbit;
+                frontier[nf++] = y;
+            }
+        }
+        next_orbit++;
+    }
+    int seen_orbit[4] = {0};
+    int mask = 0;
+    for (int D = 0; D < 4; D++) {
+        if (!seen_orbit[orbit_id[D]]) {
+            seen_orbit[orbit_id[D]] = 1;
+            mask |= 1 << D;
+        }
+    }
+    g_canonical_dir_mask = mask;
+}
+
+/* Refresh g_canonical_dir_mask for a new exit. */
+static void refresh_canonical_for_exit(int exit_pos) {
+    compute_exit_syms(exit_pos);
+    compute_canonical_dir_mask();
+}
+
 /* -------------------------------------------------------------------------
  * Backward state
  * ------------------------------------------------------------------------- */
@@ -670,7 +816,20 @@ static void expand(const BState *s) {
     uint32_t hole_occ = 0;
     for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
 
+    /* Canonical-root pruning: at the standard-root state (depth 0, player
+     * at exit, no blocks, no holes) the four first-backstep directions sit
+     * in symmetry orbits.  Restricting to one representative per orbit
+     * prunes redundant subtrees without changing the set of reachable
+     * (modulo symmetry) puzzle layouts.  At any state that doesn't match
+     * the standard root, dir_mask stays 0xF (no pruning). */
+    int dir_mask = 0xF;
+    if (s->depth == 0 && s->nblocks == 0 && s->nholes == 0
+        && P == g_exit_pos) {
+        dir_mask = g_canonical_dir_mask;
+    }
+
     for (int D = 0; D < 4; D++) {
+        if (!(dir_mask & (1 << D))) continue;
         int C = adj[P][D ^ 2];                   /* player came from C */
         if (C < 0) continue;
         if (C == g_exit_pos) continue;             /* optimal play doesn't revisit exit */
@@ -892,7 +1051,14 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
     uint32_t hole_occ = 0;
     for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
 
+    int dir_mask = 0xF;
+    if (s->depth == 0 && s->nblocks == 0 && s->nholes == 0
+        && P == g_exit_pos) {
+        dir_mask = g_canonical_dir_mask;
+    }
+
     for (int D = 0; D < 4; D++) {
+        if (!(dir_mask & (1 << D))) continue;
         int C = adj[P][D ^ 2];
         if (C < 0) continue;
         if (C == g_exit_pos) continue;
@@ -995,6 +1161,7 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
     int n_tasks = 0;
     int saved_exit = g_exit_pos;
     g_exit_pos = exit_pos;
+    refresh_canonical_for_exit(exit_pos);
 
     /* Build the depth-0 roots. */
     BState roots[8];
@@ -1021,6 +1188,7 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
      * of the push-off win consuming one move. */
     if (g_allow_exit_transit && g_max_blocks >= 1) {
         for (int D = 0; D < 4; D++) {
+            if (!(g_canonical_dir_mask & (1 << D))) continue;
             int X = adj[exit_pos][D];
             if (X < 0) continue;
             if (!(g_walkable_mask & (1u << X))) continue;
@@ -1119,6 +1287,7 @@ static const BState *g_task_seeds = NULL;
 static int           g_task_seed_count = 0;
 
 static double run_exit_search(double remaining_s, int *out_exhausted, int *out_dedup_full) {
+    refresh_canonical_for_exit(g_exit_pos);
     /* Reset per-exit state. */
     if (g_two_tables) {
         memset(g_shallow, 0, SHALLOW_CAP * sizeof *g_shallow);
@@ -1183,6 +1352,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
          * when --num-blocks allows at least one. */
         if (g_allow_exit_transit && g_max_blocks >= 1) {
             for (int D = 0; D < 4; D++) {
+                if (!(g_canonical_dir_mask & (1 << D))) continue;
                 int X = adj[g_exit_pos][D];
                 if (X < 0) continue;
                 if (!(g_walkable_mask & (1u << X))) continue;
@@ -1458,6 +1628,9 @@ int main(int argc, char **argv) {
 
     /* Effective walkable region: active region minus fixed walls. */
     g_walkable_mask = g_active_mask & ~g_fixed_walls_mask;
+
+    /* Build the D4 transforms for this grid (depends only on g_grid_rows/cols). */
+    build_d4();
 
     /* Translate --num-walls into a popcount cap on committed_empty
      * within the active region. */
