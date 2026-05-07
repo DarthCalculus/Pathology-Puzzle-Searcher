@@ -1209,22 +1209,33 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
         }
     }
 
-    /* For each root, enumerate depth-1, depth-2, depth-3.  Bucket each
-     * depth-3 state by:
-     *   transit  : did the 1st backstep put a block on the exit?
-     *   hole_loc : cell index of a hole on an exit-adjacent cell that
-     *              was introduced AFTER the 1st backstep (i.e. on
-     *              backstep 2 or 3); -1 if no such hole.
+    /* Bucket key (transit, hole_loc) classifies the LAST 3 forward moves:
+     *   transit  : 1 if forward move 1 is a push-off-exit win (the root
+     *              encodes a state with a block already at exit), else 0.
+     *   hole_loc : cell pd1 (= the cell the player walks from on its way
+     *              to the exit) IF that cell was a hole that got filled
+     *              by a block push as forward move 3, AND the player then
+     *              walked onto the just-filled tile as forward move 2.
+     *              I.e., the LAST 3 forward moves are precisely
+     *                  fill(pd1) → walk-onto(pd1) → walk/push to exit.
+     *              hole_loc = -1 in any other case (no strategic hole-fill,
+     *              or a hole filled at some non-path cell).
      *
-     * We exclude holes already present at depth 1 because those don't
-     * distinguish the depth-3 subtrees — they're a property of the root,
-     * not of the partitioning backsteps.  In practice variant 4 from
-     * depth 0 is always blocked (P=exit), so d1->nholes is always 0,
-     * but we code the exclusion explicitly to match the partition spec.
+     * Equivalently in backward-trace terms: hole_loc = pd1 iff the depth-3
+     * state has a hole at pd1 that wasn't in the depth-2 state — i.e., the
+     * hole was introduced exactly at backstep 3 via variant 4, with B=pd1.
+     * Variant 4 at backstep 3 with B=pd1 forces the depth-2 player to be a
+     * neighbor of pd1, which combined with pd1 being adjacent to exit means
+     * the player's path traversed pd1.
      *
-     * Exit-adjacent buckets (one per direction A=U, B=R, C=D, D=L,
-     * clipped by off-board/walls) plus the catch-all "no qualifying
-     * hole" give up to 5 hole buckets per transit value. */
+     * pd1 is the player position one backstep from the win, which differs
+     * by root type:
+     *   standard root (depth 0): pd1 = state_1.player_pos = d1.player_pos
+     *   push-off root  (depth 1): pd1 = root.player_pos (= Y)
+     * For push-off roots the "post-backstep-3" state is d2 (in code), one
+     * level shallower than for standard roots; the seed itself remains at
+     * d3 (one level beyond the partition key), reused as a search starting
+     * point that already encodes the partition's classifying event. */
     uint32_t exit_adj_mask = 0;
     for (int D = 0; D < 4; D++) {
         int X = adj[exit_pos][D];
@@ -1232,33 +1243,57 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
         exit_adj_mask |= (1u << X);
     }
     for (int r = 0; r < n_roots; r++) {
+        const BState *root = &roots[r];
+        int transit = (root->depth == 1) ? 1 : 0;
+
         BState d1_buf[16];
-        int n_d1 = enumerate_successors(&roots[r], d1_buf, 16);
+        int n_d1 = enumerate_successors(root, d1_buf, 16);
         for (int i = 0; i < n_d1; i++) {
             BState *d1 = &d1_buf[i];
-            int transit = 0;
-            for (int b = 0; b < d1->nblocks; b++) {
-                if (d1->block_pos[b] == exit_pos) { transit = 1; break; }
-            }
-            uint32_t d1_holes_mask = 0;
-            for (int h = 0; h < d1->nholes; h++)
-                d1_holes_mask |= (1u << d1->hole_pos[h]);
+
+            /* pd1 = state_1 player position. */
+            int pd1 = (root->depth == 0) ? d1->player_pos : root->player_pos;
+            int pd1_is_exit_adj = (exit_adj_mask & (1u << pd1)) != 0;
+
             BState d2_buf[16];
             int n_d2 = enumerate_successors(d1, d2_buf, 16);
             for (int j = 0; j < n_d2; j++) {
                 BState *d2 = &d2_buf[j];
+
+                /* For push-off roots, the partition key is determined here:
+                 * state_2 = d1, state_3 = d2.  Compute hole_loc once per d2
+                 * and reuse it for every d3 child below. */
+                int hole_loc_pushoff = -1;
+                if (root->depth == 1 && pd1_is_exit_adj) {
+                    int d1_has = 0, d2_has = 0;
+                    for (int h = 0; h < d1->nholes; h++)
+                        if (d1->hole_pos[h] == pd1) { d1_has = 1; break; }
+                    for (int h = 0; h < d2->nholes; h++)
+                        if (d2->hole_pos[h] == pd1) { d2_has = 1; break; }
+                    if (d2_has && !d1_has) hole_loc_pushoff = pd1;
+                }
+
                 BState d3_buf[16];
                 int n_d3 = enumerate_successors(d2, d3_buf, 16);
                 for (int k = 0; k < n_d3; k++) {
                     BState *d3 = &d3_buf[k];
-                    int hole_loc = -1;
-                    for (int h = 0; h < d3->nholes; h++) {
-                        int hp = d3->hole_pos[h];
-                        if (!(exit_adj_mask & (1u << hp))) continue;
-                        if (d1_holes_mask & (1u << hp)) continue;
-                        hole_loc = hp;
-                        break;
+
+                    int hole_loc;
+                    if (root->depth == 1) {
+                        hole_loc = hole_loc_pushoff;
+                    } else {
+                        /* Standard root: state_2 = d2, state_3 = d3. */
+                        hole_loc = -1;
+                        if (pd1_is_exit_adj) {
+                            int d2_has = 0, d3_has = 0;
+                            for (int h = 0; h < d2->nholes; h++)
+                                if (d2->hole_pos[h] == pd1) { d2_has = 1; break; }
+                            for (int h = 0; h < d3->nholes; h++)
+                                if (d3->hole_pos[h] == pd1) { d3_has = 1; break; }
+                            if (d3_has && !d2_has) hole_loc = pd1;
+                        }
                     }
+
                     int t = task_bucket_for(tasks, &n_tasks, max_tasks, transit, hole_loc);
                     if (t >= 0 && tasks[t].n_seeds < MAX_TASK_SEEDS) {
                         tasks[t].seeds[tasks[t].n_seeds++] = *d3;
