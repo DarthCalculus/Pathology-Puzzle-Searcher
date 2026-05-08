@@ -112,7 +112,7 @@ SHALLOW_ID="$N_TASKS"
 
 EFFECTIVE_THREADS="$NUM_THREADS"
 if [ "$EFFECTIVE_THREADS" -gt "$TOTAL_WORKERS" ]; then EFFECTIVE_THREADS="$TOTAL_WORKERS"; fi
-echo "[backsearch] $N_TASKS partition tasks + 1 shallow scan, running up to $EFFECTIVE_THREADS concurrently" >&2
+echo "[backsearch] $N_TASKS partition tasks, running up to $EFFECTIVE_THREADS concurrently" >&2
 
 # Set up merge FIFO + filter.
 MERGED="$TMPDIR/merged"

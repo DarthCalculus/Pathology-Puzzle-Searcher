@@ -290,6 +290,10 @@ static void refresh_canonical_for_exit(int exit_pos) {
     compute_canonical_dir_mask();
 }
 
+/* Runtime toggle for state-level canonicalisation in dedup, used for A/B
+ * timing.  When 0, canonical_state_key reduces to state_key. */
+static int g_state_canon = 1;
+
 /* -------------------------------------------------------------------------
  * Backward state
  * ------------------------------------------------------------------------- */
@@ -303,7 +307,15 @@ typedef struct {
     int8_t   hole_pos  [MAX_HOLES];      /* sorted ascending; all active     */
     uint32_t committed_empty;            /* bit i: cell i is known not-wall */
     int32_t  depth;
+    int32_t  state_id;                   /* analysis only; -1 when --trace-csv off */
+    int8_t   kids_lookahead;             /* beam mode: cached 1-ply child count */
 } BState;
+
+/* --trace-csv: dump (state_id, parent_id, features) for every accepted
+ * state to FILE.  Used for offline analysis of search-graph structure. */
+static FILE     *g_trace_csv         = NULL;
+static long long g_next_state_id     = 0;
+static long long g_current_parent_id = -1;
 
 /* Sort blocks ascending by (pos, mask).  Insertion sort — nblocks is small. */
 static void sort_blocks(int8_t *bp, uint8_t *bm, int n) {
@@ -415,6 +427,47 @@ static uint64_t state_key(const BState *s) {
         h = splitmix64(h ^ ((uint64_t)(uint8_t)s->hole_pos[i] | 0x100));
     }
     return h ? h : 1;  /* never zero: 0 = empty slot */
+}
+
+/* Permute every cell-valued field of s through symmetry sym, then re-sort
+ * blocks and holes so the result has canonical sort order.  Used by
+ * canonical_state_key to fold sym-equivalent states into one dedup entry. */
+static void apply_sym_to_state(const Sym *sym, const BState *in, BState *out) {
+    *out = *in;
+    out->committed_empty = apply_sym_mask(sym, in->committed_empty);
+    out->player_pos = sym->cell[(int)in->player_pos];
+    for (int i = 0; i < in->nblocks; i++) {
+        out->block_pos[i] = sym->cell[(int)in->block_pos[i]];
+        uint8_t old_mask = in->block_mask[i];
+        uint8_t new_mask = 0;
+        for (int d = 0; d < 4; d++) {
+            if (old_mask & (1u << d)) new_mask |= (uint8_t)(1u << sym->dir[d]);
+        }
+        out->block_mask[i] = new_mask;
+    }
+    for (int i = 0; i < in->nholes; i++) {
+        out->hole_pos[i] = sym->cell[(int)in->hole_pos[i]];
+    }
+    sort_blocks(out->block_pos, out->block_mask, out->nblocks);
+    sort_holes(out->hole_pos, out->nholes);
+}
+
+/* Canonical hash under the active symmetry subgroup.  Two states related
+ * by some σ ∈ g_exit_syms produce the same key, so their dedup entries
+ * collide and the second-arriving state (and its entire subtree) is
+ * skipped.  When the subgroup is just identity (|G|=1) this is identical
+ * to state_key — no overhead. */
+static uint64_t canonical_state_key(const BState *s) {
+    if (!g_state_canon) return state_key(s);
+    /* g_exit_syms[0] is identity; start with its key and look for smaller. */
+    uint64_t best = state_key(s);
+    for (int i = 1; i < g_n_exit_syms; i++) {
+        BState perm;
+        apply_sym_to_state(g_exit_syms[i], s, &perm);
+        uint64_t k = state_key(&perm);
+        if (k < best) best = k;
+    }
+    return best;
 }
 
 /* Returns 1 if state should be skipped (already seen at <= this depth).
@@ -618,7 +671,16 @@ static size_t    g_q_cap   = 0;
 static long long g_q_tail  = 0;        /* stack top                              */
 static long long g_q_peak  = 0;        /* high-water mark for stats              */
 
+/* Forward decls — q_push redirects to beam-mode push when --beam is set. */
+extern int g_beam_width;
+static void beam_push_to_next(const BState *s);
+static int  count_potential_children(const BState *s);
+
 static void q_push(const BState *s) {
+    if (g_beam_width > 0) {
+        beam_push_to_next(s);
+        return;
+    }
     if ((size_t)g_q_tail == g_q_cap) {
         g_q_cap = g_q_cap ? g_q_cap * 2 : 65536;
         g_queue = realloc(g_queue, g_q_cap * sizeof(BState));
@@ -632,6 +694,117 @@ static int q_pop(BState *out) {
     if (g_q_tail == 0) return 0;
     *out = g_queue[--g_q_tail];
     return 1;
+}
+
+/* -------------------------------------------------------------------------
+ * Beam search (alternative to DFS).  When --beam K is set, the search
+ * proceeds depth-by-depth: from the current frontier, expand all states,
+ * sort the resulting next-depth states by a heuristic score, and keep the
+ * top K.  Trades exhaustiveness for tractability.
+ *
+ * In beam mode, q_push() redirects to g_beam_next instead of g_queue.
+ * try_successor's dedup, shortcut check, and best-update logic are
+ * unchanged.
+ * ------------------------------------------------------------------------- */
+int             g_beam_width  = 0;          /* 0 = DFS mode (default) */
+static BState  *g_beam_curr   = NULL;
+static int      g_beam_curr_n = 0;
+static int      g_beam_curr_cap = 0;
+static BState  *g_beam_next   = NULL;
+static int      g_beam_next_n = 0;
+static int      g_beam_next_cap = 0;
+static long long g_beam_peak_frontier = 0;   /* before-trim high-water */
+
+static void beam_push_to_next(const BState *s) {
+    if (g_beam_next_n == g_beam_next_cap) {
+        g_beam_next_cap = g_beam_next_cap ? g_beam_next_cap * 2 : 65536;
+        g_beam_next = realloc(g_beam_next, (size_t)g_beam_next_cap * sizeof(BState));
+        if (!g_beam_next) { perror("realloc beam_next"); exit(1); }
+    }
+    g_beam_next[g_beam_next_n] = *s;
+    /* Cache 1-ply child-count for beam ranking. */
+    g_beam_next[g_beam_next_n].kids_lookahead = (int8_t)count_potential_children(s);
+    g_beam_next_n++;
+    if (g_beam_next_n > g_beam_peak_frontier) g_beam_peak_frontier = g_beam_next_n;
+}
+
+/* 1-ply lookahead: how many successors would expand(s) generate, without
+ * dedup or shortcut filtering?  Mirror of the expand() loop with no side
+ * effects.  Used as a beam-score feature — empirically, the optimal lineage
+ * tends to have high child-count. */
+static int count_potential_children(const BState *s) {
+    int count = 0;
+    int P = s->player_pos;
+
+    uint32_t blk_occ = 0;
+    int8_t blk_idx_at[NCELLS];
+    for (int i = 0; i < NCELLS; i++) blk_idx_at[i] = -1;
+    for (int i = 0; i < s->nblocks; i++) {
+        blk_occ |= (1u << s->block_pos[i]);
+        blk_idx_at[s->block_pos[i]] = (int8_t)i;
+    }
+    uint32_t hole_occ = 0;
+    for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
+
+    for (int D = 0; D < 4; D++) {
+        int C = adj[P][D ^ 2];
+        if (C < 0) continue;
+        if (C == g_exit_pos) continue;
+        if (!(g_walkable_mask & (1u << C))) continue;
+        if (blk_occ & (1u << C)) continue;
+        if (hole_occ & (1u << C)) continue;
+        count++;  /* variant 1: walk-back */
+
+        if (!g_allow_exit_transit && P == g_exit_pos) continue;
+        int B = adj[P][D];
+        if (B < 0) continue;
+        if (!g_allow_exit_transit && B == g_exit_pos) continue;
+        if (!(g_walkable_mask & (1u << B))) continue;
+
+        if (blk_idx_at[B] >= 0) {
+            count++;  /* variant 2 */
+        } else if (hole_occ & (1u << B)) {
+            /* skip */
+        } else if (B == g_exit_pos || P == g_exit_pos) {
+            /* skip */
+        } else {
+            if (!(s->committed_empty & (1u << B)) && s->nblocks < g_max_blocks) {
+                count++;  /* variant 3 */
+            }
+            int v4 = !g_holeless && s->nblocks < g_max_blocks && s->nholes < g_max_holes;
+            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1u << B))) v4 = 0;
+            if (v4) count++;  /* variant 4 */
+        }
+    }
+    return count;
+}
+
+/* Beam-score weights.  Tunable via --score-weights "wRoom,wBlocks,wHoles,wKids".
+ * Defaults derived from 4x4 trace analysis (4×4 trace shows the optimal
+ * lineage favors high room, low nblocks/nholes, high child-count). */
+static double g_w_room   =  1.0;
+static double g_w_blocks =  0.5;
+static double g_w_holes  =  0.3;
+static double g_w_kids   =  0.4;
+
+/* Heuristic score for beam ranking.  Higher = more promising.
+ * Uses cached kids_lookahead (set by beam_push_to_next). */
+static double beam_score(const BState *s) {
+    int active_size = __builtin_popcount(g_active_mask);
+    int popcount    = __builtin_popcount(s->committed_empty & g_active_mask);
+    int room        = active_size - popcount;
+    return  g_w_room   * (double)room
+          - g_w_blocks * (double)s->nblocks
+          - g_w_holes  * (double)s->nholes
+          + g_w_kids   * (double)s->kids_lookahead;
+}
+
+static int cmp_beam_score(const void *a, const void *b) {
+    double sa = beam_score((const BState *)a);
+    double sb = beam_score((const BState *)b);
+    if (sa > sb) return -1;
+    if (sa < sb) return 1;
+    return 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -712,12 +885,28 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
  *    >= 0 : a real shortcut of that length exists — caller should prune.
  *    -1   : no shortcut within the cutoff — caller should accept the state.
  *    -2   : solver overflow (treat as prune for safety). */
+/* Per-depth solver-call accounting (profiling).  Buckets correspond to
+ * the state's backward depth at the moment of the shortcut call. */
+#define SHORTCUT_PROFILE_BUCKETS 96
+static long long g_solver_calls_by_depth[SHORTCUT_PROFILE_BUCKETS];
+static double    g_solver_time_by_depth[SHORTCUT_PROFILE_BUCKETS];
+
 static int shortcut_check(const BState *s) {
     Puzzle pz;
     build_partial_puzzle(s, &pz);
     g_solver_calls++;
     int max_cost = s->depth - 2;
-    return sokoban_solve_cutoff(&pz, NULL, NULL, max_cost);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int rc = sokoban_solve_cutoff(&pz, NULL, NULL, max_cost);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int b = s->depth;
+    if (b < 0) b = 0;
+    if (b >= SHORTCUT_PROFILE_BUCKETS) b = SHORTCUT_PROFILE_BUCKETS - 1;
+    g_solver_calls_by_depth[b]++;
+    g_solver_time_by_depth[b] += (t1.tv_sec - t0.tv_sec)
+                              + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    return rc;
 }
 
 /* -------------------------------------------------------------------------
@@ -759,7 +948,7 @@ static void try_successor(const BState *s) {
         return;
     }
     if (s->depth <= g_dupe_threshold) {
-        uint64_t key = state_key(s);
+        uint64_t key = canonical_state_key(s);
         int dup = g_two_tables ? dedup_two_tables(key, s->depth)
                                : dedup_check_and_insert(key, s->depth);
         if (dup) {
@@ -797,7 +986,21 @@ static void try_successor(const BState *s) {
             }
         }
     }
-    q_push(s);
+    if (g_trace_csv) {
+        BState ns = *s;
+        long long sid = g_next_state_id++;
+        ns.state_id = (int32_t)sid;
+        int bx = 0;
+        for (int i = 0; i < s->nblocks; i++)
+            if (s->block_pos[i] == g_exit_pos) { bx = 1; break; }
+        fprintf(g_trace_csv, "%lld,%lld,%d,%d,%d,%d,%d,%d,%d\n",
+                sid, g_current_parent_id, s->depth,
+                __builtin_popcount(s->committed_empty & g_active_mask),
+                s->nblocks, s->nholes, s->player_pos, g_exit_pos, bx);
+        q_push(&ns);
+    } else {
+        q_push(s);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -1369,9 +1572,17 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         };
         g_best_state = init;
         {
-            uint64_t k = state_key(&init);
+            uint64_t k = canonical_state_key(&init);
             if (g_two_tables) dedup_two_tables(k, 0);
             else              dedup_check_and_insert(k, 0);
+        }
+        if (g_trace_csv) {
+            long long sid = g_next_state_id++;
+            init.state_id = (int32_t)sid;
+            fprintf(g_trace_csv, "%lld,-1,%d,%d,%d,%d,%d,%d,0\n",
+                    sid, init.depth,
+                    __builtin_popcount(init.committed_empty & g_active_mask),
+                    init.nblocks, init.nholes, init.player_pos, g_exit_pos);
         }
         q_push(&init);
 
@@ -1405,9 +1616,19 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                 seed.block_pos [0] = (int8_t)g_exit_pos;
                 seed.block_mask[0] = (uint8_t)(1u << D);
                 {
-                    uint64_t k = state_key(&seed);
+                    uint64_t k = canonical_state_key(&seed);
                     if (g_two_tables) dedup_two_tables(k, seed.depth);
                     else              dedup_check_and_insert(k, seed.depth);
+                }
+                if (g_trace_csv) {
+                    long long sid = g_next_state_id++;
+                    seed.state_id = (int32_t)sid;
+                    /* push-off-exit seed: the block IS at exit_pos (X is the
+                     * post-push cell; the block in the seed is at exit, mask=D). */
+                    fprintf(g_trace_csv, "%lld,-1,%d,%d,%d,%d,%d,%d,1\n",
+                            sid, seed.depth,
+                            __builtin_popcount(seed.committed_empty & g_active_mask),
+                            seed.nblocks, seed.nholes, seed.player_pos, g_exit_pos);
                 }
                 q_push(&seed);
             }
@@ -1420,14 +1641,57 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     int exhausted = 1;
     long long iter = 0;
     int unlimited = (remaining_s <= 0);
-    while (1) {
-        BState s;
-        if (!q_pop(&s)) break;
-        expand(&s);
-        if (g_dedup_full) { exhausted = 0; break; }
-        if (!unlimited && (++iter & 1023) == 0) {
-            clock_gettime(CLOCK_MONOTONIC, &t_now);
-            if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
+
+    if (g_beam_width > 0) {
+        /* Beam mode: process frontier depth-by-depth, sort + truncate to
+         * top-K each iteration.  Initial roots were q_push'd above, which
+         * redirected into g_beam_next.  Swap into g_beam_curr to start. */
+        BState *tmp_buf = g_beam_curr;
+        int     tmp_n   = g_beam_curr_n;
+        int     tmp_cap = g_beam_curr_cap;
+        g_beam_curr     = g_beam_next;
+        g_beam_curr_n   = g_beam_next_n;
+        g_beam_curr_cap = g_beam_next_cap;
+        g_beam_next     = tmp_buf;
+        g_beam_next_n   = tmp_n;
+        g_beam_next_cap = tmp_cap;
+        g_beam_next_n   = 0;
+
+        while (g_beam_curr_n > 0) {
+            g_beam_next_n = 0;
+            for (int i = 0; i < g_beam_curr_n; i++) {
+                if (g_trace_csv) g_current_parent_id = g_beam_curr[i].state_id;
+                expand(&g_beam_curr[i]);
+                if (g_dedup_full) { exhausted = 0; goto beam_done; }
+            }
+            /* Sort and truncate. */
+            if (g_beam_next_n > g_beam_width) {
+                qsort(g_beam_next, (size_t)g_beam_next_n,
+                      sizeof(BState), cmp_beam_score);
+                g_beam_next_n = g_beam_width;
+            }
+            /* Swap. */
+            tmp_buf = g_beam_curr; tmp_n = g_beam_curr_n; tmp_cap = g_beam_curr_cap;
+            g_beam_curr = g_beam_next; g_beam_curr_n = g_beam_next_n; g_beam_curr_cap = g_beam_next_cap;
+            g_beam_next = tmp_buf; g_beam_next_cap = tmp_cap; g_beam_next_n = 0;
+            (void)tmp_n;
+            if (!unlimited) {
+                clock_gettime(CLOCK_MONOTONIC, &t_now);
+                if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
+            }
+        }
+beam_done:;
+    } else {
+        while (1) {
+            BState s;
+            if (!q_pop(&s)) break;
+            if (g_trace_csv) g_current_parent_id = s.state_id;
+            expand(&s);
+            if (g_dedup_full) { exhausted = 0; break; }
+            if (!unlimited && (++iter & 1023) == 0) {
+                clock_gettime(CLOCK_MONOTONIC, &t_now);
+                if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
+            }
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &t_now);
@@ -1535,6 +1799,24 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--allow-exit-transit") == 0) {
             g_allow_exit_transit = 1;
+        } else if (strcmp(argv[i], "--no-state-canon") == 0) {
+            g_state_canon = 0;
+        } else if (strcmp(argv[i], "--beam") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --beam requires K\n"); return 1; }
+            int n = atoi(argv[i]);
+            if (n < 1) { fprintf(stderr, "error: --beam K must be >= 1\n"); return 1; }
+            g_beam_width = n;
+        } else if (strcmp(argv[i], "--score-weights") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --score-weights requires wRoom,wBlocks,wHoles,wKids\n"); return 1; }
+            if (sscanf(argv[i], "%lf,%lf,%lf,%lf",
+                       &g_w_room, &g_w_blocks, &g_w_holes, &g_w_kids) != 4) {
+                fprintf(stderr, "error: --score-weights expects 4 comma-separated floats\n"); return 1;
+            }
+        } else if (strcmp(argv[i], "--trace-csv") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --trace-csv requires FILE\n"); return 1; }
+            g_trace_csv = fopen(argv[i], "w");
+            if (!g_trace_csv) { perror("fopen --trace-csv"); return 1; }
+            fprintf(g_trace_csv, "id,parent_id,depth,popcount,nblocks,nholes,player_pos,exit_pos,block_on_exit\n");
         } else if (strcmp(argv[i], "--holeless") == 0) {
             g_holeless = 1;
         } else if (strcmp(argv[i], "--two-tables") == 0) {
@@ -1899,9 +2181,40 @@ int main(int argc, char **argv) {
         printf("(no non-trivial puzzle found)\n");
     }
 
+    /* Solver-call profile by state depth — useful for evaluating cheap
+     * lower-bound bypass strategies. */
+    {
+        long long total_calls = 0;
+        double    total_time  = 0.0;
+        int       max_seen    = -1;
+        for (int b = 0; b < SHORTCUT_PROFILE_BUCKETS; b++) {
+            total_calls += g_solver_calls_by_depth[b];
+            total_time  += g_solver_time_by_depth[b];
+            if (g_solver_calls_by_depth[b] > 0) max_seen = b;
+        }
+        if (total_calls > 0) {
+            printf("\nSolver-call profile (by state depth):\n");
+            printf("  depth   calls       time(s)   %%calls  %%time   cum%%time\n");
+            double cum_time = 0.0;
+            for (int b = 0; b <= max_seen; b++) {
+                long long c = g_solver_calls_by_depth[b];
+                double    t = g_solver_time_by_depth[b];
+                if (c == 0 && t == 0.0) continue;
+                cum_time += t;
+                printf("  %3d   %10lld   %8.3f   %5.1f%%  %5.1f%%   %5.1f%%\n",
+                       b, c, t,
+                       100.0 * (double)c / (double)total_calls,
+                       100.0 * t / total_time,
+                       100.0 * cum_time / total_time);
+            }
+            printf("  total %10lld   %8.3f s\n", total_calls, total_time);
+        }
+    }
+
     free(g_visited);
     free(g_shallow);
     free(g_recent);
     free(g_queue);
+    if (g_trace_csv) fclose(g_trace_csv);
     return 0;
 }
