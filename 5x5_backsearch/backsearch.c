@@ -787,6 +787,19 @@ static double g_w_blocks =  0.5;
 static double g_w_holes  =  0.3;
 static double g_w_kids   =  0.4;
 
+/* Stochastic beam: at clip time, take only (1 - F)*K deterministically
+ * by score, then fill the remaining F*K slots with uniform-random states
+ * from the tail.  F=0 (default) is pure top-K.  F=1.0 is uniform random.
+ * Used to escape local optima when the deterministic beam stalls. */
+static double g_beam_random_frac = 0.0;
+
+/* --beam-save-tail T: at each beam clip, save T states from the *clipped
+ * tail* (ranked just below the kept top-K) into the DFS stack.  After
+ * beam terminates, continue with DFS from those saved states.  Lets the
+ * search recover branches the beam dropped without re-exploring the
+ * top-ranked sub-graph. */
+static int g_beam_save_tail = 0;
+
 /* Heuristic score for beam ranking.  Higher = more promising.
  * Uses cached kids_lookahead (set by beam_push_to_next). */
 static double beam_score(const BState *s) {
@@ -1664,10 +1677,41 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                 expand(&g_beam_curr[i]);
                 if (g_dedup_full) { exhausted = 0; goto beam_done; }
             }
-            /* Sort and truncate. */
+            /* Sort and truncate.  Optionally fill F*K slots from the
+             * sorted tail uniformly at random (stochastic beam). */
             if (g_beam_next_n > g_beam_width) {
                 qsort(g_beam_next, (size_t)g_beam_next_n,
                       sizeof(BState), cmp_beam_score);
+                if (g_beam_random_frac > 0.0) {
+                    int n_det  = (int)(g_beam_width * (1.0 - g_beam_random_frac));
+                    int n_rand = g_beam_width - n_det;
+                    int tail_lo = n_det;
+                    int tail_hi = g_beam_next_n;
+                    /* Sample n_rand items from [tail_lo, tail_hi) into
+                     * positions [n_det, n_det + n_rand) without replacement. */
+                    for (int i = 0; i < n_rand; i++) {
+                        int span = tail_hi - tail_lo - i;
+                        if (span <= 0) break;
+                        int j = tail_lo + i + (rand() % span);
+                        BState tmp = g_beam_next[tail_lo + i];
+                        g_beam_next[tail_lo + i] = g_beam_next[j];
+                        g_beam_next[j] = tmp;
+                    }
+                }
+                /* Save up to g_beam_save_tail states from the clipped tail
+                 * into the DFS stack for later exploration. */
+                if (g_beam_save_tail > 0) {
+                    int tail_avail = g_beam_next_n - g_beam_width;
+                    int n_save = tail_avail < g_beam_save_tail ? tail_avail : g_beam_save_tail;
+                    for (int i = 0; i < n_save; i++) {
+                        if ((size_t)g_q_tail == g_q_cap) {
+                            g_q_cap = g_q_cap ? g_q_cap * 2 : 65536;
+                            g_queue = realloc(g_queue, g_q_cap * sizeof(BState));
+                            if (!g_queue) { perror("realloc q for tail save"); exit(1); }
+                        }
+                        g_queue[g_q_tail++] = g_beam_next[g_beam_width + i];
+                    }
+                }
                 g_beam_next_n = g_beam_width;
             }
             /* Swap. */
@@ -1680,7 +1724,24 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                 if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
             }
         }
-beam_done:;
+beam_done:
+        /* If --beam-save-tail accumulated states in g_queue, switch to
+         * DFS mode and drain.  This recovers branches dropped by beam
+         * clipping. */
+        if (g_q_tail > 0 && exhausted) {
+            g_beam_width = 0;
+            while (1) {
+                BState s;
+                if (!q_pop(&s)) break;
+                if (g_trace_csv) g_current_parent_id = s.state_id;
+                expand(&s);
+                if (g_dedup_full) { exhausted = 0; break; }
+                if (!unlimited && (++iter & 1023) == 0) {
+                    clock_gettime(CLOCK_MONOTONIC, &t_now);
+                    if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
+                }
+            }
+        }
     } else {
         while (1) {
             BState s;
@@ -1806,6 +1867,16 @@ int main(int argc, char **argv) {
             int n = atoi(argv[i]);
             if (n < 1) { fprintf(stderr, "error: --beam K must be >= 1\n"); return 1; }
             g_beam_width = n;
+        } else if (strcmp(argv[i], "--beam-save-tail") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --beam-save-tail requires T\n"); return 1; }
+            g_beam_save_tail = atoi(argv[i]);
+            if (g_beam_save_tail < 0) { fprintf(stderr, "error: --beam-save-tail must be >= 0\n"); return 1; }
+        } else if (strcmp(argv[i], "--stochastic") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --stochastic requires F\n"); return 1; }
+            g_beam_random_frac = atof(argv[i]);
+            if (g_beam_random_frac < 0.0 || g_beam_random_frac > 1.0) {
+                fprintf(stderr, "error: --stochastic F must be in [0, 1]\n"); return 1;
+            }
         } else if (strcmp(argv[i], "--score-weights") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --score-weights requires wRoom,wBlocks,wHoles,wKids\n"); return 1; }
             if (sscanf(argv[i], "%lf,%lf,%lf,%lf",
