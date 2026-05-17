@@ -29,40 +29,31 @@
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
 #include <limits.h>
 
-#define DEFAULT_CAP_S    60.0
+#define DEFAULT_CAP_S    0.0    /* 0 = no time limit (run until queue is empty) */
 
-/* The six canonical exit cells (D4 fundamental domain on a 5x5 grid):
- *   (0,0)=0   (0,1)=1   (0,2)=2
- *             (1,1)=6   (1,2)=7
- *                       (2,2)=12
- * Every other cell is equivalent to one of these by some D4 transform. */
-#define NUM_EXIT_CELLS 6
-static const int CANONICAL_EXITS[NUM_EXIT_CELLS] = { 0, 1, 2, 6, 7, 12 };
+/* Canonical exit cells = D4-orbit representatives in row-major order,
+ * filled by build_canonical_exits() once the D4 group is built.  For 5x5
+ * this reproduces the historical {0,1,2,6,7,12}. */
+static int g_canonical_exits[MAX_NCELLS];
+static int g_n_canonical_exits = 0;
 
-/* Adjacency table — duplicates the static one in sokoban_bfs.c.
- * Directions: 0=Up, 1=Right, 2=Down, 3=Left. */
-static const int8_t adj[NCELLS][4] = {
-    {-1,  1,  5, -1}, {-1,  2,  6,  0}, {-1,  3,  7,  1},
-    {-1,  4,  8,  2}, {-1, -1,  9,  3},
-    { 0,  6, 10, -1}, { 1,  7, 11,  5}, { 2,  8, 12,  6},
-    { 3,  9, 13,  7}, { 4, -1, 14,  8},
-    { 5, 11, 15, -1}, { 6, 12, 16, 10}, { 7, 13, 17, 11},
-    { 8, 14, 18, 12}, { 9, -1, 19, 13},
-    {10, 16, 20, -1}, {11, 17, 21, 15}, {12, 18, 22, 16},
-    {13, 19, 23, 17}, {14, -1, 24, 18},
-    {15, 21, -1, -1}, {16, 22, -1, 20}, {17, 23, -1, 21},
-    {18, 24, -1, 22}, {19, -1, -1, 23},
-};
+/* Adjacency table is owned by sokoban_bfs.c (g_adj[MAX_NCELLS][4]) and
+ * populated by sokoban_set_grid(). */
 
 /* -------------------------------------------------------------------------
  * Global config
  * ------------------------------------------------------------------------- */
 
+/* g_grid_rows/g_grid_cols are pending --grid parsing.  Once set, they're
+ * forwarded to sokoban_set_grid() which populates the solver's g_rows/
+ * g_cols/g_ncells/g_adj/edge masks.  Inside this file we read those
+ * globals directly via the header. */
 static int      g_grid_rows   = 5;
 static int      g_grid_cols   = 5;
-static uint32_t g_active_mask = 0;          /* set in main() from --grid    */
+static uint64_t g_active_mask = 0;          /* set in main() from --grid    */
 static double   g_time_cap_s  = DEFAULT_CAP_S;
 static int      g_exit_pos    = 0;          /* current exit cell being searched */
 static int      g_only_exit   = -1;         /* -1 = iterate canonical exits */
@@ -70,7 +61,7 @@ static int      g_only_exit   = -1;         /* -1 = iterate canonical exits */
  * canonical set when non-empty).  --exit takes priority over --exitloc
  * if both are given. */
 static int      g_n_only_exits = 0;
-static int      g_only_exit_list[NCELLS];
+static int      g_only_exit_list[MAX_NCELLS];
 static int      g_allow_exit_transit = 0;   /* 1 = block may transit through exit */
 static int      g_holeless           = 0;   /* 1 = forbid all holes (no variant 4) */
 static int      g_two_tables         = 0;   /* 1 = use shallow+recent two-table dedup */
@@ -81,17 +72,17 @@ static int      g_two_tables         = 0;   /* 1 = use shallow+recent two-table 
  * any subset of these allowed cells. */
 static int      g_fixed_nholes = 0;
 static int      g_fixed_hole_pos[MAX_HOLES];
-static uint32_t g_fixed_holes_mask = 0;
+static uint64_t g_fixed_holes_mask = 0;
 
 /* Fixed walls: cells that must be walls in the reported puzzle setup.
  * The search prevents these cells from ever entering committed_empty —
  * the player never walks on them, no block or hole is introduced there. */
-static uint32_t g_fixed_walls_mask = 0;
+static uint64_t g_fixed_walls_mask = 0;
 
 /* Effective walkable region = active region minus fixed walls.  This is
  * what expand() consults to decide if a cell can be entered or have a
  * block/hole placed on it. */
-static uint32_t g_walkable_mask = 0;
+static uint64_t g_walkable_mask = 0;
 
 /* Lower bound on wall count in the reported puzzle.  The search prunes
  * any successor whose committed_empty grows so large that fewer than
@@ -136,6 +127,26 @@ static int      g_max_depth         = INT_MAX;
 static int g_only_task   = -1;   /* -1 = run all tasks merged (default) */
 static int g_list_tasks  = 0;
 
+/* --seed-path "D1V1,D2V2,...": apply a specific sequence of backward
+ * steps from the standard root, then DFS-explore everything reachable
+ * from the resulting state.  Each token is a direction letter (U/R/D/L)
+ * followed by a variant digit (1=walk-back, 2=push-back existing block,
+ * 3=introduce new block, 4=un-consume = new block + new hole).  Useful
+ * for manually seeding the low-depth state that lies on a known optimal
+ * trace (so the search doesn't have to discover it on its own).
+ * Action digit meanings:
+ *   1  walk-back   (player walked, no block movement)
+ *   2  push-back   (block moved in direction D — back-search figures out
+ *                   whether it's an existing tracked block or a newly
+ *                   introduced one; both are the same forward action)
+ *   3  un-consume  (introduces a new block AND a new hole simultaneously,
+ *                   reversing a forward block-into-hole consumption)
+ */
+typedef struct { int8_t direction; int8_t variant; } SeedStep;
+static SeedStep g_seed_path[128];
+static int      g_seed_path_n = 0;
+static int      g_have_seed_path = 0;
+
 /* Dedup horizon: states at depth <= this value are deduped against the
  * visited table; states deeper than this skip dedup entirely (free-fly).
  * Trade-off: free-flying deep states do redundant subtree exploration
@@ -157,8 +168,8 @@ static long long g_skipped_dedup  = 0;
  * + 180°-rotation), 8 when the grid is square (adds 90°/270° rotations
  * and the two diagonal reflections). */
 typedef struct {
-    int8_t cell[NCELLS];   /* cell[i] = where active cell i maps; -1 if i is inactive */
-    int8_t dir[4];         /* dir[d]  = where direction d maps */
+    int8_t cell[MAX_NCELLS];   /* cell[i] = where active cell i maps; -1 if i is inactive */
+    int8_t dir[4];             /* dir[d]  = where direction d maps */
 } Sym;
 
 static int g_n_d4 = 0;
@@ -207,7 +218,7 @@ static void build_d4(void) {
     for (int it = 0; it < 8; it++) {
         if (needs_square[it] && !square) continue;
         Sym *s = &g_d4[g_n_d4++];
-        for (int idx = 0; idx < NCELLS; idx++) s->cell[idx] = -1;
+        for (int idx = 0; idx < MAX_NCELLS; idx++) s->cell[idx] = -1;
         for (int r = 0; r < R; r++) {
             for (int c = 0; c < C; c++) {
                 int nr, nc;
@@ -222,18 +233,22 @@ static void build_d4(void) {
                     case 7: nr = C - 1 - c;     nc = R - 1 - r;     break;
                     default: nr = r;            nc = c;             break;
                 }
-                s->cell[r * COLS + c] = (int8_t)(nr * COLS + nc);
+                /* Cell ids are row-major within the RxC grid.  For square
+                 * grids, rotations and diagonal reflections may map (r,c)
+                 * to (nr,nc) where nc/nr are bounded by R/C respectively
+                 * — but R == C in those cases, so a single stride works. */
+                s->cell[r * C + c] = (int8_t)(nr * C + nc);
             }
         }
         for (int d = 0; d < 4; d++) s->dir[d] = dir_perm[it][d];
     }
 }
 
-static uint32_t apply_sym_mask(const Sym *s, uint32_t m) {
-    uint32_t out = 0;
+static uint64_t apply_sym_mask(const Sym *s, uint64_t m) {
+    uint64_t out = 0;
     while (m) {
-        int b = __builtin_ctz(m);
-        out |= 1u << s->cell[b];
+        int b = __builtin_ctzll(m);
+        out |= 1ULL << s->cell[b];
         m &= m - 1;
     }
     return out;
@@ -290,6 +305,25 @@ static void refresh_canonical_for_exit(int exit_pos) {
     compute_canonical_dir_mask();
 }
 
+/* Build g_canonical_exits: one representative per D4 orbit.  Iterates
+ * cells in row-major order, picks each cell that hasn't been seen as
+ * the image of an earlier cell. */
+static void build_canonical_exits(void) {
+    g_n_canonical_exits = 0;
+    int8_t orbit_rep[MAX_NCELLS];
+    for (int i = 0; i < g_ncells; i++) orbit_rep[i] = -1;
+    for (int p = 0; p < g_ncells; p++) {
+        if (orbit_rep[p] >= 0) continue;
+        orbit_rep[p] = (int8_t)p;
+        g_canonical_exits[g_n_canonical_exits++] = p;
+        for (int i = 0; i < g_n_d4; i++) {
+            int q = g_d4[i].cell[p];
+            if (q >= 0 && q < g_ncells && orbit_rep[q] < 0)
+                orbit_rep[q] = (int8_t)p;
+        }
+    }
+}
+
 /* Runtime toggle for state-level canonicalisation in dedup, used for A/B
  * timing.  When 0, canonical_state_key reduces to state_key. */
 static int g_state_canon = 1;
@@ -305,10 +339,12 @@ typedef struct {
     int8_t   block_pos [MAX_BLOCKS];
     uint8_t  block_mask[MAX_BLOCKS];
     int8_t   hole_pos  [MAX_HOLES];      /* sorted ascending; all active     */
-    uint32_t committed_empty;            /* bit i: cell i is known not-wall */
+    uint64_t committed_empty;            /* bit i: cell i is known not-wall */
     int32_t  depth;
     int32_t  state_id;                   /* analysis only; -1 when --trace-csv off */
     int8_t   kids_lookahead;             /* beam mode: cached 1-ply child count */
+    int8_t   hole_adj_exit;              /* beam mode: cached # holes adjacent to exit */
+    int8_t   mask_pop_sum;               /* beam mode: cached sum of popcount(block_mask[i]) */
 } BState;
 
 /* --trace-csv: dump (state_id, parent_id, features) for every accepted
@@ -724,6 +760,24 @@ static void beam_push_to_next(const BState *s) {
     g_beam_next[g_beam_next_n] = *s;
     /* Cache 1-ply child-count for beam ranking. */
     g_beam_next[g_beam_next_n].kids_lookahead = (int8_t)count_potential_children(s);
+    /* Cache "# holes adjacent to exit" — captures the strategic pattern
+     * "block must be pushed through hole near exit", which empirically
+     * yields the deepest puzzles. */
+    int hae = 0;
+    for (int d = 0; d < 4; d++) {
+        int nbr = g_adj[g_exit_pos][d];
+        if (nbr < 0) continue;
+        for (int i = 0; i < s->nholes; i++) {
+            if (s->hole_pos[i] == nbr) { hae++; break; }
+        }
+    }
+    g_beam_next[g_beam_next_n].hole_adj_exit = (int8_t)hae;
+    /* Cache sum of popcount(block_mask[i]).  Lower = more constrained
+     * blocks = harder forward solve = deeper backward path. */
+    int mps = 0;
+    for (int i = 0; i < s->nblocks; i++)
+        mps += __builtin_popcount(s->block_mask[i]);
+    g_beam_next[g_beam_next_n].mask_pop_sum = (int8_t)mps;
     g_beam_next_n++;
     if (g_beam_next_n > g_beam_peak_frontier) g_beam_peak_frontier = g_beam_next_n;
 }
@@ -736,43 +790,44 @@ static int count_potential_children(const BState *s) {
     int count = 0;
     int P = s->player_pos;
 
-    uint32_t blk_occ = 0;
-    int8_t blk_idx_at[NCELLS];
-    for (int i = 0; i < NCELLS; i++) blk_idx_at[i] = -1;
+    uint64_t blk_occ = 0;
+    int8_t blk_idx_at[MAX_NCELLS];
+    for (int i = 0; i < g_ncells; i++) blk_idx_at[i] = -1;
     for (int i = 0; i < s->nblocks; i++) {
-        blk_occ |= (1u << s->block_pos[i]);
+        blk_occ |= (1ULL <<s->block_pos[i]);
         blk_idx_at[s->block_pos[i]] = (int8_t)i;
     }
-    uint32_t hole_occ = 0;
-    for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
+    uint64_t hole_occ = 0;
+    for (int i = 0; i < s->nholes; i++) hole_occ |= (1ULL <<s->hole_pos[i]);
 
     for (int D = 0; D < 4; D++) {
-        int C = adj[P][D ^ 2];
+        int C = g_adj[P][D ^ 2];
         if (C < 0) continue;
         if (C == g_exit_pos) continue;
-        if (!(g_walkable_mask & (1u << C))) continue;
-        if (blk_occ & (1u << C)) continue;
-        if (hole_occ & (1u << C)) continue;
+        if (!(g_walkable_mask & (1ULL <<C))) continue;
+        if (blk_occ & (1ULL <<C)) continue;
+        if (hole_occ & (1ULL <<C)) continue;
         count++;  /* variant 1: walk-back */
 
         if (!g_allow_exit_transit && P == g_exit_pos) continue;
-        int B = adj[P][D];
+        int B = g_adj[P][D];
         if (B < 0) continue;
         if (!g_allow_exit_transit && B == g_exit_pos) continue;
-        if (!(g_walkable_mask & (1u << B))) continue;
+        if (!(g_walkable_mask & (1ULL <<B))) continue;
 
         if (blk_idx_at[B] >= 0) {
             count++;  /* variant 2 */
-        } else if (hole_occ & (1u << B)) {
+        } else if (hole_occ & (1ULL <<B)) {
             /* skip */
-        } else if (B == g_exit_pos || P == g_exit_pos) {
-            /* skip */
+        } else if (B == g_exit_pos
+                   || (P == g_exit_pos && !g_allow_exit_transit)) {
+            /* skip — see expand() comment for rationale. */
         } else {
-            if (!(s->committed_empty & (1u << B)) && s->nblocks < g_max_blocks) {
+            if (!(s->committed_empty & (1ULL <<B)) && s->nblocks < g_max_blocks) {
                 count++;  /* variant 3 */
             }
             int v4 = !g_holeless && s->nblocks < g_max_blocks && s->nholes < g_max_holes;
-            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1u << B))) v4 = 0;
+            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B))) v4 = 0;
             if (v4) count++;  /* variant 4 */
         }
     }
@@ -782,10 +837,14 @@ static int count_potential_children(const BState *s) {
 /* Beam-score weights.  Tunable via --score-weights "wRoom,wBlocks,wHoles,wKids".
  * Defaults derived from 4x4 trace analysis (4×4 trace shows the optimal
  * lineage favors high room, low nblocks/nholes, high child-count). */
-static double g_w_room   =  1.0;
-static double g_w_blocks =  0.5;
-static double g_w_holes  =  0.3;
-static double g_w_kids   =  0.4;
+static double g_w_room    =  1.0;
+static double g_w_blocks  =  0.5;
+static double g_w_holes   =  0.3;
+static double g_w_kids    =  0.4;
+/* New features (May 2026 R&D round): direct rewards for the structural
+ * patterns we observed in deep puzzles. */
+static double g_w_holeadj =  5.0;   /* per hole adjacent to exit */
+static double g_w_maskpop =  0.2;   /* per direction-bit set across all blocks */
 
 /* Stochastic beam: at clip time, take only (1 - F)*K deterministically
  * by score, then fill the remaining F*K slots with uniform-random states
@@ -806,10 +865,12 @@ static double beam_score(const BState *s) {
     int active_size = __builtin_popcount(g_active_mask);
     int popcount    = __builtin_popcount(s->committed_empty & g_active_mask);
     int room        = active_size - popcount;
-    return  g_w_room   * (double)room
-          - g_w_blocks * (double)s->nblocks
-          - g_w_holes  * (double)s->nholes
-          + g_w_kids   * (double)s->kids_lookahead;
+    return  g_w_room    * (double)room
+          - g_w_blocks  * (double)s->nblocks
+          - g_w_holes   * (double)s->nholes
+          + g_w_kids    * (double)s->kids_lookahead
+          + g_w_holeadj * (double)s->hole_adj_exit
+          - g_w_maskpop * (double)s->mask_pop_sum;
 }
 
 static int cmp_beam_score(const void *a, const void *b) {
@@ -881,7 +942,7 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
     /* walls: NCELLS cells that are NOT committed_empty.  Inactive cells
      * (outside g_active_mask), block cells, and hole cells are all not-wall
      * (block/hole cells are in committed_empty by construction). */
-    pz->walls = ((1u << NCELLS) - 1) & ~s->committed_empty;
+    pz->walls = g_active_mask & ~s->committed_empty;
 }
 
 /* Cutoff-aware shortcut check.  We only care whether a forward path of
@@ -935,6 +996,134 @@ static int shortcut_check(const BState *s) {
  * lets the visit through to re-check the shortcut (since the threshold
  * is lower, it may now pass).
  * ------------------------------------------------------------------------- */
+
+/* Parse "U2,R3,D4" or "U2 R3 D4" into g_seed_path.  Returns 1 on success,
+ * 0 on malformed input. */
+static int parse_seed_path(const char *s) {
+    g_seed_path_n = 0;
+    while (*s) {
+        while (*s == ' ' || *s == ',' || *s == '\t') s++;
+        if (!*s) break;
+        int dir;
+        switch (*s++) {
+            case 'U': case 'u': dir = 0; break;
+            case 'R': case 'r': dir = 1; break;
+            case 'D': case 'd': dir = 2; break;
+            case 'L': case 'l': dir = 3; break;
+            default: return 0;
+        }
+        if (!*s || *s < '1' || *s > '3') return 0;
+        int user_action = *s++ - '0';
+        /* Remap user-facing digit to internal variant number:
+         *   1 -> 1 (walk-back), 2 -> 2 (push, auto 2/3), 3 -> 4 (un-consume) */
+        int var = (user_action == 3) ? 4 : user_action;
+        if (g_seed_path_n >= (int)(sizeof(g_seed_path)/sizeof(*g_seed_path))) return 0;
+        g_seed_path[g_seed_path_n].direction = (int8_t)dir;
+        g_seed_path[g_seed_path_n].variant   = (int8_t)var;
+        g_seed_path_n++;
+    }
+    return 1;
+}
+
+/* Apply one backward step in direction D with variant V (1..4) to state
+ * *s.  Mirrors the expand() logic exactly but for a single (D, V) choice
+ * with no branching.  Returns 1 on success, 0 if the requested step is
+ * invalid at this state.  Modifies *s in place on success. */
+static int apply_seed_step(BState *s, int D, int variant) {
+    int P = s->player_pos;
+    int C = g_adj[P][D ^ 2];
+    if (C < 0) return 0;
+    if (C == g_exit_pos) return 0;
+    if (!(g_walkable_mask & (1ULL << C))) return 0;
+
+    uint64_t blk_occ = 0;
+    int8_t blk_idx_at[MAX_NCELLS];
+    for (int i = 0; i < g_ncells; i++) blk_idx_at[i] = -1;
+    for (int i = 0; i < s->nblocks; i++) {
+        blk_occ |= 1ULL << s->block_pos[i];
+        blk_idx_at[s->block_pos[i]] = (int8_t)i;
+    }
+    uint64_t hole_occ = 0;
+    for (int i = 0; i < s->nholes; i++) hole_occ |= 1ULL << s->hole_pos[i];
+
+    if (blk_occ  & (1ULL << C)) return 0;
+    if (hole_occ & (1ULL << C)) return 0;
+
+    uint64_t new_E = s->committed_empty | (1ULL << C);
+
+    if (variant == 1) {
+        /* walk-back */
+        s->player_pos      = (int8_t)C;
+        s->committed_empty = new_E;
+        s->depth          += 1;
+        return 1;
+    }
+
+    /* Variants 2/3/4 require B = adj[P][D]. */
+    if (!g_allow_exit_transit && P == g_exit_pos) return 0;
+    int B = g_adj[P][D];
+    if (B < 0) return 0;
+    if (!g_allow_exit_transit && B == g_exit_pos) return 0;
+    if (!(g_walkable_mask & (1ULL << B))) return 0;
+
+    /* Digits 2 and 3 both mean "push-back".  Internally they're two
+     * variants (existing block at B vs newly-discovered block at B),
+     * which fire under mutually exclusive preconditions on the state.
+     * We try the right one automatically. */
+    if (variant == 2 || variant == 3) {
+        if (blk_idx_at[B] >= 0) {
+            /* Variant 2: block already tracked at B. */
+            int idx = blk_idx_at[B];
+            s->block_pos [idx]   = (int8_t)P;
+            s->block_mask[idx]  |= (uint8_t)(1 << D);
+            sort_blocks(s->block_pos, s->block_mask, s->nblocks);
+            s->player_pos      = (int8_t)C;
+            s->committed_empty = new_E;
+            s->depth          += 1;
+            return 1;
+        }
+        /* Variant 3: introduce a new block.  B must be uncommitted, no
+         * hole there, not the exit, and we must have room. */
+        if (hole_occ & (1ULL << B)) return 0;
+        if (B == g_exit_pos) return 0;
+        if (P == g_exit_pos && !g_allow_exit_transit) return 0;
+        if (s->committed_empty & (1ULL << B)) return 0;
+        if (s->nblocks >= g_max_blocks) return 0;
+        s->block_pos [s->nblocks] = (int8_t)P;
+        s->block_mask[s->nblocks] = (uint8_t)(1 << D);
+        s->nblocks++;
+        sort_blocks(s->block_pos, s->block_mask, s->nblocks);
+        s->player_pos      = (int8_t)C;
+        s->committed_empty = new_E | (1ULL << B);
+        s->depth          += 1;
+        return 1;
+    }
+
+    /* Variant 4: B must be empty (no block, no hole, not exit). */
+    if (blk_idx_at[B] >= 0) return 0;
+    if (hole_occ & (1ULL << B)) return 0;
+    if (B == g_exit_pos) return 0;
+    if (P == g_exit_pos && !g_allow_exit_transit) return 0;
+
+    if (variant == 4) {
+        if (g_holeless) return 0;
+        if (s->nblocks >= g_max_blocks) return 0;
+        if (s->nholes  >= g_max_holes ) return 0;
+        if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL << B))) return 0;
+        s->block_pos [s->nblocks] = (int8_t)P;
+        s->block_mask[s->nblocks] = (uint8_t)(1 << D);
+        s->nblocks++;
+        sort_blocks(s->block_pos, s->block_mask, s->nblocks);
+        s->hole_pos[s->nholes++] = (int8_t)B;
+        sort_holes(s->hole_pos, s->nholes);
+        s->player_pos      = (int8_t)C;
+        s->committed_empty = new_E | (1ULL << B);
+        s->depth          += 1;
+        return 1;
+    }
+    return 0;
+}
+
 static void try_successor(const BState *s) {
     g_states_checked++;
     /* Periodic debounce check: if a new-best timer is running and
@@ -1022,15 +1211,15 @@ static void try_successor(const BState *s) {
 static void expand(const BState *s) {
     int P = s->player_pos;
     /* Fast occupancy lookup for the current state's blocks and active holes. */
-    uint32_t blk_occ = 0;
-    int8_t blk_idx_at[NCELLS];
-    for (int i = 0; i < NCELLS; i++) blk_idx_at[i] = -1;
+    uint64_t blk_occ = 0;
+    int8_t blk_idx_at[MAX_NCELLS];
+    for (int i = 0; i < g_ncells; i++) blk_idx_at[i] = -1;
     for (int i = 0; i < s->nblocks; i++) {
-        blk_occ |= (1u << s->block_pos[i]);
+        blk_occ |= (1ULL <<s->block_pos[i]);
         blk_idx_at[s->block_pos[i]] = (int8_t)i;
     }
-    uint32_t hole_occ = 0;
-    for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
+    uint64_t hole_occ = 0;
+    for (int i = 0; i < s->nholes; i++) hole_occ |= (1ULL <<s->hole_pos[i]);
 
     /* Canonical-root pruning: at the standard-root state (depth 0, player
      * at exit, no blocks, no holes) the four first-backstep directions sit
@@ -1046,14 +1235,14 @@ static void expand(const BState *s) {
 
     for (int D = 0; D < 4; D++) {
         if (!(dir_mask & (1 << D))) continue;
-        int C = adj[P][D ^ 2];                   /* player came from C */
+        int C = g_adj[P][D ^ 2];                   /* player came from C */
         if (C < 0) continue;
         if (C == g_exit_pos) continue;             /* optimal play doesn't revisit exit */
-        if (!(g_walkable_mask & (1u << C))) continue;
-        if (blk_occ  & (1u << C)) continue;        /* can't walk into a block */
-        if (hole_occ & (1u << C)) continue;        /* can't walk into an active hole */
+        if (!(g_walkable_mask & (1ULL <<C))) continue;
+        if (blk_occ  & (1ULL <<C)) continue;        /* can't walk into a block */
+        if (hole_occ & (1ULL <<C)) continue;        /* can't walk into an active hole */
 
-        uint32_t new_E = s->committed_empty | (1u << C);
+        uint64_t new_E = s->committed_empty | (1ULL << C);
 
         /* Successor 1: walk-back. */
         {
@@ -1067,10 +1256,10 @@ static void expand(const BState *s) {
         /* Strict-rule fast-out: when transit is disallowed, no push variant
          * may involve the exit cell at all. */
         if (!g_allow_exit_transit && P == g_exit_pos) continue;
-        int B = adj[P][D];
+        int B = g_adj[P][D];
         if (B < 0) continue;
         if (!g_allow_exit_transit && B == g_exit_pos) continue;
-        if (!(g_walkable_mask & (1u << B))) continue;
+        if (!(g_walkable_mask & (1ULL <<B))) continue;
 
         if (blk_idx_at[B] >= 0) {
             /* Successor 2: backward-push existing block from B to P.
@@ -1084,29 +1273,35 @@ static void expand(const BState *s) {
             ns.committed_empty = new_E;
             ns.depth           = s->depth + 1;
             try_successor(&ns);
-        } else if (hole_occ & (1u << B)) {
+        } else if (hole_occ & (1ULL <<B)) {
             /* B has an active hole — variants 3 (no consume) is impossible since
              * a block can't sit on an active hole.  Variant 4 (un-consume) is
              * also impossible because B is already an active hole and the
              * un-consume would re-introduce one.  Skip both. */
-        } else if (B == g_exit_pos || P == g_exit_pos) {
+        } else if (B == g_exit_pos
+                   || (P == g_exit_pos && !g_allow_exit_transit)) {
             /* Variants 3 and 4 introduce a new block at P and (variant 4)
-             * a new hole at B.  Even with --allow-exit-transit, blocks and
-             * holes must not *originate* at the exit cell — they can only
-             * transit through, which is variant 2's job. */
+             * a new hole at B.  Holes can never *originate* at the exit
+             * cell — that's a wholly different rule we don't support, so
+             * B == exit is always forbidden.  Blocks can transit through
+             * the exit when --allow-exit-transit is set: this corresponds
+             * to a forward "push-off-exit" win move where the block was
+             * on the exit (transiently) before being pushed off into the
+             * hole at B.  So we only forbid P == exit when transit is
+             * disallowed. */
         } else {
             /* B has no block and no active hole.  Two possible variants: */
 
             /* Successor 3: introduce new block at B (continuously occupying B
              * for the entire backward trace up to now), then push it back to P. */
-            if (!(s->committed_empty & (1u << B)) && s->nblocks < g_max_blocks) {
+            if (!(s->committed_empty & (1ULL <<B)) && s->nblocks < g_max_blocks) {
                 BState ns = *s;
                 ns.block_pos [ns.nblocks] = (int8_t)P;
                 ns.block_mask[ns.nblocks] = (uint8_t)(1 << D);
                 ns.nblocks++;
                 sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
                 ns.player_pos      = (int8_t)C;
-                ns.committed_empty = new_E | (1u << B);
+                ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
                 try_successor(&ns);
             }
@@ -1122,7 +1317,7 @@ static void expand(const BState *s) {
              * Skipped entirely under --holeless. */
             /* When --fixedholes is non-empty, restrict variant 4's hole
              * placement: B must be one of the listed cells. */
-            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1u << B))) {
+            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B))) {
                 /* fall through — variant 4 is forbidden at this B */
             } else
             if (!g_holeless && s->nblocks < g_max_blocks && s->nholes < g_max_holes) {
@@ -1134,7 +1329,7 @@ static void expand(const BState *s) {
                 ns.hole_pos[ns.nholes++] = (int8_t)B;
                 sort_holes(ns.hole_pos, ns.nholes);
                 ns.player_pos      = (int8_t)C;
-                ns.committed_empty = new_E | (1u << B);
+                ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
                 try_successor(&ns);
             }
@@ -1146,32 +1341,33 @@ static void expand(const BState *s) {
  * Final puzzle output
  * ------------------------------------------------------------------------- */
 static void print_puzzle_for_exit(const BState *s, int exit_pos) {
-    char grid[ROWS][COLS + 1];
-    for (int r = 0; r < ROWS; r++) {
-        for (int c = 0; c < COLS; c++) grid[r][c] = '.';
-        grid[r][COLS] = '\0';
+    char grid[MAX_ROWS][MAX_COLS + 1];
+    for (int r = 0; r < g_rows; r++) {
+        for (int c = 0; c < g_cols; c++) grid[r][c] = '.';
+        grid[r][g_cols] = '\0';
     }
-    /* Walls = NCELLS cells not in committed_empty.  In the active region,
-     * unconstrained cells become walls; inactive cells are also walls. */
-    for (int i = 0; i < NCELLS; i++)
-        if (!(s->committed_empty & (1u << i))) grid[i / COLS][i % COLS] = '#';
+    /* Walls = active-region cells not in committed_empty.  Cells outside
+     * the active region (relevant only for nxm grids embedded historically
+     * in 5x5) don't apply now: the grid IS the active region. */
+    for (int i = 0; i < g_ncells; i++)
+        if (!(s->committed_empty & (1ULL << i))) grid[i / g_cols][i % g_cols] = '#';
     /* Holes (active in puzzle setup) — drawn before blocks so blocks shadow
      * any cell that was a block in our state but not a hole. */
     for (int i = 0; i < s->nholes; i++) {
         int p = s->hole_pos[i];
-        grid[p / COLS][p % COLS] = 'O';
+        grid[p / g_cols][p % g_cols] = 'O';
     }
     for (int i = 0; i < s->nblocks; i++) {
         int p = s->block_pos[i];
-        grid[p / COLS][p % COLS] = (char)('A' + i);
+        grid[p / g_cols][p % g_cols] = (char)('A' + i);
     }
-    grid[exit_pos / COLS][exit_pos % COLS] = '$';
+    grid[exit_pos / g_cols][exit_pos % g_cols] = '$';
     /* Player drawn last so it overlays whatever cell it stands on. */
-    grid[s->player_pos / COLS][s->player_pos % COLS] = '@';
+    grid[s->player_pos / g_cols][s->player_pos % g_cols] = '@';
 
-    for (int r = 0; r < g_grid_rows; r++) {
+    for (int r = 0; r < g_rows; r++) {
         printf("  ");
-        for (int c = 0; c < g_grid_cols; c++) putchar(grid[r][c]);
+        for (int c = 0; c < g_cols; c++) putchar(grid[r][c]);
         if (r < s->nblocks) {
             uint8_t m = s->block_mask[r];
             printf("   %c=[%s%s%s%s]",
@@ -1257,15 +1453,15 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
     int n = 0;
     int P = s->player_pos;
 
-    uint32_t blk_occ = 0;
-    int8_t blk_idx_at[NCELLS];
-    for (int i = 0; i < NCELLS; i++) blk_idx_at[i] = -1;
+    uint64_t blk_occ = 0;
+    int8_t blk_idx_at[MAX_NCELLS];
+    for (int i = 0; i < g_ncells; i++) blk_idx_at[i] = -1;
     for (int i = 0; i < s->nblocks; i++) {
-        blk_occ |= (1u << s->block_pos[i]);
+        blk_occ |= (1ULL <<s->block_pos[i]);
         blk_idx_at[s->block_pos[i]] = (int8_t)i;
     }
-    uint32_t hole_occ = 0;
-    for (int i = 0; i < s->nholes; i++) hole_occ |= (1u << s->hole_pos[i]);
+    uint64_t hole_occ = 0;
+    for (int i = 0; i < s->nholes; i++) hole_occ |= (1ULL <<s->hole_pos[i]);
 
     int dir_mask = 0xF;
     if (s->depth == 0 && s->nblocks == 0 && s->nholes == 0
@@ -1275,14 +1471,14 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
 
     for (int D = 0; D < 4; D++) {
         if (!(dir_mask & (1 << D))) continue;
-        int C = adj[P][D ^ 2];
+        int C = g_adj[P][D ^ 2];
         if (C < 0) continue;
         if (C == g_exit_pos) continue;
-        if (!(g_walkable_mask & (1u << C))) continue;
-        if (blk_occ  & (1u << C)) continue;
-        if (hole_occ & (1u << C)) continue;
+        if (!(g_walkable_mask & (1ULL <<C))) continue;
+        if (blk_occ  & (1ULL <<C)) continue;
+        if (hole_occ & (1ULL <<C)) continue;
 
-        uint32_t new_E = s->committed_empty | (1u << C);
+        uint64_t new_E = s->committed_empty | (1ULL << C);
 
         /* Variant 1 — walk-back. */
         if (n < max_out) {
@@ -1295,10 +1491,10 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
 
         /* Push variants. */
         if (!g_allow_exit_transit && P == g_exit_pos) continue;
-        int B = adj[P][D];
+        int B = g_adj[P][D];
         if (B < 0) continue;
         if (!g_allow_exit_transit && B == g_exit_pos) continue;
-        if (!(g_walkable_mask & (1u << B))) continue;
+        if (!(g_walkable_mask & (1ULL <<B))) continue;
 
         if (blk_idx_at[B] >= 0) {
             /* Variant 2 — push existing block. */
@@ -1313,14 +1509,17 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.depth           = s->depth + 1;
                 out_buf[n++] = ns;
             }
-        } else if (hole_occ & (1u << B)) {
+        } else if (hole_occ & (1ULL <<B)) {
             /* Skip — block can't sit on active hole. */
-        } else if (B == g_exit_pos || P == g_exit_pos) {
-            /* Skip — variants 3 and 4 forbidden at exit. */
+        } else if (B == g_exit_pos
+                   || (P == g_exit_pos && !g_allow_exit_transit)) {
+            /* Skip — B == exit always forbidden (holes never originate
+             * at exit).  P == exit only forbidden under strict rule;
+             * with --allow-exit-transit, block can transit the exit. */
         } else {
             /* Variant 3 — introduce new block at B. */
             if (n < max_out
-                && !(s->committed_empty & (1u << B))
+                && !(s->committed_empty & (1ULL <<B))
                 && s->nblocks < g_max_blocks) {
                 BState ns = *s;
                 ns.block_pos [ns.nblocks] = (int8_t)P;
@@ -1328,13 +1527,13 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.nblocks++;
                 sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
                 ns.player_pos      = (int8_t)C;
-                ns.committed_empty = new_E | (1u << B);
+                ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
                 out_buf[n++] = ns;
             }
             /* Variant 4 — un-consume (introduce block + hole). */
             int v4_allowed = 1;
-            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1u << B))) v4_allowed = 0;
+            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B))) v4_allowed = 0;
             if (g_holeless) v4_allowed = 0;
             if (s->nblocks >= g_max_blocks || s->nholes >= g_max_holes) v4_allowed = 0;
             if (v4_allowed && n < max_out) {
@@ -1346,7 +1545,7 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.hole_pos[ns.nholes++] = (int8_t)B;
                 sort_holes(ns.hole_pos, ns.nholes);
                 ns.player_pos      = (int8_t)C;
-                ns.committed_empty = new_E | (1u << B);
+                ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
                 out_buf[n++] = ns;
             }
@@ -1389,7 +1588,7 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
         r.player_pos      = (int8_t)exit_pos;
         r.nblocks         = 0;
         r.nholes          = 0;
-        r.committed_empty = 1u << exit_pos;
+        r.committed_empty = 1ULL <<exit_pos;
         r.depth           = 0;
         roots[n_roots++]  = r;
     }
@@ -1405,18 +1604,18 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
     if (g_allow_exit_transit && g_max_blocks >= 1) {
         for (int D = 0; D < 4; D++) {
             if (!(g_canonical_dir_mask & (1 << D))) continue;
-            int X = adj[exit_pos][D];
+            int X = g_adj[exit_pos][D];
             if (X < 0) continue;
-            if (!(g_walkable_mask & (1u << X))) continue;
-            if (g_fixed_holes_mask & (1u << X)) continue;
-            int Y = adj[exit_pos][D ^ 2];
+            if (!(g_walkable_mask & (1ULL <<X))) continue;
+            if (g_fixed_holes_mask & (1ULL <<X)) continue;
+            int Y = g_adj[exit_pos][D ^ 2];
             if (Y < 0) continue;
-            if (!(g_walkable_mask & (1u << Y))) continue;
+            if (!(g_walkable_mask & (1ULL <<Y))) continue;
             BState r = {0};
             r.player_pos      = (int8_t)Y;
             r.nblocks         = 1;
             r.nholes          = 0;
-            r.committed_empty = (1u << exit_pos) | (1u << X) | (1u << Y);
+            r.committed_empty = (1ULL <<exit_pos) | (1ULL <<X) | (1ULL <<Y);
             r.depth           = 1;
             r.block_pos [0]   = (int8_t)exit_pos;
             r.block_mask[0]   = (uint8_t)(1u << D);
@@ -1452,11 +1651,11 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
      * level shallower than for standard roots; the seed itself remains at
      * d3 (one level beyond the partition key), reused as a search starting
      * point that already encodes the partition's classifying event. */
-    uint32_t exit_adj_mask = 0;
+    uint64_t exit_adj_mask = 0;
     for (int D = 0; D < 4; D++) {
-        int X = adj[exit_pos][D];
+        int X = g_adj[exit_pos][D];
         if (X < 0) continue;
-        exit_adj_mask |= (1u << X);
+        exit_adj_mask |= (1ULL <<X);
     }
     for (int r = 0; r < n_roots; r++) {
         const BState *root = &roots[r];
@@ -1469,7 +1668,7 @@ static int enumerate_tasks_for_exit(int exit_pos, TaskGroup *tasks, int max_task
 
             /* pd1 = state_1 player position. */
             int pd1 = (root->depth == 0) ? d1->player_pos : root->player_pos;
-            int pd1_is_exit_adj = (exit_adj_mask & (1u << pd1)) != 0;
+            int pd1_is_exit_adj = (exit_adj_mask & (1ULL <<pd1)) != 0;
 
             BState d2_buf[16];
             int n_d2 = enumerate_successors(d1, d2_buf, 16);
@@ -1562,7 +1761,36 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_dedup_full     = 0;
     g_skipped_dedup  = 0;
 
-    if (g_task_seeds && g_task_seed_count > 0) {
+    if (g_have_seed_path) {
+        /* Seed-path mode: start from the standard root and replay the
+         * user-supplied sequence of (direction, variant) steps.  The
+         * resulting state is the SOLE seed.  DFS then explores its
+         * subtree exhaustively (subject to --time / --max-depth). */
+        BState seed = {
+            .player_pos      = (int8_t)g_exit_pos,
+            .nblocks         = 0,
+            .nholes          = 0,
+            .committed_empty = 1ULL << g_exit_pos,
+            .depth           = 0,
+        };
+        for (int i = 0; i < g_seed_path_n; i++) {
+            int D = g_seed_path[i].direction;
+            int V = g_seed_path[i].variant;
+            int user_digit = (V == 4) ? 3 : V;   /* invert the parse-time remap for messages */
+            if (!apply_seed_step(&seed, D, V)) {
+                fprintf(stderr, "error: --seed-path step %d (%c%d) is invalid at depth %d (player=%d)\n",
+                        i, "URDL"[D], user_digit, seed.depth, seed.player_pos);
+                if (out_exhausted)  *out_exhausted = 0;
+                if (out_dedup_full) *out_dedup_full = 0;
+                return 0.0;
+            }
+        }
+        fprintf(stderr, "[seed-path] seed built: depth=%d player=%d nblocks=%d nholes=%d committed_pop=%d\n",
+                seed.depth, seed.player_pos, seed.nblocks, seed.nholes,
+                __builtin_popcount(seed.committed_empty & g_active_mask));
+        g_best_state = seed;
+        try_successor(&seed);
+    } else if (g_task_seeds && g_task_seed_count > 0) {
         /* Task mode: skip default depth-0 roots; feed each seed through
          * try_successor.  This is what registers the seed itself as a
          * candidate "best" — bypassing it (a previous bug) caused tight
@@ -1580,7 +1808,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
             .player_pos      = (int8_t)g_exit_pos,
             .nblocks         = 0,
             .nholes          = 0,
-            .committed_empty = 1u << g_exit_pos,
+            .committed_empty = 1ULL <<g_exit_pos,
             .depth           = 0,
         };
         g_best_state = init;
@@ -1612,18 +1840,18 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         if (g_allow_exit_transit && g_max_blocks >= 1) {
             for (int D = 0; D < 4; D++) {
                 if (!(g_canonical_dir_mask & (1 << D))) continue;
-                int X = adj[g_exit_pos][D];
+                int X = g_adj[g_exit_pos][D];
                 if (X < 0) continue;
-                if (!(g_walkable_mask & (1u << X))) continue;
-                if (g_fixed_holes_mask & (1u << X)) continue;
-                int Y = adj[g_exit_pos][D ^ 2];
+                if (!(g_walkable_mask & (1ULL <<X))) continue;
+                if (g_fixed_holes_mask & (1ULL <<X)) continue;
+                int Y = g_adj[g_exit_pos][D ^ 2];
                 if (Y < 0) continue;
-                if (!(g_walkable_mask & (1u << Y))) continue;
+                if (!(g_walkable_mask & (1ULL <<Y))) continue;
                 BState seed = {
                     .player_pos      = (int8_t)Y,
                     .nblocks         = 1,
                     .nholes          = 0,
-                    .committed_empty = (1u << g_exit_pos) | (1u << X) | (1u << Y),
+                    .committed_empty = (1ULL <<g_exit_pos) | (1ULL <<X) | (1ULL <<Y),
                     .depth           = 1,
                 };
                 seed.block_pos [0] = (int8_t)g_exit_pos;
@@ -1768,9 +1996,9 @@ static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [--grid RxC] [--time SEC] [--exit N] [--allow-exit-transit]\n"
         "                       [--fixedwalls c,c,...] [--fixedholes c,c,...]\n"
-        "  --grid RxC            active region (R,C in [1..5]); cells outside are walls.  Default: 5x5\n"
+        "  --grid RxC            grid dimensions; R*C must be <= %d (= MAX_NCELLS).  Default: 5x5\n"
         "  --time SEC            wall-clock cap in seconds, shared across exits.  Default: %.0f\n"
-        "                          0 = no time limit (run until queue is empty for every exit)\n"
+        "                          (0 = no time limit, run until queue is empty for every exit)\n"
         "  --exit N              restrict to one exit cell.  Default: iterate canonical {0,1,2,6,7,12}\n"
         "  --exitloc c,c,...     iterate the listed exit cells (comma-separated).  Overrides the\n"
         "                          canonical default; --exit takes priority if both are given.\n"
@@ -1804,26 +2032,29 @@ static void print_usage(const char *prog) {
         "\nVisited table is %lu MB (2^%d slots × 16 B).  On overflow the search\n"
         "exits the current root gracefully.  To enlarge, recompile with -DHASH_LG2=N.\n"
         "\nNew bests are streamed to stdout as they are found, prefixed with elapsed time.\n",
-        prog, DEFAULT_CAP_S, MAX_BLOCKS, MAX_HOLES,
+        prog, MAX_NCELLS, DEFAULT_CAP_S, MAX_BLOCKS, MAX_HOLES,
         (unsigned long)((size_t)HASH_CAP * sizeof(HashSlot) / (1024*1024)), HASH_LG2);
 }
 
 static int parse_grid(const char *s) {
     int r, c;
     if (sscanf(s, "%dx%d", &r, &c) != 2) return 0;
-    if (r < 1 || r > 5 || c < 1 || c > 5) return 0;
+    if (r < 1 || c < 1 || r > MAX_ROWS || c > MAX_COLS || r * c > MAX_NCELLS) return 0;
     g_grid_rows = r;
     g_grid_cols = c;
     return 1;
 }
 
 int main(int argc, char **argv) {
+    /* Seed rand() so --stochastic produces a different sequence per run.
+     * Mixes wall-clock and PID so multi-worker ensembles diverge. */
+    srand((unsigned)(time(NULL) ^ (long)getpid()));
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]); return 0;
         } else if (strcmp(argv[i], "--grid") == 0) {
             if (++i >= argc || !parse_grid(argv[i])) {
-                fprintf(stderr, "error: --grid requires RxC with R,C in [1..5]\n"); return 1;
+                fprintf(stderr, "error: --grid requires RxC with R>=1, C>=1, R*C<=%d\n", MAX_NCELLS); return 1;
             }
         } else if (strcmp(argv[i], "--time") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --time requires SEC\n"); return 1; }
@@ -1832,9 +2063,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--exit") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --exit requires N\n"); return 1; }
             g_only_exit = atoi(argv[i]);
-            if (g_only_exit < 0 || g_only_exit >= NCELLS) {
-                fprintf(stderr, "error: --exit must be 0..%d\n", NCELLS - 1); return 1;
-            }
+            /* Bounds-checked later, once sokoban_set_grid has populated g_ncells. */
         } else if (strcmp(argv[i], "--exitloc") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --exitloc requires c,c,...\n"); return 1; }
             const char *p = argv[i];
@@ -1843,13 +2072,15 @@ int main(int argc, char **argv) {
             while (*p) {
                 char *end;
                 long v = strtol(p, &end, 10);
-                if (end == p || v < 0 || v >= NCELLS) {
+                /* Use the maximum allowable cell here; actual grid bounds
+                 * are re-checked after sokoban_set_grid populates g_ncells. */
+                if (end == p || v < 0 || v >= MAX_NCELLS) {
                     fprintf(stderr, "error: invalid cell '%s' in --exitloc\n", p); return 1;
                 }
-                if (seen & (1u << v)) {
+                if (seen & (1ULL <<v)) {
                     fprintf(stderr, "error: duplicate cell %ld in --exitloc\n", v); return 1;
                 }
-                seen |= (1u << v);
+                seen |= (1ULL <<v);
                 g_only_exit_list[g_n_only_exits++] = (int)v;
                 p = end;
                 if (*p == ',') p++;
@@ -1878,11 +2109,27 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: --stochastic F must be in [0, 1]\n"); return 1;
             }
         } else if (strcmp(argv[i], "--score-weights") == 0) {
-            if (++i >= argc) { fprintf(stderr, "error: --score-weights requires wRoom,wBlocks,wHoles,wKids\n"); return 1; }
-            if (sscanf(argv[i], "%lf,%lf,%lf,%lf",
-                       &g_w_room, &g_w_blocks, &g_w_holes, &g_w_kids) != 4) {
-                fprintf(stderr, "error: --score-weights expects 4 comma-separated floats\n"); return 1;
+            if (++i >= argc) { fprintf(stderr, "error: --score-weights requires wRoom,wBlocks,wHoles,wKids[,wHoleAdj,wMaskPop]\n"); return 1; }
+            /* Accept 4 (legacy) or 6 (with new features) comma-separated weights. */
+            int n6 = sscanf(argv[i], "%lf,%lf,%lf,%lf,%lf,%lf",
+                            &g_w_room, &g_w_blocks, &g_w_holes, &g_w_kids,
+                            &g_w_holeadj, &g_w_maskpop);
+            if (n6 != 4 && n6 != 6) {
+                fprintf(stderr, "error: --score-weights expects 4 or 6 comma-separated floats\n"); return 1;
             }
+        } else if (strcmp(argv[i], "--w-hole-adj") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --w-hole-adj requires F\n"); return 1; }
+            g_w_holeadj = atof(argv[i]);
+        } else if (strcmp(argv[i], "--w-mask-pop") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --w-mask-pop requires F\n"); return 1; }
+            g_w_maskpop = atof(argv[i]);
+        } else if (strcmp(argv[i], "--seed-path") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --seed-path requires \"D1V1,D2V2,...\"\n"); return 1; }
+            if (!parse_seed_path(argv[i])) {
+                fprintf(stderr, "error: --seed-path must be tokens like U2,R3,L1 (dir letter U/R/D/L + action digit 1=walk, 2=push, 3=consume)\n");
+                return 1;
+            }
+            g_have_seed_path = 1;
         } else if (strcmp(argv[i], "--trace-csv") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --trace-csv requires FILE\n"); return 1; }
             g_trace_csv = fopen(argv[i], "w");
@@ -1936,13 +2183,15 @@ int main(int argc, char **argv) {
             while (*p) {
                 char *end;
                 long v = strtol(p, &end, 10);
-                if (end == p || v < 0 || v >= NCELLS) {
+                /* Use the maximum allowable cell here; actual grid bounds
+                 * are re-checked after sokoban_set_grid populates g_ncells. */
+                if (end == p || v < 0 || v >= MAX_NCELLS) {
                     fprintf(stderr, "error: invalid cell '%s' in --fixedwalls\n", p); return 1;
                 }
-                if (g_fixed_walls_mask & (1u << v)) {
+                if (g_fixed_walls_mask & (1ULL <<v)) {
                     fprintf(stderr, "error: duplicate cell %ld in --fixedwalls\n", v); return 1;
                 }
-                g_fixed_walls_mask |= (1u << v);
+                g_fixed_walls_mask |= (1ULL <<v);
                 p = end;
                 if (*p == ',') p++;
                 else if (*p) { fprintf(stderr, "error: expected ',' in --fixedwalls\n"); return 1; }
@@ -1955,17 +2204,19 @@ int main(int argc, char **argv) {
             while (*p) {
                 char *end;
                 long v = strtol(p, &end, 10);
-                if (end == p || v < 0 || v >= NCELLS) {
+                /* Use the maximum allowable cell here; actual grid bounds
+                 * are re-checked after sokoban_set_grid populates g_ncells. */
+                if (end == p || v < 0 || v >= MAX_NCELLS) {
                     fprintf(stderr, "error: invalid cell '%s' in --fixedholes\n", p); return 1;
                 }
-                if (g_fixed_holes_mask & (1u << v)) {
+                if (g_fixed_holes_mask & (1ULL <<v)) {
                     fprintf(stderr, "error: duplicate cell %ld in --fixedholes\n", v); return 1;
                 }
                 if (g_fixed_nholes >= MAX_HOLES) {
                     fprintf(stderr, "error: too many fixed holes (max %d)\n", MAX_HOLES); return 1;
                 }
                 g_fixed_hole_pos[g_fixed_nholes++] = (int)v;
-                g_fixed_holes_mask |= (1u << v);
+                g_fixed_holes_mask |= (1ULL <<v);
                 p = end;
                 if (*p == ',') p++;
                 else if (*p) { fprintf(stderr, "error: expected ',' in --fixedholes\n"); return 1; }
@@ -1976,18 +2227,51 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Build active mask from grid dimensions. */
+    /* Configure the solver for the requested grid.  This populates the
+     * solver's g_rows / g_cols / g_ncells / g_adj / g_all_cells globals,
+     * which we then read directly from the header. */
+    sokoban_set_grid(g_grid_rows, g_grid_cols);
+
+    /* Now that g_ncells is known, finish bounds-checking flags that were
+     * parsed before sokoban_set_grid (--exit, --exitloc, --fixedwalls,
+     * --fixedholes accept up to MAX_NCELLS at parse time). */
+    if (g_only_exit >= 0 && g_only_exit >= g_ncells) {
+        fprintf(stderr, "error: --exit must be 0..%d (got %d)\n", g_ncells - 1, g_only_exit);
+        return 1;
+    }
+    for (int i = 0; i < g_n_only_exits; i++) {
+        if (g_only_exit_list[i] >= g_ncells) {
+            fprintf(stderr, "error: --exitloc cell %d is outside the %dx%d grid\n",
+                    g_only_exit_list[i], g_grid_rows, g_grid_cols);
+            return 1;
+        }
+    }
+    if (g_fixed_walls_mask & ~((g_ncells == 64) ? ~0ULL : ((1ULL << g_ncells) - 1))) {
+        fprintf(stderr, "error: --fixedwalls includes a cell outside the %dx%d grid\n",
+                g_grid_rows, g_grid_cols);
+        return 1;
+    }
+    if (g_fixed_holes_mask & ~((g_ncells == 64) ? ~0ULL : ((1ULL << g_ncells) - 1))) {
+        fprintf(stderr, "error: --fixedholes includes a cell outside the %dx%d grid\n",
+                g_grid_rows, g_grid_cols);
+        return 1;
+    }
+
+    /* Build active mask from grid dimensions.  In the new generalized
+     * model the entire grid is the active region, so this equals the
+     * solver's g_all_cells — but we keep the loop for clarity and in case
+     * future use re-introduces an active sub-region. */
     g_active_mask = 0;
     for (int r = 0; r < g_grid_rows; r++)
         for (int c = 0; c < g_grid_cols; c++)
-            g_active_mask |= 1u << (r * COLS + c);
+            g_active_mask |= 1ULL << (r * g_cols + c);
 
     sokoban_init();
 
     /* Validate fixed holes against the active region. */
     for (int i = 0; i < g_fixed_nholes; i++) {
         int h = g_fixed_hole_pos[i];
-        if (!(g_active_mask & (1u << h))) {
+        if (!(g_active_mask & (1ULL <<h))) {
             fprintf(stderr, "error: --fixedholes cell %d is outside the %dx%d active region\n",
                     h, g_grid_rows, g_grid_cols);
             return 1;
@@ -2020,6 +2304,10 @@ int main(int argc, char **argv) {
     /* Build the D4 transforms for this grid (depends only on g_grid_rows/cols). */
     build_d4();
 
+    /* Enumerate canonical exit reps under the D4 group.  For 5x5 this
+     * reproduces the historical {0,1,2,6,7,12}. */
+    build_canonical_exits();
+
     /* Translate --num-walls into a popcount cap on committed_empty
      * within the active region. */
     {
@@ -2047,19 +2335,19 @@ int main(int argc, char **argv) {
      *   3. default              canonical {0,1,2,6,7,12} in active region.
      * In all cases, cells that conflict with --fixedholes or --fixedwalls
      * are invalid (single-cell forms error; lists silently filter). */
-    int exits[NCELLS];
+    int exits[MAX_NCELLS];
     int n_exits = 0;
     if (g_only_exit >= 0) {
-        if (!(g_active_mask & (1u << g_only_exit))) {
+        if (!(g_active_mask & (1ULL <<g_only_exit))) {
             fprintf(stderr, "error: --exit %d is outside the %dx%d active region\n",
                     g_only_exit, g_grid_rows, g_grid_cols);
             return 1;
         }
-        if (g_fixed_holes_mask & (1u << g_only_exit)) {
+        if (g_fixed_holes_mask & (1ULL <<g_only_exit)) {
             fprintf(stderr, "error: --exit %d coincides with a fixed hole\n", g_only_exit);
             return 1;
         }
-        if (g_fixed_walls_mask & (1u << g_only_exit)) {
+        if (g_fixed_walls_mask & (1ULL <<g_only_exit)) {
             fprintf(stderr, "error: --exit %d coincides with a fixed wall\n", g_only_exit);
             return 1;
         }
@@ -2067,27 +2355,27 @@ int main(int argc, char **argv) {
     } else if (g_n_only_exits > 0) {
         for (int i = 0; i < g_n_only_exits; i++) {
             int e = g_only_exit_list[i];
-            if (!(g_active_mask & (1u << e))) {
+            if (!(g_active_mask & (1ULL <<e))) {
                 fprintf(stderr, "error: --exitloc cell %d is outside the %dx%d active region\n",
                         e, g_grid_rows, g_grid_cols);
                 return 1;
             }
-            if (g_fixed_holes_mask & (1u << e)) {
+            if (g_fixed_holes_mask & (1ULL <<e)) {
                 fprintf(stderr, "error: --exitloc cell %d coincides with a fixed hole\n", e);
                 return 1;
             }
-            if (g_fixed_walls_mask & (1u << e)) {
+            if (g_fixed_walls_mask & (1ULL <<e)) {
                 fprintf(stderr, "error: --exitloc cell %d coincides with a fixed wall\n", e);
                 return 1;
             }
             exits[n_exits++] = e;
         }
     } else {
-        for (int i = 0; i < NUM_EXIT_CELLS; i++) {
-            int e = CANONICAL_EXITS[i];
-            if (!(g_active_mask & (1u << e))) continue;
-            if (g_fixed_holes_mask & (1u << e)) continue;  /* exit can't be a hole */
-            if (g_fixed_walls_mask & (1u << e)) continue;  /* exit can't be a wall */
+        for (int i = 0; i < g_n_canonical_exits; i++) {
+            int e = g_canonical_exits[i];
+            if (!(g_active_mask & (1ULL << e))) continue;
+            if (g_fixed_holes_mask & (1ULL << e)) continue;  /* exit can't be a hole */
+            if (g_fixed_walls_mask & (1ULL << e)) continue;  /* exit can't be a wall */
             exits[n_exits++] = e;
         }
         if (n_exits == 0) {
@@ -2111,10 +2399,26 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &g_t_session_start);
     struct timespec t_global0 = g_t_session_start, t_global_now;
 
-    /* Handle --list-tasks: enumerate tasks per exit, print total, exit. */
+    /* Handle --list-tasks: enumerate tasks per exit, print total, exit.
+     * When --seed-path is in effect, the seed-path overrides task seeds
+     * inside run_exit_search anyway — so partitioning into N tasks would
+     * just have N workers explore the same subtree redundantly.  Emit
+     * a single synthetic task so the wrapper falls through to the
+     * single-worker path. */
+    if (g_list_tasks && g_have_seed_path) {
+        printf("seed-path: %d step%s\ntotal: 1\n",
+               g_seed_path_n, g_seed_path_n == 1 ? "" : "s");
+        free(g_visited); free(g_queue);
+        free(g_shallow); free(g_recent);
+        return 0;
+    }
     if (g_list_tasks) {
         int total = 0;
-        TaskGroup tasks[MAX_TASKS_PER_EXIT];
+        /* Heap-allocate: a TaskGroup is large (~120 KB with MAX_BLOCKS/HOLES
+         * bumped for 8x8), and the array of 32 of them would overflow the
+         * main-thread stack. */
+        TaskGroup *tasks = calloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup));
+        if (!tasks) { perror("calloc tasks"); return 1; }
         for (int ei = 0; ei < n_exits; ei++) {
             int n = enumerate_tasks_for_exit(exits[ei], tasks, MAX_TASKS_PER_EXIT);
             printf("exit %d: %d task%s\n", exits[ei], n, n == 1 ? "" : "s");
@@ -2125,6 +2429,7 @@ int main(int argc, char **argv) {
             total += n;
         }
         printf("\ntotal: %d\n", total);
+        free(tasks);
         free(g_visited);
         free(g_queue);
         free(g_shallow);
@@ -2137,7 +2442,8 @@ int main(int argc, char **argv) {
     TaskGroup task_target = {0};
     if (g_only_task >= 0) {
         int idx = 0;
-        TaskGroup tasks[MAX_TASKS_PER_EXIT];
+        TaskGroup *tasks = calloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup));
+        if (!tasks) { perror("calloc tasks"); return 1; }
         for (int ei = 0; ei < n_exits; ei++) {
             int n = enumerate_tasks_for_exit(exits[ei], tasks, MAX_TASKS_PER_EXIT);
             if (g_only_task < idx + n) {
@@ -2147,6 +2453,7 @@ int main(int argc, char **argv) {
             }
             idx += n;
         }
+        free(tasks);
         if (task_target_exit < 0) {
             fprintf(stderr, "error: --task-id %d out of range (total tasks = %d)\n",
                     g_only_task, idx);

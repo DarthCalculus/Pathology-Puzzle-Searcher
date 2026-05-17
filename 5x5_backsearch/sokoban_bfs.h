@@ -1,18 +1,33 @@
 #pragma once
 #include <stdint.h>
 
-/* Grid dimensions */
-#define ROWS       5
-#define COLS       5
-#define NCELLS     25   /* ROWS * COLS */
-#define MAX_BLOCKS 24
-#define MAX_HOLES  23
-#define CONSUMED   25   /* sentinel: block fell into a hole */
+/* Maximum grid bounds.  Bitmask cell occupancy uses a single uint64_t,
+ * so the addressable region is capped at MAX_NCELLS=64 cells total.
+ * Any RxC with R*C <= 64 is supported — 8x8, 7x9, 3x21, 1x64, etc. */
+#define MAX_ROWS    64
+#define MAX_COLS    64
+#define MAX_NCELLS  64
+#define MAX_BLOCKS  32     /* enough for 8x8 puzzles in practice; --num-blocks rejects more */
+#define MAX_HOLES   32
+/* CONSUMED sentinel: encodes "block fell into a hole".  Set by
+ * sokoban_set_grid() to g_ncells, which is the smallest value larger
+ * than any legal cell index AND still fits in g_bits_per_cell bits. */
+extern int g_consumed;
+
+/* Runtime grid dimensions — set by sokoban_set_grid() and used by both
+ * the solver and the back-search generator. */
+extern int g_rows;
+extern int g_cols;
+extern int g_ncells;
+
+/* Adjacency table built from grid dimensions in sokoban_set_grid().
+ * g_adj[cell][dir] = neighbor cell or -1.  Directions 0=U 1=R 2=D 3=L. */
+extern int8_t g_adj[MAX_NCELLS][4];
 
 /* Pushable-direction bits stored in block_pushable[]:  U=1 R=2 D=4 L=8 */
 
 typedef struct {
-    uint32_t walls;               /* bitmask: bit i set → cell i is a wall    */
+    uint64_t walls;               /* bitmask: bit i set → cell i is a wall    */
     int      exit_pos;            /* cell index the block must reach           */
     int      player_start;        /* cell index where the player begins        */
     int      num_blocks;
@@ -23,9 +38,20 @@ typedef struct {
 } Puzzle;
 
 /* Returns the cell index for row r, column c */
-static inline int pos(int r, int c) { return r * COLS + c; }
-static inline int row_(int p)       { return p / COLS; }
-static inline int col_(int p)       { return p % COLS; }
+static inline int pos(int r, int c) { return r * g_cols + c; }
+static inline int row_(int p)       { return p / g_cols; }
+static inline int col_(int p)       { return p % g_cols; }
+
+/*
+ * sokoban_set_grid(rows, cols)
+ *
+ * Must be called once before sokoban_init() and before any solve.  Sets
+ * the runtime grid dimensions, rebuilds the adjacency table, and
+ * recomputes the bitmask edge constants.  Safe to call repeatedly to
+ * change grid size (e.g., between tests), but the call is not
+ * thread-safe — only the main thread should change the grid.
+ */
+void sokoban_set_grid(int rows, int cols);
 
 /*
  * sokoban_solve(pz, used_dirs, prof)

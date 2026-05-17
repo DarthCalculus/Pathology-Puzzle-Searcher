@@ -2,29 +2,72 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <limits.h>
 
-/* ---- Precomputed neighbor table ----
- * adj[cell][dir] = neighbor cell index, or -1 if out of bounds.
- * Directions: 0=Up, 1=Right, 2=Down, 3=Left
- */
-static const int8_t adj[NCELLS][4] = {
-    /* row 0 */
-    {-1,  1,  5, -1}, {-1,  2,  6,  0}, {-1,  3,  7,  1},
-    {-1,  4,  8,  2}, {-1, -1,  9,  3},
-    /* row 1 */
-    { 0,  6, 10, -1}, { 1,  7, 11,  5}, { 2,  8, 12,  6},
-    { 3,  9, 13,  7}, { 4, -1, 14,  8},
-    /* row 2 */
-    { 5, 11, 15, -1}, { 6, 12, 16, 10}, { 7, 13, 17, 11},
-    { 8, 14, 18, 12}, { 9, -1, 19, 13},
-    /* row 3 */
-    {10, 16, 20, -1}, {11, 17, 21, 15}, {12, 18, 22, 16},
-    {13, 19, 23, 17}, {14, -1, 24, 18},
-    /* row 4 */
-    {15, 21, -1, -1}, {16, 22, -1, 20}, {17, 23, -1, 21},
-    {18, 24, -1, 22}, {19, -1, -1, 23},
-};
+/* Runtime grid dimensions (defined here, declared extern in the header). */
+int     g_rows           = 0;
+int     g_cols           = 0;
+int     g_ncells         = 0;
+int     g_consumed       = 0;     /* sentinel for "block fell in hole"; == g_ncells */
+int8_t  g_adj[MAX_NCELLS][4];
+
+/* Bits-per-cell for state encoding (5 for ≤32 cells, 6 for ≤64). */
+static int      g_bits_per_cell = 0;
+static uint64_t g_cell_mask     = 0;   /* = (1<<g_bits_per_cell) - 1 */
+
+/* Bitmask edge constants — recomputed in sokoban_set_grid(). */
+static uint64_t g_col0_mask    = 0;
+static uint64_t g_collast_mask = 0;
+static uint64_t g_all_cells    = 0;
+
+static int bits_needed(int n) {
+    int b = 1;
+    while ((1 << b) < n) b++;
+    return b;
+}
+
+/* Build g_adj[][] for the current g_rows x g_cols grid. */
+static void build_adj(void) {
+    for (int i = 0; i < MAX_NCELLS; i++)
+        for (int d = 0; d < 4; d++) g_adj[i][d] = -1;
+    for (int r = 0; r < g_rows; r++) {
+        for (int c = 0; c < g_cols; c++) {
+            int p = r * g_cols + c;
+            g_adj[p][0] = (r > 0)          ? (int8_t)((r - 1) * g_cols + c)     : -1;
+            g_adj[p][1] = (c < g_cols - 1) ? (int8_t)( r      * g_cols + c + 1) : -1;
+            g_adj[p][2] = (r < g_rows - 1) ? (int8_t)((r + 1) * g_cols + c)     : -1;
+            g_adj[p][3] = (c > 0)          ? (int8_t)( r      * g_cols + c - 1) : -1;
+        }
+    }
+}
+
+void sokoban_set_grid(int rows, int cols) {
+    if (rows < 1 || cols < 1 || rows > MAX_ROWS || cols > MAX_COLS
+        || rows * cols > MAX_NCELLS) {
+        fprintf(stderr, "sokoban_set_grid: %dx%d out of range "
+                        "(need R>=1, C>=1, R*C<=%d)\n",
+                rows, cols, MAX_NCELLS);
+        abort();
+    }
+    g_rows   = rows;
+    g_cols   = cols;
+    g_ncells = rows * cols;
+    g_consumed = g_ncells;                          /* sentinel just above max valid cell */
+    g_bits_per_cell = bits_needed(g_ncells + 1);    /* must encode 0..g_ncells (CONSUMED) */
+    if (g_bits_per_cell < 5) g_bits_per_cell = 5;   /* historical minimum; keeps small grids in known territory */
+    g_cell_mask = (g_bits_per_cell >= 64) ? ~0ULL : ((1ULL << g_bits_per_cell) - 1);
+
+    g_all_cells    = (g_ncells == 64) ? ~0ULL : ((1ULL << g_ncells) - 1);
+    g_col0_mask    = 0;
+    g_collast_mask = 0;
+    for (int r = 0; r < g_rows; r++) {
+        g_col0_mask    |= 1ULL << (r * g_cols + 0);
+        g_collast_mask |= 1ULL << (r * g_cols + (g_cols - 1));
+    }
+
+    build_adj();
+}
 
 /* ========================================================================
  * ZOBRIST HASHING  (comment out USE_ZOBRIST below to revert to pack5 keys)
@@ -41,19 +84,20 @@ static const int8_t adj[NCELLS][4] = {
 #define USE_ZOBRIST
 
 #ifdef USE_ZOBRIST
-/* z_block[mask][cell]: mask in [0,15], cell in [0, NCELLS] (NCELLS=CONSUMED) */
-static uint64_t z_player[NCELLS];
-static uint64_t z_block [16][NCELLS + 1];
+/* z_block[mask][cell]: mask in [0,15], cell in [0, MAX_NCELLS]
+ * Allocated for the worst case; only [0, g_ncells] are populated. */
+static uint64_t z_player[MAX_NCELLS];
+static uint64_t z_block [16][MAX_NCELLS + 1];
 static uint64_t z_hole  [MAX_HOLES];
 
 static void zobrist_init(void) {
     /* xorshift64 with fixed seed for reproducibility */
     uint64_t s = 0x9E3779B97F4A7C15ULL;
 #define ZN() (s ^= s << 13, s ^= s >> 7, s ^= s << 17, s)
-    for (int c = 0; c < NCELLS;    c++) z_player[c]       = ZN();
-    for (int m = 0; m < 16;        m++)
-        for (int c = 0; c <= NCELLS; c++) z_block[m][c]   = ZN();
-    for (int h = 0; h < MAX_HOLES; h++) z_hole[h]          = ZN();
+    for (int c = 0; c < g_ncells;    c++) z_player[c]       = ZN();
+    for (int m = 0; m < 16;          m++)
+        for (int c = 0; c <= g_ncells; c++) z_block[m][c]   = ZN();
+    for (int h = 0; h < MAX_HOLES;   h++) z_hole[h]          = ZN();
 #undef ZN
 }
 
@@ -75,10 +119,10 @@ void sokoban_init(void) {
 #endif
 }
 
-/* State space size: NCELLS * (NCELLS+1)^nb * 2^nh (as int64_t to detect overflow) */
+/* State space size: g_ncells * (g_ncells+1)^nb * 2^nh (as int64_t to detect overflow) */
 static int64_t state_space_size(int nb, int nh) {
-    int64_t s = NCELLS;
-    for (int i = 0; i < nb; i++) s *= NCELLS + 1;
+    int64_t s = g_ncells;
+    for (int i = 0; i < nb; i++) s *= g_ncells + 1;
     for (int i = 0; i < nh; i++) s *= 2;
     return s;
 }
@@ -138,20 +182,20 @@ static inline int ds_mark(DirectState *ds, uint32_t state) {
     return 1;
 }
 
-/* Mixed-radix packing: state = player + NCELLS*(block[0] + (NCELLS+1)*(block[1] + ...)) */
+/* Mixed-radix packing: state = player + g_ncells*(block[0] + (g_ncells+1)*(block[1] + ...)) */
 static inline uint32_t mr_pack(int pl, const int *bp, int nb, int hm) {
     uint32_t s = (uint32_t)hm;
     for (int i = nb - 1; i >= 0; i--)
-        s = s * (NCELLS + 1) + (uint32_t)bp[i];
-    return s * NCELLS + (uint32_t)pl;
+        s = s * (g_ncells + 1) + (uint32_t)bp[i];
+    return s * g_ncells + (uint32_t)pl;
 }
 
 static inline void mr_unpack(uint32_t s, int *pl, int *bp, int nb, int *hm) {
-    *pl = (int)(s % NCELLS);
-    s /= NCELLS;
+    *pl = (int)(s % g_ncells);
+    s /= g_ncells;
     for (int i = 0; i < nb; i++) {
-        bp[i] = (int)(s % (NCELLS + 1));
-        s /= (NCELLS + 1);
+        bp[i] = (int)(s % (g_ncells + 1));
+        s /= (g_ncells + 1);
     }
     *hm = (int)s;
 }
@@ -161,15 +205,15 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
     int nh = pz->num_holes;
 
     /* Precompute strides for incremental state updates.
-     * stride[i] = NCELLS * (NCELLS+1)^i  (coefficient of block i in packed state)
-     * hm_stride = NCELLS * (NCELLS+1)^nb (coefficient of hole_mask)
+     * stride[i] = g_ncells * (g_ncells+1)^i  (coefficient of block i in packed state)
+     * hm_stride = g_ncells * (g_ncells+1)^nb (coefficient of hole_mask)
      */
     int stride[MAX_BLOCKS];
     if (nb > 0) {
-        stride[0] = NCELLS;
-        for (int i = 1; i < nb; i++) stride[i] = stride[i - 1] * (NCELLS + 1);
+        stride[0] = g_ncells;
+        for (int i = 1; i < nb; i++) stride[i] = stride[i - 1] * (g_ncells + 1);
     }
-    int hm_stride = (nb > 0) ? stride[nb - 1] * (NCELLS + 1) : NCELLS;
+    int hm_stride = (nb > 0) ? stride[nb - 1] * (g_ncells + 1) : g_ncells;
 
     DirectState *ds = ds_get(ss_size);
     ds_clear(ds);
@@ -187,7 +231,7 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
     qt++;
 
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     while (qh < qt) {
         if (qh == ql) { dist++; ql = qt; }
@@ -198,32 +242,32 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
         int pl, bp[MAX_BLOCKS], hm;
         mr_unpack(cur, &pl, bp, nb, &hm);
 
-        uint32_t block_occ = 0;
+        uint64_t block_occ = 0;
         for (int i = 0; i < nb; i++)
-            if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
+            if (bp[i] < g_ncells) block_occ |= (1ULL << bp[i]);
 
-        uint32_t active_holes = 0;
+        uint64_t active_holes = 0;
         for (int h = 0; h < nh; h++)
-            if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
+            if (hm & (1 << h)) active_holes |= (1ULL << pz->hole_pos[h]);
 
-        uint32_t blocked = walls | active_holes;
+        uint64_t blocked = walls | active_holes;
 
         for (int d = 0; d < 4; d++) {
-            int np = adj[pl][d];
+            int np = g_adj[pl][d];
             if (np < 0) continue;
-            if (blocked & (1u << np)) continue;
+            if (blocked & (1ULL << np)) continue;
 
-            if (block_occ & (1u << np)) {
+            if (block_occ & (1ULL << np)) {
                 /* Push */
                 int bi = -1;
                 for (int b = 0; b < nb; b++)
                     if (bp[b] == np) { bi = b; break; }
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int bnp = adj[np][d];
+                int bnp = g_adj[np][d];
                 if (bnp < 0) continue;
-                if (walls     & (1u << bnp)) continue;
-                if (block_occ & (1u << bnp)) continue;
+                if (walls     & (1ULL << bnp)) continue;
+                if (block_occ & (1ULL << bnp)) continue;
 
                 if (np == exit_pos) {
                     if (used_dirs) {
@@ -236,11 +280,11 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
 
                 int delta = (np - pl);
                 int ih = 0;
-                if (active_holes & (1u << bnp)) {
+                if (active_holes & (1ULL << bnp)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == bnp && (hm & (1 << h))) {
                             ih = 1;
-                            delta += (CONSUMED - bp[bi]) * stride[bi]
+                            delta += (g_consumed - bp[bi]) * stride[bi]
                                    - (1 << h) * hm_stride;
                             break;
                         }
@@ -330,11 +374,11 @@ static inline int hs_mark(HashState *hs, uint64_t k) {
     return 0;  /* table full — treat as already visited */
 }
 
-/* 5-bit packing: player[4:0] block0[9:5] block1[14:10] ... hm[last] */
+/* g_bits_per_cell-wide packing: player[low] block0 block1 ... hm[top] */
 static inline uint64_t pack5(int pl, const int *bp, int nb, int hm) {
     uint64_t s = (uint64_t)pl;
-    int sh = 5;
-    for (int i = 0; i < nb; i++) { s |= ((uint64_t)bp[i] << sh); sh += 5; }
+    int sh = g_bits_per_cell;
+    for (int i = 0; i < nb; i++) { s |= ((uint64_t)bp[i] << sh); sh += g_bits_per_cell; }
     s |= ((uint64_t)hm << sh);
     return s;
 }
@@ -359,7 +403,7 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
     qt++;
 
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     while (qh < qt) {
         if (qh == ql) { dist++; ql = qt; }
@@ -368,36 +412,36 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
         qh++;
 
         /* Unpack */
-        int pl = (int)(cur & 0x1F), sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & 0x1F); sh += 5; }
+        int pl = (int)(cur & g_cell_mask), sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(cur >> sh);   /* hm is at the top — no mask needed */
 
-        uint32_t block_occ = 0;
+        uint64_t block_occ = 0;
         for (int i = 0; i < nb; i++)
-            if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
+            if (bp[i] < g_ncells) block_occ |= (1ULL << bp[i]);
 
-        uint32_t active_holes = 0;
+        uint64_t active_holes = 0;
         for (int h = 0; h < nh; h++)
-            if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
+            if (hm & (1 << h)) active_holes |= (1ULL << pz->hole_pos[h]);
 
-        uint32_t blocked = walls | active_holes;
+        uint64_t blocked = walls | active_holes;
 
         for (int d = 0; d < 4; d++) {
-            int np = adj[pl][d];
+            int np = g_adj[pl][d];
             if (np < 0) continue;
-            if (blocked & (1u << np)) continue;
+            if (blocked & (1ULL << np)) continue;
 
-            if (block_occ & (1u << np)) {
+            if (block_occ & (1ULL << np)) {
                 /* Push */
                 int bi = -1;
                 for (int b = 0; b < nb; b++)
                     if (bp[b] == np) { bi = b; break; }
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int bnp = adj[np][d];
+                int bnp = g_adj[np][d];
                 if (bnp < 0) continue;
-                if (walls     & (1u << bnp)) continue;
-                if (block_occ & (1u << bnp)) continue;
+                if (walls     & (1ULL << bnp)) continue;
+                if (block_occ & (1ULL << bnp)) continue;
 
                 if (np == exit_pos) {
                     if (used_dirs) {
@@ -411,20 +455,20 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
                 /* Build new state via in-place bit modification */
                 int new_bpos = bnp;
                 int nhm = hm;
-                if (active_holes & (1u << bnp)) {
+                if (active_holes & (1ULL << bnp)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == bnp && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
                     }
                 }
-                uint64_t ns = (cur & ~0x1FULL) | (uint64_t)np;
-                int bsh = 5 * (bi + 1);
-                ns = (ns & ~(0x1FULL << bsh)) | ((uint64_t)new_bpos << bsh);
+                uint64_t ns = (cur & ~g_cell_mask) | (uint64_t)np;
+                int bsh = g_bits_per_cell * (bi + 1);
+                ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
                 if (nhm != hm) {
-                    int hmsh = 5 * (nb + 1);
+                    int hmsh = g_bits_per_cell * (nb + 1);
                     uint64_t hm_mask = ((uint64_t)((1 << nh) - 1)) << hmsh;
                     ns = (ns & ~hm_mask) | ((uint64_t)nhm << hmsh);
                 }
@@ -447,7 +491,7 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
                     return dist + 1;
                 }
 
-                uint64_t ns = (cur & ~0x1FULL) | (uint64_t)np;
+                uint64_t ns = (cur & ~g_cell_mask) | (uint64_t)np;
                 if (hs_mark(hs, ns)) {
                     if (qt >= QSZ) return -2;
                     hs->qs[qt] = ns;
@@ -463,39 +507,38 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
 /* ========================================================================
  * HELPERS FOR PUSH-BASED DIJKSTRA SOLVERS
  *
- * Bitmask BFS: all 25 cells fit in a uint32_t, so each level of BFS can
- * be expanded with 4 shift operations rather than iterating cell-by-cell
- * through the adj table.  Directions on the 5×5 grid:
- *   Up    — shift right by 5  (no wrap guard needed; high bits go to 0)
- *   Down  — shift left  by 5  (bits above 24 masked out by free_mask)
- *   Right — shift left  by 1, masking col 4 to prevent row wraparound
- *   Left  — shift right by 1, masking col 0 to prevent row wraparound
+ * Bitmask BFS: all g_ncells cells fit in a uint64_t (capped at 64 = 8x8),
+ * so each level of BFS expands with 4 shift operations rather than
+ * iterating cell-by-cell through the adj table.  Directions:
+ *   Up    — shift right by g_cols  (high bits dropped naturally)
+ *   Down  — shift left  by g_cols  (out-of-region bits masked by g_all_cells)
+ *   Right — shift left  by 1, masking last column to prevent row wraparound
+ *   Left  — shift right by 1, masking first column to prevent row wraparound
  * ======================================================================== */
-
-#define COL0_MASK  0x108421u   /* bits 0,5,10,15,20  — column 0 */
-#define COL4_MASK  0x1084210u  /* bits 4,9,14,19,24  — column 4 */
-#define ALL_CELLS  0x1FFFFFFu  /* bits 0-24          — all 25 cells */
 
 /* walk_dists_from: BFS distances from start to all reachable cells.
  * out[i] = distance, or -1 if unreachable. */
-static void walk_dists_from(uint32_t blocked, int start, int8_t *out) {
-    memset(out, -1, NCELLS);
+static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
+    memset(out, -1, (size_t)g_ncells);
     if ((blocked >> start) & 1) return;
-    uint32_t free_mask = ~blocked & ALL_CELLS;
-    uint32_t reached   = 1u << start;
-    uint32_t frontier  = reached;
+    const uint64_t col0    = g_col0_mask;
+    const uint64_t collast = g_collast_mask;
+    const int      shc     = g_cols;
+    uint64_t free_mask = ~blocked & g_all_cells;
+    uint64_t reached   = 1ULL << start;
+    uint64_t frontier  = reached;
     out[start] = 0;
     int8_t dist = 0;
     while (frontier) {
         dist++;
-        uint32_t nxt = (frontier >> 5)
-                     | (frontier << 5)
-                     | ((frontier & ~COL4_MASK) << 1)
-                     | ((frontier & ~COL0_MASK) >> 1);
+        uint64_t nxt = (frontier >> shc)
+                     | (frontier << shc)
+                     | ((frontier & ~collast) << 1)
+                     | ((frontier & ~col0)    >> 1);
         frontier = nxt & free_mask & ~reached;
         reached |= frontier;
-        for (uint32_t tmp = frontier; tmp; tmp &= tmp - 1)
-            out[__builtin_ctz(tmp)] = dist;
+        for (uint64_t tmp = frontier; tmp; tmp &= tmp - 1)
+            out[__builtin_ctzll(tmp)] = dist;
     }
 }
 
@@ -635,7 +678,7 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     int ib[MAX_BLOCKS];
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
@@ -665,17 +708,17 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
         if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
 
         /* Unpack blocks and hole mask (skip canonical player cell in bits[4:0]). */
-        int sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & 0x1F); sh += 5; }
+        int sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(e.state >> sh);
 
-        uint32_t blk_occ = 0;
-        for (int i = 0; i < nb; i++) if (bp[i] < NCELLS) blk_occ |= (1u << bp[i]);
-        uint32_t cur_holes = 0;
-        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1u << pz->hole_pos[h]);
+        uint64_t blk_occ = 0;
+        for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
+        uint64_t cur_holes = 0;
+        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
         /* Walk distances from exact player position. */
-        int8_t wdist[NCELLS];
+        int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
 
         /* Win check: can player walk to exit? */
@@ -686,24 +729,24 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
 
         /* Enumerate valid pushes. */
         for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= NCELLS) continue; /* block consumed */
+            if (bp[bi] >= g_ncells) continue; /* block consumed */
             int bpos = bp[bi];
 
             for (int d = 0; d < 4; d++) {
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int pfr = adj[bpos][d ^ 2]; /* push-from cell (player must be here) */
+                int pfr = g_adj[bpos][d ^ 2]; /* push-from cell (player must be here) */
                 if (pfr < 0 || wdist[pfr] < 0) continue;
 
-                int lnd = adj[bpos][d]; /* landing cell for block */
-                if (lnd < 0 || (walls & (1u << lnd)) || (blk_occ & (1u << lnd))) continue;
+                int lnd = g_adj[bpos][d]; /* landing cell for block */
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
 
                 /* Compute new block position (handle hole consumption). */
                 int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1u << lnd)) {
+                if (cur_holes & (1ULL << lnd)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
@@ -776,7 +819,7 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     int ib[MAX_BLOCKS];
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
@@ -804,16 +847,16 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
 
         if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
 
-        int sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & 0x1F); sh += 5; }
+        int sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(e.state >> sh);
 
-        uint32_t blk_occ = 0;
-        for (int i = 0; i < nb; i++) if (bp[i] < NCELLS) blk_occ |= (1u << bp[i]);
-        uint32_t cur_holes = 0;
-        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1u << pz->hole_pos[h]);
+        uint64_t blk_occ = 0;
+        for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
+        uint64_t cur_holes = 0;
+        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
-        int8_t wdist[NCELLS];
+        int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
 
         if (wdist[exit_pos] >= 0) {
@@ -824,23 +867,23 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         }
 
         for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= NCELLS) continue;
+            if (bp[bi] >= g_ncells) continue;
             int bpos = bp[bi];
 
             for (int d = 0; d < 4; d++) {
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int pfr = adj[bpos][d ^ 2];
+                int pfr = g_adj[bpos][d ^ 2];
                 if (pfr < 0 || wdist[pfr] < 0) continue;
 
-                int lnd = adj[bpos][d];
-                if (lnd < 0 || (walls & (1u << lnd)) || (blk_occ & (1u << lnd))) continue;
+                int lnd = g_adj[bpos][d];
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
 
                 int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1u << lnd)) {
+                if (cur_holes & (1ULL << lnd)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
@@ -938,8 +981,8 @@ static inline int hs128_mark(HashState128 *hs, __uint128_t k) {
 
 static inline __uint128_t pack128(int pl, const int *bp, int nb, int hm) {
     __uint128_t s = (__uint128_t)pl;
-    int sh = 5;
-    for (int i = 0; i < nb; i++) { s |= ((__uint128_t)bp[i] << sh); sh += 5; }
+    int sh = g_bits_per_cell;
+    for (int i = 0; i < nb; i++) { s |= ((__uint128_t)bp[i] << sh); sh += g_bits_per_cell; }
     s |= ((__uint128_t)hm << sh);
     return s;
 }
@@ -964,7 +1007,7 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
     qt++;
 
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     while (qh < qt) {
         if (qh == ql) { dist++; ql = qt; }
@@ -973,36 +1016,36 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
         qh++;
 
         /* Unpack */
-        int pl = (int)(cur & 0x1F), sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & 0x1F); sh += 5; }
+        int pl = (int)(cur & g_cell_mask), sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((cur >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(cur >> sh);   /* hm at the top — no mask needed */
 
-        uint32_t block_occ = 0;
+        uint64_t block_occ = 0;
         for (int i = 0; i < nb; i++)
-            if (bp[i] < NCELLS) block_occ |= (1u << bp[i]);
+            if (bp[i] < g_ncells) block_occ |= (1ULL << bp[i]);
 
-        uint32_t active_holes = 0;
+        uint64_t active_holes = 0;
         for (int h = 0; h < nh; h++)
-            if (hm & (1 << h)) active_holes |= (1u << pz->hole_pos[h]);
+            if (hm & (1 << h)) active_holes |= (1ULL << pz->hole_pos[h]);
 
-        uint32_t blocked = walls | active_holes;
+        uint64_t blocked = walls | active_holes;
 
         for (int d = 0; d < 4; d++) {
-            int np = adj[pl][d];
+            int np = g_adj[pl][d];
             if (np < 0) continue;
-            if (blocked & (1u << np)) continue;
+            if (blocked & (1ULL << np)) continue;
 
-            if (block_occ & (1u << np)) {
+            if (block_occ & (1ULL << np)) {
                 /* Push */
                 int bi = -1;
                 for (int b = 0; b < nb; b++)
                     if (bp[b] == np) { bi = b; break; }
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int bnp = adj[np][d];
+                int bnp = g_adj[np][d];
                 if (bnp < 0) continue;
-                if (walls     & (1u << bnp)) continue;
-                if (block_occ & (1u << bnp)) continue;
+                if (walls     & (1ULL << bnp)) continue;
+                if (block_occ & (1ULL << bnp)) continue;
 
                 if (np == exit_pos) {
                     if (used_dirs) {
@@ -1016,20 +1059,20 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
                 /* Build new state via in-place bit modification */
                 int new_bpos = bnp;
                 int nhm = hm;
-                if (active_holes & (1u << bnp)) {
+                if (active_holes & (1ULL << bnp)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == bnp && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
                     }
                 }
-                __uint128_t ns = (cur & ~(__uint128_t)0x1F) | (__uint128_t)np;
-                int bsh = 5 * (bi + 1);
-                ns = (ns & ~((__uint128_t)0x1F << bsh)) | ((__uint128_t)new_bpos << bsh);
+                __uint128_t ns = (cur & ~(__uint128_t)g_cell_mask) | (__uint128_t)np;
+                int bsh = g_bits_per_cell * (bi + 1);
+                ns = (ns & ~((__uint128_t)g_cell_mask << bsh)) | ((__uint128_t)new_bpos << bsh);
                 if (nhm != hm) {
-                    int hmsh = 5 * (nb + 1);
+                    int hmsh = g_bits_per_cell * (nb + 1);
                     __uint128_t hm_mask = ((__uint128_t)((1 << nh) - 1)) << hmsh;
                     ns = (ns & ~hm_mask) | ((__uint128_t)nhm << hmsh);
                 }
@@ -1052,7 +1095,7 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
                     return dist + 1;
                 }
 
-                __uint128_t ns = (cur & ~(__uint128_t)0x1F) | (__uint128_t)np;
+                __uint128_t ns = (cur & ~(__uint128_t)g_cell_mask) | (__uint128_t)np;
                 if (hs128_mark(hs, ns)) {
                     if (qt >= QSZ128) return -2;
                     hs->qs[qt] = ns;
@@ -1176,7 +1219,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     int ib[MAX_BLOCKS];
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
@@ -1200,16 +1243,16 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
 
         if (hsp128_get_cost(hs, e.state) < e.prio) continue;
 
-        int sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & 0x1F); sh += 5; }
+        int sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(e.state >> sh);
 
-        uint32_t blk_occ = 0;
-        for (int i = 0; i < nb; i++) if (bp[i] < NCELLS) blk_occ |= (1u << bp[i]);
-        uint32_t cur_holes = 0;
-        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1u << pz->hole_pos[h]);
+        uint64_t blk_occ = 0;
+        for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
+        uint64_t cur_holes = 0;
+        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
-        int8_t wdist[NCELLS];
+        int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
 
         if (wdist[exit_pos] >= 0) {
@@ -1218,23 +1261,23 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
         }
 
         for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= NCELLS) continue;
+            if (bp[bi] >= g_ncells) continue;
             int bpos = bp[bi];
 
             for (int d = 0; d < 4; d++) {
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int pfr = adj[bpos][d ^ 2];
+                int pfr = g_adj[bpos][d ^ 2];
                 if (pfr < 0 || wdist[pfr] < 0) continue;
 
-                int lnd = adj[bpos][d];
-                if (lnd < 0 || (walls & (1u << lnd)) || (blk_occ & (1u << lnd))) continue;
+                int lnd = g_adj[bpos][d];
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
 
                 int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1u << lnd)) {
+                if (cur_holes & (1ULL << lnd)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
@@ -1290,7 +1333,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
     const int      exit_pos = pz->exit_pos;
-    const uint32_t walls    = pz->walls;
+    const uint64_t walls    = pz->walls;
 
     int ib[MAX_BLOCKS];
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
@@ -1315,16 +1358,16 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
 
         if (hsp128_get_cost(hs, e.state) < e.prio) continue;
 
-        int sh = 5, bp[MAX_BLOCKS];
-        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & 0x1F); sh += 5; }
+        int sh = g_bits_per_cell, bp[MAX_BLOCKS];
+        for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
         int hm = (int)(e.state >> sh);
 
-        uint32_t blk_occ = 0;
-        for (int i = 0; i < nb; i++) if (bp[i] < NCELLS) blk_occ |= (1u << bp[i]);
-        uint32_t cur_holes = 0;
-        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1u << pz->hole_pos[h]);
+        uint64_t blk_occ = 0;
+        for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
+        uint64_t cur_holes = 0;
+        for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
-        int8_t wdist[NCELLS];
+        int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
 
         if (wdist[exit_pos] >= 0) {
@@ -1335,23 +1378,23 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
         }
 
         for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= NCELLS) continue;
+            if (bp[bi] >= g_ncells) continue;
             int bpos = bp[bi];
 
             for (int d = 0; d < 4; d++) {
                 if (!(pz->block_pushable[bi] & (1 << d))) continue;
 
-                int pfr = adj[bpos][d ^ 2];
+                int pfr = g_adj[bpos][d ^ 2];
                 if (pfr < 0 || wdist[pfr] < 0) continue;
 
-                int lnd = adj[bpos][d];
-                if (lnd < 0 || (walls & (1u << lnd)) || (blk_occ & (1u << lnd))) continue;
+                int lnd = g_adj[bpos][d];
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
 
                 int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1u << lnd)) {
+                if (cur_holes & (1ULL << lnd)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = CONSUMED;
+                            new_bpos = g_consumed;
                             nhm &= ~(1 << h);
                             break;
                         }
@@ -1396,14 +1439,14 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
 
 int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     int nb = pz->num_blocks, nh = pz->num_holes;
-    if (5 + 5 * nb + nh > 64)
+    if (g_bits_per_cell * (1 + nb) + nh > 64)
         return solve_push128(pz, used_dirs, prof);
     return solve_push64(pz, used_dirs, prof);
 }
 
 int sokoban_solve_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     int nb = pz->num_blocks, nh = pz->num_holes;
-    if (5 + 5 * nb + nh > 64)
+    if (g_bits_per_cell * (1 + nb) + nh > 64)
         return solve_push128_cutoff(pz, used_dirs, prof, max_cost);
     return solve_push64_cutoff(pz, used_dirs, prof, max_cost);
 }
