@@ -119,6 +119,12 @@ void sokoban_init(void) {
 #endif
 }
 
+/* Soft per-solve heap-size cap; 0 = disabled.  Solvers return -3 if
+ * heap_sz grows past this value.  See sokoban_set_heap_cap() in header. */
+static int g_heap_cap = 0;
+
+void sokoban_set_heap_cap(int n) { g_heap_cap = (n > 0) ? n : 0; }
+
 /* State space size: g_ncells * (g_ncells+1)^nb * 2^nh (as int64_t to detect overflow) */
 static int64_t state_space_size(int nb, int nh) {
     int64_t s = g_ncells;
@@ -334,6 +340,18 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
 #define HT_MASK  (HT_SIZE - 1)
 #define QSZ      (1 << 24)          /* 16 M entries */
 
+/* Linear-probing scan depth for the dedup hash tables.  Bumped from the
+ * original 128 after observing depth over-counts caused by silent state-
+ * drops when a probe chain saturated mid-BFS — a 9-block 6x6 reachable
+ * via SA needed > 4K probes to terminate correctly; at the old limit it
+ * returned 275 (wrong), at 4K it bailed via -3, at 64K it returns 191.
+ *
+ * Tables are 4–16 M slots, so 64K is still well-bounded.  Probe-failure
+ * is now flagged via HashState*::probe_failed and propagated as -3, so
+ * even if a future puzzle exceeds this limit the answer can never be
+ * silently wrong — the solver bails instead. */
+#define HT_PROBE_LIMIT 65536
+
 typedef struct {
     uint64_t htk   [HT_SIZE];   /* stored keys        — 128 MB */
     uint32_t ht_gen[HT_SIZE];   /* generation stamps  —  64 MB */
@@ -364,7 +382,7 @@ static inline uint64_t h64(uint64_t x) {
 
 static inline int hs_mark(HashState *hs, uint64_t k) {
     uint64_t h = h64(k) & HT_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HT_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) {
             hs->ht_gen[idx] = hs->ht_seq; hs->htk[idx] = k; return 1;
@@ -554,7 +572,12 @@ static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
  * ~352 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HTP_SIZE  (1 << 22)    /* 4 M hash-table slots               */
+#define HTP_SIZE  (1 << 24)    /* 16 M hash-table slots.  Doubled from 8M
+                                 * after probe-saturation was observed on
+                                 * 11-block 6x6 boards even at 65K-probe
+                                 * limit — load factor was still high
+                                 * enough for clusters to exceed the cap.
+                                 * 16M halves the load factor again. */
 #define HTP_MASK  (HTP_SIZE - 1)
 #define HP64_SIZE (1 << 20)    /* 1 M heap entries                   */
 
@@ -583,6 +606,7 @@ typedef struct {
     uint32_t    ht_seq;
     HeapEntry64 heap   [HP64_SIZE];  /* min-heap           —  96 MB */
     int         heap_sz;
+    int         probe_failed;        /* set when 128-probe limit hit */
 } HashStatePush64;        /* total ~352 MB                           */
 
 static _Thread_local HashStatePush64 *hsp64_tls;
@@ -601,13 +625,14 @@ static void hsp64_clear(HashStatePush64 *hs) {
         hs->ht_seq = 1;
     }
     hs->heap_sz = 0;
+    hs->probe_failed = 0;
 }
 
 /* Update stored cost for key k.
  * Returns 1 if new_cost is an improvement (caller should enqueue). */
 static inline int hsp64_update(HashStatePush64 *hs, uint64_t k, int new_cost) {
     uint64_t h = h64(k) & HTP_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HTP_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) {
             hs->ht_gen[idx] = hs->ht_seq;
@@ -623,13 +648,16 @@ static inline int hsp64_update(HashStatePush64 *hs, uint64_t k, int new_cost) {
             return 0;
         }
     }
-    return 0; /* table full — skip */
+    /* Probe limit exceeded — would silently drop the state, which can
+     * make BFS over-count depth.  Flag for the solver to bail with -3. */
+    hs->probe_failed = 1;
+    return 0;
 }
 
 /* Return stored min cost, or INT_MAX if key not in table. */
 static inline int hsp64_get_cost(const HashStatePush64 *hs, uint64_t k) {
     uint64_t h = h64(k) & HTP_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HTP_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) return INT_MAX;
         if (hs->htk[idx] == k) return hs->ht_cost[idx];
@@ -670,10 +698,19 @@ static inline HeapEntry64 heap64_pop(HashStatePush64 *hs) {
     return top;
 }
 
+/* Zero the near-goal frontier window and record the cutoff ceiling.  Called
+ * by the cutoff solvers before their main loop (and on early return). */
+static inline void bfs_tail_reset(BfsProfile *prof, int max_cost) {
+    if (!prof) return;
+    prof->max_cost_seen = max_cost;
+    for (int i = 0; i < BFS_TAIL_W; i++) prof->tail_width[i] = 0;
+}
+
 static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush64 *hs = hsp64_get();
     hsp64_clear(hs);
     int peak_heap = 1;
+    int n_popped  = 0;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -706,6 +743,7 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
 
         /* Lazy deletion: skip if a shorter path was already found. */
         if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
+        n_popped++;
 
         /* Unpack blocks and hole mask (skip canonical player cell in bits[4:0]). */
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
@@ -768,7 +806,7 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
 #endif
                 if (hsp64_update(hs, nk, nc)) {
                     if (hs->heap_sz >= HP64_SIZE) {
-                        if (prof) prof->peak_heap_sz = HP64_SIZE;
+                        if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
                         return -2;
                     }
                     HeapEntry64 ne;
@@ -779,12 +817,17 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
 #endif
                     heap64_push(hs, ne);
                     if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
+                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
+                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                        return -3;
+                    }
                 }
             }
         }
     }
 
-    if (prof) prof->peak_heap_sz = peak_heap;
+    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+    if (hs->probe_failed) return -3;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)
@@ -808,13 +851,15 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
  * ======================================================================== */
 static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     if (max_cost < 0) {
-        if (prof) prof->peak_heap_sz = 1;
+        if (prof) { prof->peak_heap_sz = 1; prof->states_popped = 0; bfs_tail_reset(prof, max_cost); }
         return -1;
     }
 
     HashStatePush64 *hs = hsp64_get();
     hsp64_clear(hs);
+    bfs_tail_reset(prof, max_cost);
     int peak_heap = 1;
+    int n_popped  = 0;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -846,6 +891,11 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         if (e.prio >= best_win) break;
 
         if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
+        n_popped++;
+        if (prof) {
+            int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
+            if (twi >= 0 && twi < BFS_TAIL_W) prof->tail_width[twi]++;
+        }
 
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
         for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
@@ -905,7 +955,7 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
 #endif
                 if (hsp64_update(hs, nk, nc)) {
                     if (hs->heap_sz >= HP64_SIZE) {
-                        if (prof) prof->peak_heap_sz = HP64_SIZE;
+                        if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
                         return -2;
                     }
                     HeapEntry64 ne;
@@ -916,12 +966,17 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
 #endif
                     heap64_push(hs, ne);
                     if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
+                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
+                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                        return -3;
+                    }
                 }
             }
         }
     }
 
-    if (prof) prof->peak_heap_sz = peak_heap;
+    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+    if (hs->probe_failed) return -3;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)
@@ -937,7 +992,7 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
  * 208 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HT128_SIZE  (1 << 22)
+#define HT128_SIZE  (1 << 24)  /* 16 M slots — see HTP_SIZE rationale. */
 #define HT128_MASK  (HT128_SIZE - 1)
 #define QSZ128      (1 << 22)
 
@@ -969,7 +1024,7 @@ static inline uint64_t h128(__uint128_t x) {
 
 static inline int hs128_mark(HashState128 *hs, __uint128_t k) {
     uint64_t h = h128(k) & HT128_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) {
             hs->ht_gen[idx] = hs->ht_seq; hs->htk[idx] = k; return 1;
@@ -1132,6 +1187,7 @@ typedef struct {
     uint32_t     ht_seq;
     HeapEntry128 heap   [HP128_SIZE];  /* min-heap           —  ~48 MB */
     int          heap_sz;
+    int          probe_failed;         /* set when 128-probe limit hit */
 } HashStatePush128;   /* total ~144 MB */
 
 static _Thread_local HashStatePush128 *hsp128_tls;
@@ -1150,11 +1206,12 @@ static void hsp128_clear(HashStatePush128 *hs) {
         hs->ht_seq = 1;
     }
     hs->heap_sz = 0;
+    hs->probe_failed = 0;
 }
 
 static inline int hsp128_update(HashStatePush128 *hs, __uint128_t k, int new_cost) {
     uint64_t h = h128(k) & HT128_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) {
             hs->ht_gen[idx]  = hs->ht_seq;
@@ -1167,12 +1224,14 @@ static inline int hsp128_update(HashStatePush128 *hs, __uint128_t k, int new_cos
             return 0;
         }
     }
+    /* Probe limit exceeded — flag for the solver to bail with -3. */
+    hs->probe_failed = 1;
     return 0;
 }
 
 static inline int hsp128_get_cost(const HashStatePush128 *hs, __uint128_t k) {
     uint64_t h = h128(k) & HT128_MASK;
-    for (int i = 0; i < 128; i++) {
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) return INT_MAX;
         if (hs->htk[idx] == k) return hs->ht_cost[idx];
@@ -1215,6 +1274,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
     HashStatePush128 *hs = hsp128_get();
     hsp128_clear(hs);
     int peak_heap = 1;
+    int n_popped  = 0;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -1242,6 +1302,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
         if (e.prio >= best_win) break;
 
         if (hsp128_get_cost(hs, e.state) < e.prio) continue;
+        n_popped++;
 
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
         for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
@@ -1295,7 +1356,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
 
                 if (hsp128_update(hs, ns, nc)) {
                     if (hs->heap_sz >= HP128_SIZE) {
-                        if (prof) prof->peak_heap_sz = HP128_SIZE;
+                        if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
                         return -2;
                     }
                     HeapEntry128 ne;
@@ -1303,12 +1364,17 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
                     ne.prio = nc; ne.player_pos = bpos;
                     heap128_push(hs, ne);
                     if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
+                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
+                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                        return -3;
+                    }
                 }
             }
         }
     }
 
-    if (prof) prof->peak_heap_sz = peak_heap;
+    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+    if (hs->probe_failed) return -3;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)
@@ -1322,13 +1388,15 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
  * ======================================================================== */
 static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     if (max_cost < 0) {
-        if (prof) prof->peak_heap_sz = 1;
+        if (prof) { prof->peak_heap_sz = 1; prof->states_popped = 0; bfs_tail_reset(prof, max_cost); }
         return -1;
     }
 
     HashStatePush128 *hs = hsp128_get();
     hsp128_clear(hs);
+    bfs_tail_reset(prof, max_cost);
     int peak_heap = 1;
+    int n_popped  = 0;
 
     const int      nb       = pz->num_blocks;
     const int      nh       = pz->num_holes;
@@ -1357,6 +1425,11 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
         if (e.prio >= best_win) break;
 
         if (hsp128_get_cost(hs, e.state) < e.prio) continue;
+        n_popped++;
+        if (prof) {
+            int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
+            if (twi >= 0 && twi < BFS_TAIL_W) prof->tail_width[twi]++;
+        }
 
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
         for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
@@ -1412,7 +1485,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
 
                 if (hsp128_update(hs, ns, nc)) {
                     if (hs->heap_sz >= HP128_SIZE) {
-                        if (prof) prof->peak_heap_sz = HP128_SIZE;
+                        if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
                         return -2;
                     }
                     HeapEntry128 ne;
@@ -1420,12 +1493,17 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
                     ne.prio = nc; ne.player_pos = bpos;
                     heap128_push(hs, ne);
                     if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
+                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
+                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                        return -3;
+                    }
                 }
             }
         }
     }
 
-    if (prof) prof->peak_heap_sz = peak_heap;
+    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+    if (hs->probe_failed) return -3;
     if (best_win == INT_MAX) return -1;
     if (used_dirs)
         for (int i = 0; i < nb; i++)

@@ -8,7 +8,7 @@
 #define MAX_COLS    64
 #define MAX_NCELLS  64
 #define MAX_BLOCKS  32     /* enough for 8x8 puzzles in practice; --num-blocks rejects more */
-#define MAX_HOLES   32
+#define MAX_HOLES   64
 /* CONSUMED sentinel: encodes "block fell into a hole".  Set by
  * sokoban_set_grid() to g_ncells, which is the smallest value larger
  * than any legal cell index AND still fits in g_bits_per_cell bits. */
@@ -70,8 +70,20 @@ void sokoban_set_grid(int rows, int cols);
  * prof: if non-NULL, filled with profiling data for this call.
  *   Pass NULL for normal operation.
  */
+/* Width of the near-goal frontier window recorded by the cutoff solvers.
+ * tail_width[BFS_TAIL_W-1] is the number of states that settle at exactly
+ * cost == max_cost; tail_width[BFS_TAIL_W-1-j] is the count at max_cost-j. */
+#define BFS_TAIL_W 64
+
 typedef struct {
     int peak_heap_sz;  /* max heap entries live at any point during the solve */
+    int states_popped; /* unique states actually expanded (post-staleness check) */
+    int max_cost_seen; /* max_cost passed to the cutoff solve (-1 / unset otherwise) */
+    /* Frontier-width profile for the deepest BFS_TAIL_W cost levels of the
+     * forward solve: tail_width[i] = #states settling at cost
+     * (max_cost_seen - (BFS_TAIL_W-1-i)).  Only the *cutoff* solvers populate
+     * this; the uncapped solvers leave it untouched. */
+    int32_t tail_width[BFS_TAIL_W];
 } BfsProfile;
 
 int  sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof);
@@ -92,3 +104,19 @@ int  sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof);
 int  sokoban_solve_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost);
 
 void sokoban_init(void);   /* call once before spawning threads */
+
+/*
+ * sokoban_set_heap_cap(n)
+ *
+ * Soft upper bound on the BFS priority-queue size for all subsequent
+ * solves.  When heap_sz exceeds n, the solver aborts and returns -3.
+ * Useful for capping per-eval cost: solvable puzzles with very wide
+ * state spaces (and unsolvable puzzles that aren't trivially walled
+ * off) can otherwise burn seconds before BFS exhausts the heap.
+ *
+ * Set n = 0 (default) to disable.  Setting n >= HP64_SIZE is effectively
+ * disabled — the heap can't grow past HP64_SIZE anyway (returns -2).
+ *
+ * Not thread-safe; call from a single thread before parallel solves.
+ */
+void sokoban_set_heap_cap(int n);
