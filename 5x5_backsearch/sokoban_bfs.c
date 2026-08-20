@@ -534,9 +534,12 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
  *   Left  — shift right by 1, masking first column to prevent row wraparound
  * ======================================================================== */
 
-/* walk_dists_from: BFS distances from start to all reachable cells.
- * out[i] = distance, or -1 if unreachable. */
-static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
+/* walk_dists_from: BFS distances from start, recorded only for cells in
+ * `interesting` (the only cells the caller will query).  out[i] = distance,
+ * or -1 if unreachable / not interesting.  Terminates as soon as every
+ * reachable interesting cell has settled. */
+static void walk_dists_from(uint64_t blocked, int start, uint64_t interesting,
+                            int8_t *out) {
     memset(out, -1, (size_t)g_ncells);
     if ((blocked >> start) & 1) return;
     const uint64_t col0    = g_col0_mask;
@@ -546,8 +549,9 @@ static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
     uint64_t reached   = 1ULL << start;
     uint64_t frontier  = reached;
     out[start] = 0;
+    uint64_t remaining = interesting & free_mask & ~reached;
     int8_t dist = 0;
-    while (frontier) {
+    while (frontier && remaining) {
         dist++;
         uint64_t nxt = (frontier >> shc)
                      | (frontier << shc)
@@ -555,9 +559,18 @@ static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
                      | ((frontier & ~col0)    >> 1);
         frontier = nxt & free_mask & ~reached;
         reached |= frontier;
-        for (uint64_t tmp = frontier; tmp; tmp &= tmp - 1)
+        for (uint64_t tmp = frontier & remaining; tmp; tmp &= tmp - 1)
             out[__builtin_ctzll(tmp)] = dist;
+        remaining &= ~frontier;
     }
+}
+
+/* Neighbor mask: all cells orthogonally adjacent to a set bit of m. */
+static inline uint64_t nbr_mask(uint64_t m) {
+    return ((m >> g_cols)
+          | (m << g_cols)
+          | ((m & ~g_collast_mask) << 1)
+          | ((m & ~g_col0_mask)    >> 1)) & g_all_cells;
 }
 
 /* ========================================================================
@@ -568,8 +581,18 @@ static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
  *   The exact player position is tracked per heap entry (not in key).
  *
  * Edge cost = walk_distance(player_pos, push_from_cell) + 1.
- * Dijkstra with lazy deletion — edge costs in [1, 25] on a 5x5 grid.
- * ~352 MB per thread, allocated on first use.
+ * Dijkstra with lazy deletion — edge weights in [1, g_ncells].
+ *
+ * Priority queue: Dial's bucket queue.  Dijkstra pops priorities in
+ * non-decreasing order and every edge weight is < PQ64_NBUCKETS, so all
+ * pending priorities fit in a circular window of PQ64_NBUCKETS buckets
+ * indexed by (prio & PQ64_BMASK).  O(1) push/pop vs O(log n) heap sifts.
+ *
+ * Hash table: one 16-byte slot per state (key + generation + cost) so a
+ * probe touches a single cache line instead of three parallel arrays.
+ * Queue entries carry their slot index, making the stale-entry check on
+ * pop a single load instead of a re-probe.
+ * ~256 MB per thread, allocated on first use.
  * ======================================================================== */
 
 #define HTP_SIZE  (1 << 24)    /* 16 M hash-table slots.  Doubled from 8M
@@ -579,13 +602,16 @@ static void walk_dists_from(uint64_t blocked, int start, int8_t *out) {
                                  * enough for clusters to exceed the cap.
                                  * 16M halves the load factor again. */
 #define HTP_MASK  (HTP_SIZE - 1)
-#define HP64_SIZE (1 << 20)    /* 1 M heap entries                   */
+#define HP64_SIZE (1 << 20)    /* pending-entry cap (-2 on overflow)  */
+
+#define PQ64_NBUCKETS 128      /* power of two > max edge weight (≤64) */
+#define PQ64_BMASK    (PQ64_NBUCKETS - 1)
 
 typedef struct {
     int      prio;        /* priority: total cost (walks + pushes)  */
     int      player_pos;  /* exact player cell (not in state key)   */
     uint32_t used;        /* accumulated used-direction bits         */
-    uint32_t _pad;
+    uint32_t slot;        /* hash-table slot holding this state      */
     uint64_t state;       /* pack5 state (always kept for unpacking) */
 #ifdef USE_ZOBRIST
     uint64_t key;         /* Zobrist hash used for HT dedup          */
@@ -600,14 +626,23 @@ typedef struct {
 #endif
 
 typedef struct {
-    uint64_t    htk    [HTP_SIZE];   /* stored keys        — 128 MB */
-    uint32_t    ht_gen [HTP_SIZE];   /* generation stamps  —  64 MB */
-    int32_t     ht_cost[HTP_SIZE];   /* min cost per state —  64 MB */
-    uint32_t    ht_seq;
-    HeapEntry64 heap   [HP64_SIZE];  /* min-heap           —  96 MB */
-    int         heap_sz;
-    int         probe_failed;        /* set when 128-probe limit hit */
-} HashStatePush64;        /* total ~352 MB                           */
+    uint64_t key;
+    uint32_t gen;
+    int32_t  cost;
+} HSlot64;                /* 16 B — one cache-line touch per probe */
+
+typedef struct {
+    HeapEntry64 *items;
+    int len, cap;
+} Bucket64;
+
+typedef struct {
+    HSlot64  slot[HTP_SIZE];     /* key+gen+cost       — 256 MB */
+    uint32_t ht_seq;
+    Bucket64 bq[PQ64_NBUCKETS];  /* Dial bucket queue (lazy alloc) */
+    int      pq_count;           /* pending entries across buckets */
+    int      probe_failed;       /* set when probe limit hit */
+} HashStatePush64;
 
 static _Thread_local HashStatePush64 *hsp64_tls;
 
@@ -621,81 +656,57 @@ static HashStatePush64 *hsp64_get(void) {
 
 static void hsp64_clear(HashStatePush64 *hs) {
     if (++hs->ht_seq == 0) {
-        memset(hs->ht_gen, 0, sizeof(hs->ht_gen));
+        memset(hs->slot, 0, sizeof(hs->slot));
         hs->ht_seq = 1;
     }
-    hs->heap_sz = 0;
+    for (int i = 0; i < PQ64_NBUCKETS; i++) hs->bq[i].len = 0;
+    hs->pq_count = 0;
     hs->probe_failed = 0;
 }
 
 /* Update stored cost for key k.
- * Returns 1 if new_cost is an improvement (caller should enqueue). */
+ * Returns the slot index if new_cost is an improvement (caller should
+ * enqueue), or -1 otherwise. */
 static inline int hsp64_update(HashStatePush64 *hs, uint64_t k, int new_cost) {
     uint64_t h = h64(k) & HTP_MASK;
     for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HTP_MASK);
-        if (hs->ht_gen[idx] != hs->ht_seq) {
-            hs->ht_gen[idx] = hs->ht_seq;
-            hs->htk[idx]    = k;
-            hs->ht_cost[idx] = new_cost;
-            return 1;
+        HSlot64 *s = &hs->slot[idx];
+        if (s->gen != hs->ht_seq) {
+            s->gen  = hs->ht_seq;
+            s->key  = k;
+            s->cost = new_cost;
+            return (int)idx;
         }
-        if (hs->htk[idx] == k) {
-            if (new_cost < hs->ht_cost[idx]) {
-                hs->ht_cost[idx] = new_cost;
-                return 1;
-            }
-            return 0;
+        if (s->key == k) {
+            if (new_cost < s->cost) { s->cost = new_cost; return (int)idx; }
+            return -1;
         }
     }
     /* Probe limit exceeded — would silently drop the state, which can
      * make BFS over-count depth.  Flag for the solver to bail with -3. */
     hs->probe_failed = 1;
-    return 0;
+    return -1;
 }
 
-/* Return stored min cost, or INT_MAX if key not in table. */
-static inline int hsp64_get_cost(const HashStatePush64 *hs, uint64_t k) {
-    uint64_t h = h64(k) & HTP_MASK;
-    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
-        uint32_t idx = (uint32_t)((h + i) & HTP_MASK);
-        if (hs->ht_gen[idx] != hs->ht_seq) return INT_MAX;
-        if (hs->htk[idx] == k) return hs->ht_cost[idx];
-    }
-    return INT_MAX;
-}
+/* Candidate push collected in pass 1 (before walk distances are known). */
+typedef struct {
+    uint64_t state;
+    uint64_t key;
+    int16_t  pfr;     /* push-from cell — needs wdist[pfr] >= 0  */
+    int16_t  bpos;    /* block's old cell == player landing cell */
+    uint8_t  dirbit;  /* bi*4 + d, for used-direction tracking   */
+} PushCand;
 
-/* Min-heap: push entry. */
-static inline void heap64_push(HashStatePush64 *hs, HeapEntry64 e) {
-    int i = hs->heap_sz++;
-    hs->heap[i] = e;
-    while (i > 0) {
-        int p = (i - 1) >> 1;
-        if (hs->heap[p].prio <= hs->heap[i].prio) break;
-        HeapEntry64 tmp  = hs->heap[p];
-        hs->heap[p] = hs->heap[i];
-        hs->heap[i] = tmp;
-        i = p;
+/* Bucket queue: push entry into its priority's bucket. */
+static inline void bq64_push(HashStatePush64 *hs, const HeapEntry64 *e) {
+    Bucket64 *b = &hs->bq[e->prio & PQ64_BMASK];
+    if (b->len == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 1024;
+        b->items = realloc(b->items, (size_t)b->cap * sizeof(HeapEntry64));
     }
-}
-
-/* Min-heap: pop minimum entry. */
-static inline HeapEntry64 heap64_pop(HashStatePush64 *hs) {
-    HeapEntry64 top = hs->heap[0];
-    int sz = --hs->heap_sz;
-    hs->heap[0] = hs->heap[sz];
-    int i = 0;
-    for (;;) {
-        int l = (i << 1) | 1, r = l + 1, m = i;
-        if (l < sz && hs->heap[l].prio < hs->heap[m].prio) m = l;
-        if (r < sz && hs->heap[r].prio < hs->heap[m].prio) m = r;
-        if (m == i) break;
-        HeapEntry64 tmp  = hs->heap[m];
-        hs->heap[m] = hs->heap[i];
-        hs->heap[i] = tmp;
-        i = m;
-    }
-    return top;
+    b->items[b->len++] = *e;
+    hs->pq_count++;
 }
 
 /* Zero the near-goal frontier window and record the cutoff ceiling.  Called
@@ -726,23 +737,27 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
     {
         HeapEntry64 e0;
         e0.prio = 0; e0.player_pos = pz->player_start;
-        e0.used = 0; e0._pad = 0; e0.state = init_st;
+        e0.used = 0; e0.state = init_st;
 #ifdef USE_ZOBRIST
         e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh);
 #endif
-        hsp64_update(hs, HE64_KEY(e0), 0);
-        heap64_push(hs, e0);
+        e0.slot = (uint32_t)hsp64_update(hs, HE64_KEY(e0), 0);
+        bq64_push(hs, &e0);
     }
 
     int      best_win  = INT_MAX;
     uint32_t best_used = 0;
 
-    while (hs->heap_sz > 0) {
-        HeapEntry64 e = heap64_pop(hs);
+    int pq_min = 0;
+    while (hs->pq_count > 0) {
+        Bucket64 *bkt = &hs->bq[pq_min & PQ64_BMASK];
+        if (bkt->len == 0) { pq_min++; continue; }
+        HeapEntry64 e = bkt->items[--bkt->len];
+        hs->pq_count--;
         if (e.prio >= best_win) break; /* Dijkstra: can't improve */
 
         /* Lazy deletion: skip if a shorter path was already found. */
-        if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
+        if (hs->slot[e.slot].cost < e.prio) continue;
         n_popped++;
 
         /* Unpack blocks and hole mask (skip canonical player cell in bits[4:0]). */
@@ -755,9 +770,69 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
         uint64_t cur_holes = 0;
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
-        /* Walk distances from exact player position. */
+        /* Pass 1: enumerate candidate pushes (everything except player
+         * reachability), compute their state/key, and prefetch each one's
+         * hash slot.  The walk-distance BFS below then overlaps with the
+         * table's cold-miss latency. */
+        PushCand cand[MAX_BLOCKS * 4];
+        int ncand = 0;
+        for (int bi = 0; bi < nb; bi++) {
+            if (bp[bi] >= g_ncells) continue; /* block consumed */
+            const int bpos = bp[bi];
+            const int mb   = pz->block_pushable[bi] & 0xF;
+
+            for (int d = 0; d < 4; d++) {
+                if (!(mb & (1 << d))) continue;
+
+                int pfr = g_adj[bpos][d ^ 2]; /* push-from cell (player must be here) */
+                if (pfr < 0) continue;
+
+                int lnd = g_adj[bpos][d]; /* landing cell for block */
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
+
+                /* Compute new block position (handle hole consumption). */
+                int new_bpos = lnd, nhm = hm, ch = -1;
+                if (cur_holes & (1ULL << lnd)) {
+                    for (int h = 0; h < nh; h++) {
+                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
+                            new_bpos = g_consumed;
+                            nhm &= ~(1 << h);
+                            ch = h;
+                            break;
+                        }
+                    }
+                }
+
+                /* Incremental state update: player lands at bpos; patch
+                 * block bi's field (and the hole mask if one was consumed). */
+                int      bsh = g_bits_per_cell * (bi + 1);
+                uint64_t ns  = (e.state & ~g_cell_mask) | (uint64_t)bpos;
+                ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
+                if (ch >= 0)
+                    ns ^= (uint64_t)(hm ^ nhm) << (g_bits_per_cell * (nb + 1));
+#ifdef USE_ZOBRIST
+                /* Incremental Zobrist: XOR out moved pieces, XOR in new. */
+                uint64_t nk = e.key ^ z_player[e.player_pos] ^ z_player[bpos]
+                            ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
+                if (ch >= 0) nk ^= z_hole[ch];
+#else
+                uint64_t nk = ns;
+#endif
+                __builtin_prefetch(&hs->slot[h64(nk) & HTP_MASK], 1, 1);
+                cand[ncand].state = ns;
+                cand[ncand].key   = nk;
+                cand[ncand].pfr   = (int16_t)pfr;
+                cand[ncand].bpos  = (int16_t)bpos;
+                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
+                ncand++;
+            }
+        }
+
+        /* Walk distances from exact player position (only block-adjacent
+         * cells and the exit are ever queried). */
         int8_t wdist[MAX_NCELLS];
-        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
+        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
+                        nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
 
         /* Win check: can player walk to exit? */
         if (wdist[exit_pos] >= 0) {
@@ -765,62 +840,30 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
             if (wc < best_win) { best_win = wc; best_used = e.used; }
         }
 
-        /* Enumerate valid pushes. */
-        for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= g_ncells) continue; /* block consumed */
-            int bpos = bp[bi];
+        /* Pass 2: keep candidates whose push-from cell is reachable. */
+        for (int ci = 0; ci < ncand; ci++) {
+            if (wdist[cand[ci].pfr] < 0) continue;
 
-            for (int d = 0; d < 4; d++) {
-                if (!(pz->block_pushable[bi] & (1 << d))) continue;
-
-                int pfr = g_adj[bpos][d ^ 2]; /* push-from cell (player must be here) */
-                if (pfr < 0 || wdist[pfr] < 0) continue;
-
-                int lnd = g_adj[bpos][d]; /* landing cell for block */
-                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
-
-                /* Compute new block position (handle hole consumption). */
-                int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1ULL << lnd)) {
-                    for (int h = 0; h < nh; h++) {
-                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = g_consumed;
-                            nhm &= ~(1 << h);
-                            break;
-                        }
-                    }
+            int      nc = e.prio + (int)wdist[cand[ci].pfr] + 1;
+            uint64_t nk = cand[ci].key;
+            int slot = hsp64_update(hs, nk, nc);
+            if (slot >= 0) {
+                if (hs->pq_count >= HP64_SIZE) {
+                    if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
+                    return -2;
                 }
-
-                int nbp[MAX_BLOCKS];
-                for (int i = 0; i < nb; i++) nbp[i] = bp[i];
-                nbp[bi] = new_bpos;
-
-                /* Player lands at bpos. */
-                uint64_t ns = pack5(bpos, nbp, nb, nhm);
-                int      nc = e.prio + (int)wdist[pfr] + 1;
-                uint32_t nu = e.used | (1u << (bi * 4 + d));
+                HeapEntry64 ne;
+                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.used = e.used | (1u << cand[ci].dirbit);
+                ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
-                uint64_t nk = zpack64(bpos, nbp, pz->block_pushable, nb, nhm, nh);
-#else
-                uint64_t nk = ns;
+                ne.key = nk;
 #endif
-                if (hsp64_update(hs, nk, nc)) {
-                    if (hs->heap_sz >= HP64_SIZE) {
-                        if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
-                        return -2;
-                    }
-                    HeapEntry64 ne;
-                    ne.prio = nc; ne.player_pos = bpos;
-                    ne.used = nu; ne._pad = 0; ne.state = ns;
-#ifdef USE_ZOBRIST
-                    ne.key = nk;
-#endif
-                    heap64_push(hs, ne);
-                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
-                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
-                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                        return -3;
-                    }
+                bq64_push(hs, &ne);
+                if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
+                if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return -3;
                 }
             }
         }
@@ -874,23 +917,27 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
     {
         HeapEntry64 e0;
         e0.prio = 0; e0.player_pos = pz->player_start;
-        e0.used = 0; e0._pad = 0; e0.state = init_st;
+        e0.used = 0; e0.state = init_st;
 #ifdef USE_ZOBRIST
         e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh);
 #endif
-        hsp64_update(hs, HE64_KEY(e0), 0);
-        heap64_push(hs, e0);
+        e0.slot = (uint32_t)hsp64_update(hs, HE64_KEY(e0), 0);
+        bq64_push(hs, &e0);
     }
 
     int      best_win  = INT_MAX;
     uint32_t best_used = 0;
 
-    while (hs->heap_sz > 0) {
-        HeapEntry64 e = heap64_pop(hs);
+    int pq_min = 0;
+    while (hs->pq_count > 0) {
+        Bucket64 *bkt = &hs->bq[pq_min & PQ64_BMASK];
+        if (bkt->len == 0) { pq_min++; continue; }
+        HeapEntry64 e = bkt->items[--bkt->len];
+        hs->pq_count--;
         if (e.prio > max_cost) break;          /* CUTOFF */
         if (e.prio >= best_win) break;
 
-        if (hsp64_get_cost(hs, HE64_KEY(e)) < e.prio) continue;
+        if (hs->slot[e.slot].cost < e.prio) continue;
         n_popped++;
         if (prof) {
             int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
@@ -906,8 +953,60 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         uint64_t cur_holes = 0;
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
+        /* Pass 1: candidates + slot prefetch (see solve_push64). */
+        PushCand cand[MAX_BLOCKS * 4];
+        int ncand = 0;
+        for (int bi = 0; bi < nb; bi++) {
+            if (bp[bi] >= g_ncells) continue;
+            const int bpos = bp[bi];
+            const int mb   = pz->block_pushable[bi] & 0xF;
+
+            for (int d = 0; d < 4; d++) {
+                if (!(mb & (1 << d))) continue;
+
+                int pfr = g_adj[bpos][d ^ 2];
+                if (pfr < 0) continue;
+
+                int lnd = g_adj[bpos][d];
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
+
+                int new_bpos = lnd, nhm = hm, ch = -1;
+                if (cur_holes & (1ULL << lnd)) {
+                    for (int h = 0; h < nh; h++) {
+                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
+                            new_bpos = g_consumed;
+                            nhm &= ~(1 << h);
+                            ch = h;
+                            break;
+                        }
+                    }
+                }
+
+                int      bsh = g_bits_per_cell * (bi + 1);
+                uint64_t ns  = (e.state & ~g_cell_mask) | (uint64_t)bpos;
+                ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
+                if (ch >= 0)
+                    ns ^= (uint64_t)(hm ^ nhm) << (g_bits_per_cell * (nb + 1));
+#ifdef USE_ZOBRIST
+                uint64_t nk = e.key ^ z_player[e.player_pos] ^ z_player[bpos]
+                            ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
+                if (ch >= 0) nk ^= z_hole[ch];
+#else
+                uint64_t nk = ns;
+#endif
+                __builtin_prefetch(&hs->slot[h64(nk) & HTP_MASK], 1, 1);
+                cand[ncand].state = ns;
+                cand[ncand].key   = nk;
+                cand[ncand].pfr   = (int16_t)pfr;
+                cand[ncand].bpos  = (int16_t)bpos;
+                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
+                ncand++;
+            }
+        }
+
         int8_t wdist[MAX_NCELLS];
-        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
+        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
+                        nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
@@ -916,60 +1015,32 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
             }
         }
 
-        for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= g_ncells) continue;
-            int bpos = bp[bi];
+        /* Pass 2: reachable push-from cells, costs within the cutoff. */
+        for (int ci = 0; ci < ncand; ci++) {
+            if (wdist[cand[ci].pfr] < 0) continue;
 
-            for (int d = 0; d < 4; d++) {
-                if (!(pz->block_pushable[bi] & (1 << d))) continue;
+            int nc = e.prio + (int)wdist[cand[ci].pfr] + 1;
+            if (nc > max_cost) continue;       /* CUTOFF: don't enqueue */
 
-                int pfr = g_adj[bpos][d ^ 2];
-                if (pfr < 0 || wdist[pfr] < 0) continue;
-
-                int lnd = g_adj[bpos][d];
-                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
-
-                int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1ULL << lnd)) {
-                    for (int h = 0; h < nh; h++) {
-                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = g_consumed;
-                            nhm &= ~(1 << h);
-                            break;
-                        }
-                    }
+            uint64_t nk = cand[ci].key;
+            int slot = hsp64_update(hs, nk, nc);
+            if (slot >= 0) {
+                if (hs->pq_count >= HP64_SIZE) {
+                    if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
+                    return -2;
                 }
-
-                int nbp[MAX_BLOCKS];
-                for (int i = 0; i < nb; i++) nbp[i] = bp[i];
-                nbp[bi] = new_bpos;
-
-                uint64_t ns = pack5(bpos, nbp, nb, nhm);
-                int      nc = e.prio + (int)wdist[pfr] + 1;
-                if (nc > max_cost) continue;       /* CUTOFF: don't enqueue */
-                uint32_t nu = e.used | (1u << (bi * 4 + d));
+                HeapEntry64 ne;
+                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.used = e.used | (1u << cand[ci].dirbit);
+                ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
-                uint64_t nk = zpack64(bpos, nbp, pz->block_pushable, nb, nhm, nh);
-#else
-                uint64_t nk = ns;
+                ne.key = nk;
 #endif
-                if (hsp64_update(hs, nk, nc)) {
-                    if (hs->heap_sz >= HP64_SIZE) {
-                        if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
-                        return -2;
-                    }
-                    HeapEntry64 ne;
-                    ne.prio = nc; ne.player_pos = bpos;
-                    ne.used = nu; ne._pad = 0; ne.state = ns;
-#ifdef USE_ZOBRIST
-                    ne.key = nk;
-#endif
-                    heap64_push(hs, ne);
-                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
-                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
-                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                        return -3;
-                    }
+                bq64_push(hs, &ne);
+                if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
+                if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return -3;
                 }
             }
         }
@@ -1171,24 +1242,30 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
  * ~144 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HP128_SIZE (1 << 20)   /* 1 M heap entries */
+#define HP128_SIZE (1 << 20)   /* pending-entry cap (-2 on overflow) */
 
 typedef struct {
     __uint128_t state;
     __uint128_t used;
     int         prio;
     int         player_pos;
+    uint32_t    slot;     /* hash-table slot holding this state */
 } HeapEntry128;   /* ~48 bytes with alignment */
 
 typedef struct {
-    __uint128_t  htk    [HT128_SIZE];  /* stored keys        —  64 MB */
-    uint32_t     ht_gen [HT128_SIZE];  /* generation stamps  —  16 MB */
-    int32_t      ht_cost[HT128_SIZE];  /* min cost per state —  16 MB */
+    HeapEntry128 *items;
+    int len, cap;
+} Bucket128;
+
+typedef struct {
+    __uint128_t  htk    [HT128_SIZE];  /* stored keys        — 256 MB */
+    uint32_t     ht_gen [HT128_SIZE];  /* generation stamps  —  64 MB */
+    int32_t      ht_cost[HT128_SIZE];  /* min cost per state —  64 MB */
     uint32_t     ht_seq;
-    HeapEntry128 heap   [HP128_SIZE];  /* min-heap           —  ~48 MB */
-    int          heap_sz;
-    int          probe_failed;         /* set when 128-probe limit hit */
-} HashStatePush128;   /* total ~144 MB */
+    Bucket128    bq[PQ64_NBUCKETS];    /* Dial bucket queue (lazy alloc) */
+    int          pq_count;             /* pending entries across buckets */
+    int          probe_failed;         /* set when probe limit hit */
+} HashStatePush128;
 
 static _Thread_local HashStatePush128 *hsp128_tls;
 
@@ -1205,10 +1282,13 @@ static void hsp128_clear(HashStatePush128 *hs) {
         memset(hs->ht_gen, 0, sizeof(hs->ht_gen));
         hs->ht_seq = 1;
     }
-    hs->heap_sz = 0;
+    for (int i = 0; i < PQ64_NBUCKETS; i++) hs->bq[i].len = 0;
+    hs->pq_count = 0;
     hs->probe_failed = 0;
 }
 
+/* Returns the slot index if new_cost improves the stored cost (caller
+ * should enqueue), or -1 otherwise. */
 static inline int hsp128_update(HashStatePush128 *hs, __uint128_t k, int new_cost) {
     uint64_t h = h128(k) & HT128_MASK;
     for (int i = 0; i < HT_PROBE_LIMIT; i++) {
@@ -1217,58 +1297,35 @@ static inline int hsp128_update(HashStatePush128 *hs, __uint128_t k, int new_cos
             hs->ht_gen[idx]  = hs->ht_seq;
             hs->htk[idx]     = k;
             hs->ht_cost[idx] = new_cost;
-            return 1;
+            return (int)idx;
         }
         if (hs->htk[idx] == k) {
-            if (new_cost < hs->ht_cost[idx]) { hs->ht_cost[idx] = new_cost; return 1; }
-            return 0;
+            if (new_cost < hs->ht_cost[idx]) { hs->ht_cost[idx] = new_cost; return (int)idx; }
+            return -1;
         }
     }
     /* Probe limit exceeded — flag for the solver to bail with -3. */
     hs->probe_failed = 1;
-    return 0;
+    return -1;
 }
 
-static inline int hsp128_get_cost(const HashStatePush128 *hs, __uint128_t k) {
-    uint64_t h = h128(k) & HT128_MASK;
-    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
-        uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
-        if (hs->ht_gen[idx] != hs->ht_seq) return INT_MAX;
-        if (hs->htk[idx] == k) return hs->ht_cost[idx];
+static inline void bq128_push(HashStatePush128 *hs, const HeapEntry128 *e) {
+    Bucket128 *b = &hs->bq[e->prio & PQ64_BMASK];
+    if (b->len == b->cap) {
+        b->cap = b->cap ? b->cap * 2 : 1024;
+        b->items = realloc(b->items, (size_t)b->cap * sizeof(HeapEntry128));
     }
-    return INT_MAX;
+    b->items[b->len++] = *e;
+    hs->pq_count++;
 }
 
-static inline void heap128_push(HashStatePush128 *hs, HeapEntry128 e) {
-    int i = hs->heap_sz++;
-    hs->heap[i] = e;
-    while (i > 0) {
-        int p = (i - 1) >> 1;
-        if (hs->heap[p].prio <= hs->heap[i].prio) break;
-        HeapEntry128 tmp = hs->heap[p];
-        hs->heap[p] = hs->heap[i];
-        hs->heap[i] = tmp;
-        i = p;
-    }
-}
-
-static inline HeapEntry128 heap128_pop(HashStatePush128 *hs) {
-    HeapEntry128 top = hs->heap[0];
-    int sz = --hs->heap_sz;
-    hs->heap[0] = hs->heap[sz];
-    int i = 0;
-    for (;;) {
-        int l = (i << 1) | 1, r = l + 1, m = i;
-        if (l < sz && hs->heap[l].prio < hs->heap[m].prio) m = l;
-        if (r < sz && hs->heap[r].prio < hs->heap[m].prio) m = r;
-        if (m == i) break;
-        HeapEntry128 tmp = hs->heap[m];
-        hs->heap[m] = hs->heap[i];
-        hs->heap[i] = tmp;
-        i = m;
-    }
-    return top;
-}
+/* Candidate push for the 128-bit solvers (key == packed state). */
+typedef struct {
+    __uint128_t state;
+    int16_t     pfr;
+    int16_t     bpos;
+    uint8_t     dirbit;
+} PushCand128;
 
 static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush128 *hs = hsp128_get();
@@ -1290,18 +1347,22 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
         HeapEntry128 e0;
         e0.state = init_st; e0.used = 0;
         e0.prio = 0; e0.player_pos = pz->player_start;
-        hsp128_update(hs, init_st, 0);
-        heap128_push(hs, e0);
+        e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
+        bq128_push(hs, &e0);
     }
 
     int         best_win  = INT_MAX;
     __uint128_t best_used = 0;
 
-    while (hs->heap_sz > 0) {
-        HeapEntry128 e = heap128_pop(hs);
+    int pq_min = 0;
+    while (hs->pq_count > 0) {
+        Bucket128 *bkt = &hs->bq[pq_min & PQ64_BMASK];
+        if (bkt->len == 0) { pq_min++; continue; }
+        HeapEntry128 e = bkt->items[--bkt->len];
+        hs->pq_count--;
         if (e.prio >= best_win) break;
 
-        if (hsp128_get_cost(hs, e.state) < e.prio) continue;
+        if (hs->ht_cost[e.slot] < e.prio) continue;
         n_popped++;
 
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
@@ -1313,61 +1374,83 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
         uint64_t cur_holes = 0;
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
+        /* Pass 1: candidates + slot prefetch (see solve_push64). */
+        PushCand128 cand[MAX_BLOCKS * 4];
+        int ncand = 0;
+        for (int bi = 0; bi < nb; bi++) {
+            if (bp[bi] >= g_ncells) continue;
+            const int bpos = bp[bi];
+            const int mb   = pz->block_pushable[bi] & 0xF;
+
+            for (int d = 0; d < 4; d++) {
+                if (!(mb & (1 << d))) continue;
+
+                int pfr = g_adj[bpos][d ^ 2];
+                if (pfr < 0) continue;
+
+                int lnd = g_adj[bpos][d];
+                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
+
+                int new_bpos = lnd, nhm = hm, ch = -1;
+                if (cur_holes & (1ULL << lnd)) {
+                    for (int h = 0; h < nh; h++) {
+                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
+                            new_bpos = g_consumed;
+                            nhm &= ~(1 << h);
+                            ch = h;
+                            break;
+                        }
+                    }
+                }
+
+                /* Incremental state patch: player + block bi (+ hole mask). */
+                int         bsh = g_bits_per_cell * (bi + 1);
+                __uint128_t ns  = (e.state & ~(__uint128_t)g_cell_mask) | (__uint128_t)bpos;
+                ns = (ns & ~((__uint128_t)g_cell_mask << bsh)) | ((__uint128_t)new_bpos << bsh);
+                if (ch >= 0)
+                    ns ^= (__uint128_t)(hm ^ nhm) << (g_bits_per_cell * (nb + 1));
+                __builtin_prefetch(&hs->htk[h128(ns) & HT128_MASK], 1, 1);
+                __builtin_prefetch(&hs->ht_gen[h128(ns) & HT128_MASK], 1, 1);
+                cand[ncand].state = ns;
+                cand[ncand].pfr   = (int16_t)pfr;
+                cand[ncand].bpos  = (int16_t)bpos;
+                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
+                ncand++;
+            }
+        }
+
         int8_t wdist[MAX_NCELLS];
-        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
+        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
+                        nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
             if (wc < best_win) { best_win = wc; best_used = e.used; }
         }
 
-        for (int bi = 0; bi < nb; bi++) {
-            if (bp[bi] >= g_ncells) continue;
-            int bpos = bp[bi];
+        /* Pass 2: keep candidates whose push-from cell is reachable. */
+        for (int ci = 0; ci < ncand; ci++) {
+            if (wdist[cand[ci].pfr] < 0) continue;
 
-            for (int d = 0; d < 4; d++) {
-                if (!(pz->block_pushable[bi] & (1 << d))) continue;
+            __uint128_t ns = cand[ci].state;
+            int         nc = e.prio + (int)wdist[cand[ci].pfr] + 1;
 
-                int pfr = g_adj[bpos][d ^ 2];
-                if (pfr < 0 || wdist[pfr] < 0) continue;
-
-                int lnd = g_adj[bpos][d];
-                if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
-
-                int new_bpos = lnd, nhm = hm;
-                if (cur_holes & (1ULL << lnd)) {
-                    for (int h = 0; h < nh; h++) {
-                        if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
-                            new_bpos = g_consumed;
-                            nhm &= ~(1 << h);
-                            break;
-                        }
-                    }
+            int slot = hsp128_update(hs, ns, nc);
+            if (slot >= 0) {
+                if (hs->pq_count >= HP128_SIZE) {
+                    if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
+                    return -2;
                 }
-
-                int nbp[MAX_BLOCKS];
-                for (int i = 0; i < nb; i++) nbp[i] = bp[i];
-                nbp[bi] = new_bpos;
-
-                /* Player lands at bpos. */
-                __uint128_t ns = pack128(bpos, nbp, nb, nhm);
-                int         nc = e.prio + (int)wdist[pfr] + 1;
-                __uint128_t nu = e.used | ((__uint128_t)1 << (bi * 4 + d));
-
-                if (hsp128_update(hs, ns, nc)) {
-                    if (hs->heap_sz >= HP128_SIZE) {
-                        if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
-                        return -2;
-                    }
-                    HeapEntry128 ne;
-                    ne.state = ns; ne.used = nu;
-                    ne.prio = nc; ne.player_pos = bpos;
-                    heap128_push(hs, ne);
-                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
-                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
-                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                        return -3;
-                    }
+                HeapEntry128 ne;
+                ne.state = ns;
+                ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
+                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.slot = (uint32_t)slot;
+                bq128_push(hs, &ne);
+                if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
+                if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return -3;
                 }
             }
         }
@@ -1412,19 +1495,23 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
         HeapEntry128 e0;
         e0.state = init_st; e0.used = 0;
         e0.prio = 0; e0.player_pos = pz->player_start;
-        hsp128_update(hs, init_st, 0);
-        heap128_push(hs, e0);
+        e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
+        bq128_push(hs, &e0);
     }
 
     int         best_win  = INT_MAX;
     __uint128_t best_used = 0;
 
-    while (hs->heap_sz > 0) {
-        HeapEntry128 e = heap128_pop(hs);
+    int pq_min = 0;
+    while (hs->pq_count > 0) {
+        Bucket128 *bkt = &hs->bq[pq_min & PQ64_BMASK];
+        if (bkt->len == 0) { pq_min++; continue; }
+        HeapEntry128 e = bkt->items[--bkt->len];
+        hs->pq_count--;
         if (e.prio > max_cost) break;          /* CUTOFF */
         if (e.prio >= best_win) break;
 
-        if (hsp128_get_cost(hs, e.state) < e.prio) continue;
+        if (hs->ht_cost[e.slot] < e.prio) continue;
         n_popped++;
         if (prof) {
             int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
@@ -1441,7 +1528,8 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
 
         int8_t wdist[MAX_NCELLS];
-        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos, wdist);
+        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
+                        nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
@@ -1450,53 +1538,78 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
             }
         }
 
+        /* Pass 1: candidates + slot prefetch (see solve_push64).  Note the
+         * candidate pass runs before wdist is known, so it must come before
+         * the walk — moved above for the 64-bit solvers; here the walk has
+         * already run, so collect-then-process still saves nothing unless
+         * we hoist it.  Keep structure identical to solve_push128. */
+        PushCand128 cand[MAX_BLOCKS * 4];
+        int ncand = 0;
         for (int bi = 0; bi < nb; bi++) {
             if (bp[bi] >= g_ncells) continue;
-            int bpos = bp[bi];
+            const int bpos = bp[bi];
+            const int mb   = pz->block_pushable[bi] & 0xF;
 
             for (int d = 0; d < 4; d++) {
-                if (!(pz->block_pushable[bi] & (1 << d))) continue;
+                if (!(mb & (1 << d))) continue;
 
                 int pfr = g_adj[bpos][d ^ 2];
-                if (pfr < 0 || wdist[pfr] < 0) continue;
+                if (pfr < 0) continue;
 
                 int lnd = g_adj[bpos][d];
                 if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
 
-                int new_bpos = lnd, nhm = hm;
+                int new_bpos = lnd, nhm = hm, ch = -1;
                 if (cur_holes & (1ULL << lnd)) {
                     for (int h = 0; h < nh; h++) {
                         if (pz->hole_pos[h] == lnd && (hm & (1 << h))) {
                             new_bpos = g_consumed;
                             nhm &= ~(1 << h);
+                            ch = h;
                             break;
                         }
                     }
                 }
 
-                int nbp[MAX_BLOCKS];
-                for (int i = 0; i < nb; i++) nbp[i] = bp[i];
-                nbp[bi] = new_bpos;
+                int         bsh = g_bits_per_cell * (bi + 1);
+                __uint128_t ns  = (e.state & ~(__uint128_t)g_cell_mask) | (__uint128_t)bpos;
+                ns = (ns & ~((__uint128_t)g_cell_mask << bsh)) | ((__uint128_t)new_bpos << bsh);
+                if (ch >= 0)
+                    ns ^= (__uint128_t)(hm ^ nhm) << (g_bits_per_cell * (nb + 1));
+                __builtin_prefetch(&hs->htk[h128(ns) & HT128_MASK], 1, 1);
+                __builtin_prefetch(&hs->ht_gen[h128(ns) & HT128_MASK], 1, 1);
+                cand[ncand].state = ns;
+                cand[ncand].pfr   = (int16_t)pfr;
+                cand[ncand].bpos  = (int16_t)bpos;
+                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
+                ncand++;
+            }
+        }
 
-                __uint128_t ns = pack128(bpos, nbp, nb, nhm);
-                int         nc = e.prio + (int)wdist[pfr] + 1;
-                if (nc > max_cost) continue;       /* CUTOFF */
-                __uint128_t nu = e.used | ((__uint128_t)1 << (bi * 4 + d));
+        /* Pass 2: reachable push-from cells, costs within the cutoff. */
+        for (int ci = 0; ci < ncand; ci++) {
+            if (wdist[cand[ci].pfr] < 0) continue;
 
-                if (hsp128_update(hs, ns, nc)) {
-                    if (hs->heap_sz >= HP128_SIZE) {
-                        if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
-                        return -2;
-                    }
-                    HeapEntry128 ne;
-                    ne.state = ns; ne.used = nu;
-                    ne.prio = nc; ne.player_pos = bpos;
-                    heap128_push(hs, ne);
-                    if (hs->heap_sz > peak_heap) peak_heap = hs->heap_sz;
-                    if (g_heap_cap > 0 && hs->heap_sz > g_heap_cap) {
-                        if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                        return -3;
-                    }
+            int nc = e.prio + (int)wdist[cand[ci].pfr] + 1;
+            if (nc > max_cost) continue;       /* CUTOFF */
+
+            __uint128_t ns = cand[ci].state;
+            int slot = hsp128_update(hs, ns, nc);
+            if (slot >= 0) {
+                if (hs->pq_count >= HP128_SIZE) {
+                    if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
+                    return -2;
+                }
+                HeapEntry128 ne;
+                ne.state = ns;
+                ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
+                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.slot = (uint32_t)slot;
+                bq128_push(hs, &ne);
+                if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
+                if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return -3;
                 }
             }
         }

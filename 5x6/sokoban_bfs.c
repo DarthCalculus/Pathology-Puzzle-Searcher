@@ -463,12 +463,12 @@ static int solve_hash(const Puzzle *pz, uint8_t *used_dirs) {
 /* ========================================================================
  * HELPERS FOR PUSH-BASED DIJKSTRA SOLVERS
  *
- * Bitmask BFS: all 25 cells fit in a uint32_t, so each level of BFS can
+ * Bitmask BFS: all 30 cells fit in a uint32_t, so each level of BFS can
  * be expanded with 4 shift operations rather than iterating cell-by-cell
- * through the adj table.  Directions on the 5×5 grid:
- *   Up    — shift right by 5  (no wrap guard needed; high bits go to 0)
- *   Down  — shift left  by 5  (bits above 24 masked out by free_mask)
- *   Right — shift left  by 1, masking col 4 to prevent row wraparound
+ * through the adj table.  Directions on the 5×6 grid:
+ *   Up    — shift right by 6  (no wrap guard needed; high bits go to 0)
+ *   Down  — shift left  by 6  (bits above 29 masked out by free_mask)
+ *   Right — shift left  by 1, masking col 5 to prevent row wraparound
  *   Left  — shift right by 1, masking col 0 to prevent row wraparound
  * ======================================================================== */
 
@@ -507,7 +507,7 @@ static void walk_dists_from(uint32_t blocked, int start, int8_t *out) {
  *   The exact player position is tracked per heap entry (not in key).
  *
  * Edge cost = walk_distance(player_pos, push_from_cell) + 1.
- * Dijkstra with lazy deletion — edge costs in [1, 25] on a 5x5 grid.
+ * Dijkstra with lazy deletion — edge costs in [1, 30] on a 5×6 grid.
  * ~352 MB per thread, allocated on first use.
  * ======================================================================== */
 

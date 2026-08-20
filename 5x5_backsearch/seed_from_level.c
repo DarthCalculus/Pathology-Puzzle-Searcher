@@ -320,6 +320,7 @@ int main(int argc, char **argv) {
             "  Reads a puzzle in the printed-text format and outputs a\n"
             "  --seed-path token-string producing the first N backward\n"
             "  steps on the optimal solution's reverse trace.\n"
+            "  N=0: depth-only mode — print 'optimal depth: D' and exit.\n"
             "\n"
             "  Puzzle input: provide either\n"
             "    - As argv[2]:  %s 10 \"  .$@.\\n  ABC.   A=[R]\\n  ...\"\n"
@@ -333,7 +334,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     int N = atoi(argv[1]);
-    if (N <= 0) { fprintf(stderr, "error: N must be > 0\n"); return 1; }
+    if (N < 0) { fprintf(stderr, "error: N must be >= 0 (0 = depth-only)\n"); return 1; }
 
     if (argc >= 3) {
         /* Puzzle text passed as a single argv string. */
@@ -365,6 +366,10 @@ int main(int argc, char **argv) {
 
     int D = solve_state(&st);
     if (D <= 0) { fprintf(stderr, "error: puzzle unsolvable (rc=%d)\n", D); return 1; }
+    if (N == 0) {
+        printf("optimal depth: %d\n", D);
+        return 0;
+    }
     if (N > D) {
         fprintf(stderr, "warning: requested N=%d > optimal depth %d; using N=%d\n", N, D, D);
         N = D;

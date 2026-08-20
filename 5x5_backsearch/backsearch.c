@@ -67,6 +67,11 @@ static int      g_only_exit   = -1;         /* -1 = iterate canonical exits */
 static int      g_n_only_exits = 0;
 static int      g_only_exit_list[MAX_NCELLS];
 static int      g_allow_exit_transit = 0;   /* 1 = block may transit through exit */
+/* --allow-block-on-exit: permit the accepted puzzle to have a block resting
+ * on the exit cell in its start position.  Implies --allow-exit-transit,
+ * since a block can only land on the exit via a transit backstep at the
+ * root.  Default: 0 (such candidates are rejected as best states). */
+static int      g_allow_block_on_exit = 0;
 static int      g_holeless           = 0;   /* 1 = forbid all holes (no variant 4) */
 static int      g_two_tables         = 0;   /* 1 = use shallow+recent two-table dedup */
 static int      g_reverse_order      = 0;   /* 1 = invert expand() emission order (flips DFS priority) */
@@ -102,6 +107,21 @@ static uint64_t g_walkable_mask = 0;
  * constraint). */
 static int      g_min_walls         = 0;
 static int      g_max_committed_in_active = INT_MAX;  /* derived from g_min_walls */
+
+/* --single-axis-blocks: at most one block may be pushed along both axes
+ * (horizontal AND vertical).  Every other block must stay on a single
+ * axis.  Any backward step that would make a second block span both axes
+ * is pruned.  Default: 0 (off). */
+static int      g_single_axis_blocks = 0;
+
+/* --single-axis-strict: implies --single-axis-blocks, and additionally
+ * relaxes each block's pushable mask for the shortcut check so that a
+ * block pulled along an axis is treated as pushable *both ways* on that
+ * axis (vertical bit -> U|D, horizontal bit -> L|R).  This makes the
+ * shortcut solver strictly more permissive, so surviving puzzles admit no
+ * shortcut even when blocks can be pushed either direction on their axis.
+ * Default: 0 (off). */
+static int      g_axis_both_ways = 0;
 
 /* Upper bounds on dynamically-introduced blocks/holes (--num-blocks,
  * --num-holes).  Variants 3 and 4 in expand() will not introduce new
@@ -155,9 +175,16 @@ static int g_list_tasks  = 0;
  *                   reversing a forward block-into-hole consumption)
  */
 typedef struct { int8_t direction; int8_t variant; } SeedStep;
-static SeedStep g_seed_path[128];
+static SeedStep g_seed_path[1024];
 static int      g_seed_path_n = 0;
+static int      g_seed_path_overflow = 0;   /* set by parse_seed_path when the token cap is hit */
 static int      g_have_seed_path = 0;
+static int      g_print_seed_key = 0; /* build the --seed-path state, print its canonical key, exit */
+static uint64_t g_watch_key = 0;       /* if nonzero, report when this canonical key shows up in a rollout pool */
+static int      g_watch_key_depth = -1;/* only check pools at this depth (-1 = any) */
+static uint64_t g_watch_keys[16];      /* multi-key watch: per-gen raw multiplicity + pool presence */
+static int      g_watch_nkeys = 0;
+static int      g_beam_level_report = 0;/* beam mode: print distinct-state frontier size per depth */
 
 /* Dedup horizon: states at depth <= this value are deduped against the
  * visited table; states deeper than this skip dedup entirely (free-fly).
@@ -365,6 +392,9 @@ typedef struct {
 /* --trace-csv: dump (state_id, parent_id, features) for every accepted
  * state to FILE.  Used for offline analysis of search-graph structure. */
 static FILE     *g_trace_csv         = NULL;
+/* --bf-dump: dump (depth,branch_factor) for every shortcut_check eval to FILE.
+ * Captures the raw pool distribution the percentile band ranks on. */
+static FILE     *g_bf_dump           = NULL;
 static long long g_next_state_id     = 0;
 static long long g_current_parent_id = -1;
 
@@ -1220,8 +1250,8 @@ static void state_to_features(const BState *s, int exit_pos,
 /* Hand-tuned beam score from cached features.  Cheap.  Forward-declared
  * at top of file so beam_push_to_next can call it. */
 double beam_score_handtuned(const BState *s) {
-    int active_size = __builtin_popcount(g_active_mask);
-    int popcount    = __builtin_popcount(s->committed_empty & g_active_mask);
+    int active_size = __builtin_popcountll(g_active_mask);
+    int popcount    = __builtin_popcountll(s->committed_empty & g_active_mask);
     int room        = active_size - popcount;
     return  g_w_room    * (double)room
           - g_w_blocks  * (double)s->nblocks
@@ -1290,6 +1320,7 @@ static long long g_states_checked = 0;
 static long long g_pruned_short   = 0;
 static long long g_pruned_dedup   = 0;
 static long long g_pruned_cap     = 0;   /* states pruned by --shortcut-state-cap */
+static long long g_pruned_axis    = 0;   /* states pruned by --single-axis-blocks */
 static long long g_solver_calls   = 0;
 
 /* Cross-exit overall best (for streaming new bests as they happen). */
@@ -1335,7 +1366,16 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
     pz->num_blocks   = s->nblocks;
     for (int i = 0; i < s->nblocks; i++) {
         pz->block_pos[i]      = s->block_pos[i];
-        pz->block_pushable[i] = s->block_mask[i];
+        uint8_t m = s->block_mask[i];
+        if (g_axis_both_ways) {
+            /* Relax to both directions on each axis the block was pulled
+             * along: vertical bit -> U|D (0x5), horizontal bit -> L|R (0xA). */
+            uint8_t exp = 0;
+            if (m & 0x5u) exp |= 0x5u;
+            if (m & 0xAu) exp |= 0xAu;
+            m = exp;
+        }
+        pz->block_pushable[i] = m;
     }
     /* All tracked holes are active; the forward solver assumes initial-active. */
     pz->num_holes = s->nholes;
@@ -1367,6 +1407,7 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
 #define SHORTCUT_PROFILE_BUCKETS 96
 static long long g_solver_calls_by_depth[SHORTCUT_PROFILE_BUCKETS];
 static double    g_solver_time_by_depth[SHORTCUT_PROFILE_BUCKETS];
+static int       g_solver_profile = 0;   /* print per-depth solver-call profile; opt-in via --solver-profile */
 
 /* shortcut_check return codes, extended:
  *   >= 0 : real shortcut of that length exists (caller prunes)
@@ -1403,6 +1444,7 @@ static int shortcut_check(const BState *s) {
     } else {
         g_last_peak_heap = prof.states_popped;
     }
+    if (g_bf_dump) fprintf(g_bf_dump, "%d,%d\n", s->depth, g_last_peak_heap);
     int b = s->depth;
     if (b < 0) b = 0;
     if (b >= SHORTCUT_PROFILE_BUCKETS) b = SHORTCUT_PROFILE_BUCKETS - 1;
@@ -1525,8 +1567,9 @@ static void flush_surrogate_pending(void) {
 
         if (s->depth > g_best_depth) {
             int block_on_exit = 0;
-            for (int j = 0; j < s->nblocks; j++)
-                if (s->block_pos[j] == g_exit_pos) { block_on_exit = 1; break; }
+            if (!g_allow_block_on_exit)
+                for (int j = 0; j < s->nblocks; j++)
+                    if (s->block_pos[j] == g_exit_pos) { block_on_exit = 1; break; }
             if (!block_on_exit) {
                 g_best_depth = s->depth;
                 g_best_state = *s;
@@ -1549,7 +1592,7 @@ static void flush_surrogate_pending(void) {
                 if (s->block_pos[j] == g_exit_pos) { bx = 1; break; }
             fprintf(g_trace_csv, "%lld,%lld,%d,%d,%d,%d,%d,%d,%d\n",
                     sid, g_current_parent_id, s->depth,
-                    __builtin_popcount(s->committed_empty & g_active_mask),
+                    __builtin_popcountll(s->committed_empty & g_active_mask),
                     s->nblocks, s->nholes, s->player_pos, g_exit_pos, bx);
         }
         q_push(&ns);
@@ -1576,6 +1619,7 @@ static void flush_surrogate_pending(void) {
  * 0 on malformed input. */
 static int parse_seed_path(const char *s) {
     g_seed_path_n = 0;
+    g_seed_path_overflow = 0;
     while (*s) {
         while (*s == ' ' || *s == ',' || *s == '\t') s++;
         if (!*s) break;
@@ -1592,7 +1636,7 @@ static int parse_seed_path(const char *s) {
         /* Remap user-facing digit to internal variant number:
          *   1 -> 1 (walk-back), 2 -> 2 (push, auto 2/3), 3 -> 4 (un-consume) */
         int var = (user_action == 3) ? 4 : user_action;
-        if (g_seed_path_n >= (int)(sizeof(g_seed_path)/sizeof(*g_seed_path))) return 0;
+        if (g_seed_path_n >= (int)(sizeof(g_seed_path)/sizeof(*g_seed_path))) { g_seed_path_overflow = 1; return 0; }
         g_seed_path[g_seed_path_n].direction = (int8_t)dir;
         g_seed_path[g_seed_path_n].variant   = (int8_t)var;
         g_seed_path_n++;
@@ -1740,7 +1784,7 @@ static void try_successor(const BState *s) {
 
     /* --num-walls cap: refuse states whose committed_empty has overgrown
      * the active region beyond the limit set by --num-walls. */
-    if (__builtin_popcount(s->committed_empty & g_active_mask) > g_max_committed_in_active) {
+    if (__builtin_popcountll(s->committed_empty & g_active_mask) > g_max_committed_in_active) {
         g_pruned_short++;
         harvest_emit(s, sid, 'W', -99);
         return;
@@ -1750,6 +1794,23 @@ static void try_successor(const BState *s) {
         g_pruned_short++;
         harvest_emit(s, sid, 'X', -99);
         return;
+    }
+    /* --single-axis-blocks: at most one block may be pushed along both
+     * axes.  Directions 0=U,2=D form the vertical axis (mask 0x5); 1=R,3=L
+     * the horizontal axis (mask 0xA).  A block spans both axes when its
+     * accumulated push-mask has a bit in each.  Prune once a second such
+     * block appears. */
+    if (g_single_axis_blocks) {
+        int both = 0;
+        for (int i = 0; i < s->nblocks; i++) {
+            uint8_t m = s->block_mask[i];
+            if ((m & 0x5u) && (m & 0xAu)) both++;
+        }
+        if (both > 1) {
+            g_pruned_axis++;
+            harvest_emit(s, sid, 'M', -99);
+            return;
+        }
     }
     if (s->depth <= g_dupe_threshold) {
         uint64_t key = canonical_state_key(s);
@@ -1786,10 +1847,12 @@ static void try_successor(const BState *s) {
         return;
     }
     if (s->depth > g_best_depth) {
-        /* Reject candidates with a block sitting on the exit cell. */
+        /* Reject candidates with a block sitting on the exit cell, unless
+         * --allow-block-on-exit permits it. */
         int block_on_exit = 0;
-        for (int i = 0; i < s->nblocks; i++)
-            if (s->block_pos[i] == g_exit_pos) { block_on_exit = 1; break; }
+        if (!g_allow_block_on_exit)
+            for (int i = 0; i < s->nblocks; i++)
+                if (s->block_pos[i] == g_exit_pos) { block_on_exit = 1; break; }
         if (!block_on_exit) {
             g_best_depth = s->depth;
             g_best_state = *s;
@@ -1812,7 +1875,7 @@ static void try_successor(const BState *s) {
                 if (s->block_pos[i] == g_exit_pos) { bx = 1; break; }
             fprintf(g_trace_csv, "%lld,%lld,%d,%d,%d,%d,%d,%d,%d\n",
                     sid, g_current_parent_id, s->depth,
-                    __builtin_popcount(s->committed_empty & g_active_mask),
+                    __builtin_popcountll(s->committed_empty & g_active_mask),
                     s->nblocks, s->nholes, s->player_pos, g_exit_pos, bx);
         }
     }
@@ -1983,11 +2046,14 @@ static void print_puzzle_for_exit(const BState *s, int exit_pos) {
         int p = s->hole_pos[i];
         grid[p / g_cols][p % g_cols] = 'O';
     }
+    /* Exit drawn before blocks so a block resting on the exit (possible
+     * under --allow-block-on-exit) shadows the '$' and stays visible as its
+     * letter; the block's side annotation still identifies it. */
+    grid[exit_pos / g_cols][exit_pos % g_cols] = '$';
     for (int i = 0; i < s->nblocks; i++) {
         int p = s->block_pos[i];
         grid[p / g_cols][p % g_cols] = (char)('A' + i);
     }
-    grid[exit_pos / g_cols][exit_pos % g_cols] = '$';
     /* Player drawn last so it overlays whatever cell it stands on. */
     grid[s->player_pos / g_cols][s->player_pos % g_cols] = '@';
 
@@ -2380,6 +2446,25 @@ static int g_rollout_steps = 0;     /* K: backward steps per rollout (0 = mode o
 static int g_rollout_pop   = 100;   /* M: population / band size */
 static int g_rollout_child  = 10;   /* C: rollouts (children) spawned per member */
 static int g_rollout_pct   = 50;    /* P: percentile center of the next band (0..100) */
+/* --rollout-pct-window LO,HI,P: in percentile gens whose representative depth is
+ * in [LO,HI], use percentile P instead of g_rollout_pct. Experiment knob to test
+ * a non-monotone P schedule (record-depth levels ride high-percentile/branchy
+ * states in the early band gens; flat P=10 prunes them). lo<0 = disabled. */
+static int g_rollout_pctwin_lo  = -1;
+static int g_rollout_pctwin_hi  = -1;
+static int g_rollout_pctwin_pct = 50;
+
+/* --rollout-bf-target FILE: in percentile (non-rand) gens, instead of a
+ * percentile-centered band, select the M candidates whose branch_factor is
+ * CLOSEST to a per-depth target value loaded from FILE ("depth,bf" CSV, e.g.
+ * a record level's pathbf dump). This walks an exemplar level's actual
+ * branchiness signature (absolute bf per depth) rather than a relative
+ * percentile — auto-encoding its non-monotone profile (narrow early, branchy
+ * deep). g_bf_target indexed by depth; NULL = disabled. */
+static int32_t *g_bf_target      = NULL;   /* g_bf_target[d] = target bf at depth d */
+static int      g_bf_target_max  = -1;     /* max depth index loaded (-1 = disabled) */
+static const char *g_bf_target_path = NULL; /* deferred until after arg parse */
+static int      g_bf_smooth_w    = 0;      /* moving-average half-width (0 = raw) */
 static int g_rollout_gen1_pct = -1; /* >=0: force gen 1 to be a bf-band at this percentile
                                      *      (full M*C pool + rank) instead of random, while
                                      *      leaving gens 2+ untouched.  -1 = gen 1 obeys the
@@ -2454,6 +2539,10 @@ static int g_rollout_max_restarts = 0; /* N>0: stop after N dead-end restarts (e
                                      *    depth-per-restart can be compared across P/M (the
                                      *    fundamental knob) instead of depth-per-wall-clock
                                      *    (which just rewards whichever P spawns fastest). */
+static int g_rollout_max_gen_depth = 0; /* N>0: force a restart once the population's depth
+                                     *    reaches N.  Purely a sampling aid (cheap shallow-curve
+                                     *    collection): lets --rollout-restarts gather many
+                                     *    episodes without each one mining the expensive deep tail. */
 
 static void rollout_record(const BState *s);
 
@@ -2524,6 +2613,19 @@ static int rollout_valid_successors(const BState *cur, RollSucc *out, int max) {
     return nv;
 }
 
+/* Probe-only: count valid (non-shortcut) backward successors of *cur WITHOUT
+ * recording them (no rollout_record) so it can't perturb best-depth/dedup
+ * state.  Used by the watch-key probe to read out-degree as a heuristic
+ * signal.  Costs one forward shortcut_check per geometric successor. */
+static int count_valid_successors(const BState *cur) {
+    BState buf[16];
+    int n = enumerate_successors(cur, buf, 16);
+    int nv = 0;
+    for (int i = 0; i < n; i++)
+        if (shortcut_check(&buf[i]) == -1) nv++;
+    return nv;
+}
+
 /* DFS for ANY valid K-step backward continuation from cur.  Returns 1 and
  * writes the endpoint to *out on success. */
 static int rollout_dfs_extend(const BState *cur, int remaining, BState *out) {
@@ -2549,6 +2651,58 @@ static int cmp_rollcand_bf(const void *a, const void *b) {
 static int cmp_rollcand_key(const void *a, const void *b) {
     uint64_t x = ((const RollCand *)a)->key, y = ((const RollCand *)b)->key;
     return (x > y) - (x < y);
+}
+/* Sort by |bf - g_rollcand_bf_target| ascending: candidates whose branch_factor
+ * is closest to the per-depth target rank first. Used by --rollout-bf-target. */
+static int32_t g_rollcand_bf_target = 0;
+static int cmp_rollcand_bfdist(const void *a, const void *b) {
+    long da = labs((long)((const RollCand *)a)->bf - (long)g_rollcand_bf_target);
+    long db = labs((long)((const RollCand *)b)->bf - (long)g_rollcand_bf_target);
+    return (da > db) - (da < db);
+}
+
+/* Load a "depth,bf" CSV into g_bf_target (indexed by depth), optionally applying
+ * a ±smooth_w moving-average so the steppy/cliffy raw bf curve becomes a gentle
+ * per-depth target ramp. Returns 1 on success. */
+static int load_bf_target(const char *path, int smooth_w) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror("fopen --rollout-bf-target"); return 0; }
+    int cap = 256, maxd = -1;
+    int32_t *raw = calloc(cap, sizeof(int32_t));
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        int d; long bf;
+        if (sscanf(line, "%d,%ld", &d, &bf) != 2) continue;  /* header/blank */
+        if (d < 0) continue;
+        if (d >= cap) { int nc = cap; while (d >= nc) nc *= 2;
+                        raw = realloc(raw, (size_t)nc * sizeof(int32_t));
+                        for (int k = cap; k < nc; k++) raw[k] = 0; cap = nc; }
+        raw[d] = (int32_t)bf;
+        if (d > maxd) maxd = d;
+    }
+    fclose(f);
+    if (maxd < 0) { fprintf(stderr, "error: --rollout-bf-target %s: no depth,bf rows\n", path);
+                    free(raw); return 0; }
+    if (smooth_w > 0) {
+        int32_t *sm = malloc((size_t)(maxd + 1) * sizeof(int32_t));
+        for (int d = 0; d <= maxd; d++) {
+            long sum = 0; int n = 0;
+            for (int k = d - smooth_w; k <= d + smooth_w; k++)
+                if (k >= 0 && k <= maxd) { sum += raw[k]; n++; }
+            sm[d] = (int32_t)(sum / n);
+        }
+        free(raw); raw = sm;
+    }
+    g_bf_target = raw;
+    g_bf_target_max = maxd;
+    fprintf(stderr, "[bf-target] loaded %s: depths 0..%d, smooth=%d "
+            "(target@20=%d @40=%d @41=%d @50=%d)\n",
+            path, maxd, smooth_w,
+            maxd >= 20 ? g_bf_target[20] : -1,
+            maxd >= 40 ? g_bf_target[40] : -1,
+            maxd >= 41 ? g_bf_target[41] : -1,
+            maxd >= 50 ? g_bf_target[50] : -1);
+    return 1;
 }
 
 /* Exhaustively enumerate every distinct valid state `remaining` backward steps
@@ -2821,6 +2975,22 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
     int restarts = 0;
     while (1) {
         gen++;
+        /* --rollout-max-gen-depth: sampling aid.  Once the carried population has
+         * reached the cap depth, force a restart instead of mining the (expensive)
+         * deeper tail -- lets --rollout-restarts collect many shallow episodes fast. */
+        if (g_rollout_max_gen_depth > 0 && pop_n > 0
+            && pop[0].depth >= g_rollout_max_gen_depth) {
+            restarts++;
+            if (g_rollout_max_restarts > 0 && restarts >= g_rollout_max_restarts) {
+                if (g_rollout_trace)
+                    fprintf(stderr, "%s[rollout] restart cap %d reached -> stop\n",
+                            g_rollout_quiet ? "\r\033[K" : "", g_rollout_max_restarts);
+                break;
+            }
+            pop_n = seed_rollout_pop(&root, pop);
+            gen = 0;
+            continue;
+        }
         int pop_n_prev = pop_n;   /* members that spawn this generation */
         /* 1. every member spawns up to c_lim K-step rollouts; pool surviving endpoints.
          *    A RANDOM-selected generation discards all but M survivors at random, so the
@@ -2947,6 +3117,18 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
             g_states_checked += (long long)pop_n * c_lim; /* flow counts real solves itself */
 
         if (nc > 0) {
+            /* multi-key watch, stage 1: raw multiplicity before dedup.  Under
+             * flow this is ~0/1 (online dedup); under independent walks it is
+             * the true duplicate-generation count (path mass). */
+            int wraw[16] = {0}, wded[16] = {0}, wpool[16] = {0};
+            int wod[16];                      /* valid out-degree of each watched key (-1 absent) */
+            for (int w = 0; w < 16; w++) wod[w] = -1;
+            int pod_med = -1;                 /* sampled pool median valid out-degree */
+            size_t nc_raw = nc;
+            if (g_watch_nkeys > 0)
+                for (size_t i = 0; i < nc; i++)
+                    for (int w = 0; w < g_watch_nkeys; w++)
+                        if (cand[i].key == g_watch_keys[w]) wraw[w]++;
             /* 2. dedup by canonical key (sort by key, drop adjacent dups). */
             qsort(cand, nc, sizeof(RollCand), cmp_rollcand_key);
             size_t uniq = 0;
@@ -2989,6 +3171,69 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
                         cand[uniq++] = cand[i];
             }
 
+            /* 2c. median-bf probe: gen-agnostic (fires for rand AND band gens),
+             *     so the full depth-vs-pool-bf curve can be reconstructed.  Sorts
+             *     a scratch copy of the deduped pool's bf values; does NOT touch
+             *     cand[] ordering that selection below relies on. */
+            if (g_fill_probe && uniq > 0) {
+                static int32_t *bfscratch = NULL;
+                static size_t   bfscratch_cap = 0;
+                if (uniq > bfscratch_cap) {
+                    bfscratch = realloc(bfscratch, uniq * sizeof(int32_t));
+                    bfscratch_cap = uniq;
+                }
+                for (size_t i = 0; i < uniq; i++) bfscratch[i] = cand[i].bf;
+                qsort(bfscratch, uniq, sizeof(int32_t), cmp_int32_asc);
+                fprintf(stderr, "BFMED gen %d depth %d med %d n %zu\n",
+                        gen, cand[0].st.depth, bfscratch[uniq / 2], uniq);
+            }
+
+            /* 2d. watch-key probe: report whether a specific canonical key is
+             *     present in this gen's deduped pool.  cand[] is sorted by key
+             *     here, so binary-search it.  Used for Monte-Carlo estimating
+             *     P(gem prefix in random pool). */
+            if (g_watch_key && uniq > 0
+                && (g_watch_key_depth < 0 || cand[0].st.depth == g_watch_key_depth)) {
+                size_t lo2 = 0, hi2 = uniq, found = 0;
+                while (lo2 < hi2) {
+                    size_t mid = lo2 + (hi2 - lo2) / 2;
+                    if (cand[mid].key == g_watch_key) { found = 1; break; }
+                    if (cand[mid].key < g_watch_key) lo2 = mid + 1; else hi2 = mid;
+                }
+                fprintf(stderr, "WATCHKEY gen %d depth %d hit %d n %zu\n",
+                        gen, cand[0].st.depth, (int)found, uniq);
+            }
+
+            /* multi-key watch, stage 2: presence in the deduped (post-fill)
+             * candidate pool.  cand[] sorted by key here. */
+            if (g_watch_nkeys > 0 && uniq > 0) {
+                for (int w = 0; w < g_watch_nkeys; w++) {
+                    size_t lo2 = 0, hi2 = uniq;
+                    while (lo2 < hi2) {
+                        size_t mid = lo2 + (hi2 - lo2) / 2;
+                        if (cand[mid].key == g_watch_keys[w]) {
+                            wded[w] = 1;
+                            wod[w] = count_valid_successors(&cand[mid].st);
+                            break;
+                        }
+                        if (cand[mid].key < g_watch_keys[w]) lo2 = mid + 1; else hi2 = mid;
+                    }
+                }
+                /* pool out-degree median over a capped random sample */
+                int sample[64], sn = 0;
+                int want = (uniq < 64) ? (int)uniq : 64;
+                for (int s = 0; s < want; s++) {
+                    size_t idx = (size_t)(rand() % (int)uniq);
+                    sample[sn++] = count_valid_successors(&cand[idx].st);
+                }
+                for (int a = 1; a < sn; a++) {       /* insertion sort (sn<=64) */
+                    int v = sample[a], b = a - 1;
+                    while (b >= 0 && sample[b] > v) { sample[b+1] = sample[b]; b--; }
+                    sample[b+1] = v;
+                }
+                if (sn > 0) pod_med = sample[sn / 2];
+            }
+
             /* 3. select M survivors.  For the first g_rollout_rand_gens
              *    generations, take a PURE RANDOM subset of the unique pool
              *    (inject diversity where the most consequential cuts happen);
@@ -3004,9 +3249,27 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
                     RollCand tmp = cand[i]; cand[i] = cand[j]; cand[j] = tmp;
                 }
                 mode = "RANDOM";
+            } else if (g_bf_target_max >= 0) {
+                /* bf-target: take the M candidates whose branch_factor is closest
+                 * to the exemplar level's value at this generation's depth.
+                 * All candidates in a generation share one depth (clustered),
+                 * so cand[0].st.depth is the representative. */
+                int d = cand[0].st.depth;
+                if (d < 0) d = 0;
+                g_rollcand_bf_target = (d <= g_bf_target_max)
+                                       ? g_bf_target[d]
+                                       : g_bf_target[g_bf_target_max];  /* clamp */
+                qsort(cand, uniq, sizeof(RollCand), cmp_rollcand_bfdist);
+                lo = 0;  /* M closest-to-target are now first */
+                mode = "bftarget";
             } else {
                 qsort(cand, uniq, sizeof(RollCand), cmp_rollcand_bf);
                 int pct = gen1_band ? g_rollout_gen1_pct : g_rollout_pct;
+                if (!gen1_band && g_rollout_pctwin_lo >= 0) {
+                    int gd = cand[0].st.depth;
+                    if (gd >= g_rollout_pctwin_lo && gd <= g_rollout_pctwin_hi)
+                        pct = g_rollout_pctwin_pct;
+                }
                 int center = (int)(((long long)pct * ((long long)uniq - 1)) / 100);
                 lo = center - M / 2;
                 if (lo + M > (int)uniq) lo = (int)uniq - M;
@@ -3017,6 +3280,19 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
             for (int i = 0; i < take; i++) {
                 pop[i] = cand[lo + i].st;
                 rollout_record(&pop[i]);
+            }
+            /* multi-key watch, stage 3: presence in the selected pool, then
+             * one parseable line per gen. */
+            if (g_watch_nkeys > 0) {
+                for (int i = 0; i < take; i++)
+                    for (int w = 0; w < g_watch_nkeys; w++)
+                        if (cand[lo + i].key == g_watch_keys[w]) wpool[w] = 1;
+                fprintf(stderr, "WKEYS gen %d depth %d nc %zu uniq %zu podmed %d",
+                        gen, pop[0].depth, nc_raw, uniq, pod_med);
+                for (int w = 0; w < g_watch_nkeys; w++)
+                    fprintf(stderr, " k%d raw %d ded %d pool %d od %d",
+                            w, wraw[w], wded[w], wpool[w], wod[w]);
+                fprintf(stderr, "\n");
             }
             /* PROBE: in percentile gens cand[] is bf-sorted ascending here, so we
              * can read the pool's bf quantiles directly and report where the band
@@ -3055,9 +3331,9 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
         } else {
             /* 4. nothing survived — DFS-rescue from some member.  If that also
              *    fails the trajectory is dead: reseed from the root and keep
-             *    going so the time budget is actually spent (global best
-             *    persists across restarts).  A budget-less run has nothing to
-             *    fill, so it stops instead of restarting forever. */
+             *    going (global best persists across restarts).  Restarting is
+             *    bounded by --time and/or --rollout-restarts; with neither it
+             *    loops until interrupted. */
             BState rescued;
             int rescued_any = 0;
             for (int m = 0; m < pop_n; m++) {
@@ -3075,13 +3351,6 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
                             gen, (size_t)pop_n_prev * c_lim, g_rollout_quiet ? "\033[K" : "\n");
                     if (g_rollout_quiet) fflush(stderr);
                 }
-            } else if (unlimited && g_rollout_max_restarts <= 0) {
-                if (g_rollout_trace)
-                    fprintf(stderr, "%sgen %3d  DEAD-END at depth %d  stop (no budget)\n",
-                            g_rollout_quiet ? "\r\033[K" : "",
-                            gen, (gen - 1) * g_rollout_steps);
-                no_continuation = 1;
-                break;
             } else {
                 restarts++;
                 if (g_rollout_trace) {
@@ -3151,6 +3420,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_pruned_short   = 0;
     g_pruned_dedup   = 0;
     g_pruned_cap     = 0;
+    g_pruned_axis    = 0;
     g_solver_calls   = 0;
     g_dedup_full     = 0;
     g_skipped_dedup  = 0;
@@ -3168,7 +3438,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         }
         fprintf(stderr, "[seed-path] seed built: depth=%d player=%d nblocks=%d nholes=%d committed_pop=%d\n",
                 seed.depth, seed.player_pos, seed.nblocks, seed.nholes,
-                __builtin_popcount(seed.committed_empty & g_active_mask));
+                __builtin_popcountll(seed.committed_empty & g_active_mask));
         g_best_state = seed;
         try_successor(&seed);
     } else if (g_task_seeds && g_task_seed_count > 0) {
@@ -3204,7 +3474,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
             if (g_trace_csv) {
                 fprintf(g_trace_csv, "%lld,-1,%d,%d,%d,%d,%d,%d,0\n",
                         sid, init.depth,
-                        __builtin_popcount(init.committed_empty & g_active_mask),
+                        __builtin_popcountll(init.committed_empty & g_active_mask),
                         init.nblocks, init.nholes, init.player_pos, g_exit_pos);
             }
             /* Roots use parent_id=-1 — temporarily reset g_current_parent_id
@@ -3257,7 +3527,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                         /* push-off-exit seed: the block IS at exit_pos. */
                         fprintf(g_trace_csv, "%lld,-1,%d,%d,%d,%d,%d,%d,1\n",
                                 sid, seed.depth,
-                                __builtin_popcount(seed.committed_empty & g_active_mask),
+                                __builtin_popcountll(seed.committed_empty & g_active_mask),
                                 seed.nblocks, seed.nholes, seed.player_pos, g_exit_pos);
                     }
                     long long save_parent = g_current_parent_id;
@@ -3298,6 +3568,10 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         g_beam_next_n   = 0;
 
         while (g_beam_curr_n > 0) {
+            if (g_beam_level_report)
+                fprintf(stderr, "BEAMLVL depth %d distinct %d%s\n",
+                        g_beam_curr[0].depth, g_beam_curr_n,
+                        (g_beam_curr_n >= g_beam_width) ? " (CLIPPED)" : "");
             g_beam_next_n = 0;
             for (int i = 0; i < g_beam_curr_n; i++) {
                 if (g_trace_csv || HARVEST_ACTIVE) g_current_parent_id = g_beam_curr[i].state_id;
@@ -3421,6 +3695,7 @@ static void print_usage(const char *prog) {
         "  --exitloc c,c,...     iterate the listed exit cells (comma-separated).  Overrides the\n"
         "                          canonical default; --exit takes priority if both are given.\n"
         "  --allow-exit-transit  allow blocks to be pushed onto the exit and back off during play\n"
+        "  --allow-block-on-exit permit the puzzle to start with a block on the exit (implies transit)\n"
         "                          (block still cannot start at exit at puzzle setup).  Default: off.\n"
         "  --reverse             invert variant priority within each direction.  In DFS (LIFO),\n"
         "                          default order explores un-consume (4) then new-block / push-\n"
@@ -3472,6 +3747,8 @@ static void print_usage(const char *prog) {
         "                          (else states_popped); smaller ranks first, so P picks how deep into\n"
         "                          the branchiness distribution the band sits.  M=1 is single-trajectory.\n"
         "                          Defaults: K=10, M=100, C=10, P=50 (e.g. --rollout 10,100,10,50).\n"
+        "  --solver-profile      print the per-depth solver-call profile table at the end of the\n"
+        "                          run.  Default: off (the table can be ~90 rows).\n"
         "  --rollout-trace       log per-generation selectivity to stderr (depth, spawned, survived,\n"
         "                          unique-after-dedup, kept, and whether the band actually filters or\n"
         "                          keeps-all).  Diagnostic for tuning M/C/P.  Default: off.\n"
@@ -3511,6 +3788,9 @@ static void print_usage(const char *prog) {
         "                          The search prevents these cells from being walked on or used\n"
         "                          for blocks/holes.  Default: none.\n"
         "  --num-walls N         require at least N cells of the active region to remain walls\n"
+        "  --single-axis-blocks  allow at most one block pushed along both axes; others single-axis\n"
+        "  --single-axis-strict  implies --single-axis-blocks; shortcut check treats each block as\n"
+        "                        pushable both ways on any axis it was pulled along\n"
         "                          in the reported puzzle (any cells, the search picks).  Counted\n"
         "                          as TOTAL walls including any --fixedwalls.  Default: 0.\n"
         "  --num-blocks N        cap the number of blocks introduced by the search to at most N.\n"
@@ -3646,6 +3926,9 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--allow-exit-transit") == 0) {
             g_allow_exit_transit = 1;
+        } else if (strcmp(argv[i], "--allow-block-on-exit") == 0) {
+            g_allow_block_on_exit = 1;
+            g_allow_exit_transit  = 1;   /* required to generate block-on-exit states */
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse_order = 1;
         } else if (strcmp(argv[i], "--shortcut-state-cap") == 0) {
@@ -3680,6 +3963,8 @@ int main(int argc, char **argv) {
             g_rollout_pop   = mm;
             g_rollout_child = cc;
             g_rollout_pct   = pp;
+        } else if (strcmp(argv[i], "--solver-profile") == 0) {
+            g_solver_profile = 1;
         } else if (strcmp(argv[i], "--rollout-trace") == 0) {
             g_rollout_trace = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) {
@@ -3717,6 +4002,10 @@ int main(int argc, char **argv) {
             if (++i >= argc) { fprintf(stderr, "error: --rollout-restarts requires N\n"); return 1; }
             g_rollout_max_restarts = atoi(argv[i]);
             if (g_rollout_max_restarts < 0) { fprintf(stderr, "error: --rollout-restarts N must be >= 0\n"); return 1; }
+        } else if (strcmp(argv[i], "--rollout-max-gen-depth") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-max-gen-depth requires N\n"); return 1; }
+            g_rollout_max_gen_depth = atoi(argv[i]);
+            if (g_rollout_max_gen_depth < 0) { fprintf(stderr, "error: --rollout-max-gen-depth N must be >= 0\n"); return 1; }
         } else if (strcmp(argv[i], "--rollout-rand-gens") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --rollout-rand-gens requires N\n"); return 1; }
             g_rollout_rand_gens = atoi(argv[i]);
@@ -3766,15 +4055,55 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--seed-path") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --seed-path requires \"D1V1,D2V2,...\"\n"); return 1; }
             if (!parse_seed_path(argv[i])) {
-                fprintf(stderr, "error: --seed-path must be tokens like U2,R3,L1 (dir letter U/R/D/L + action digit 1=walk, 2=push, 3=consume)\n");
+                if (g_seed_path_overflow)
+                    fprintf(stderr, "error: --seed-path too long (max %d tokens)\n",
+                            (int)(sizeof(g_seed_path)/sizeof(*g_seed_path)));
+                else
+                    fprintf(stderr, "error: --seed-path must be tokens like U2,R3,L1 (dir letter U/R/D/L + action digit 1=walk, 2=push, 3=consume)\n");
                 return 1;
             }
             g_have_seed_path = 1;
+        } else if (strcmp(argv[i], "--print-seed-key") == 0) {
+            g_print_seed_key = 1;
+        } else if (strcmp(argv[i], "--beam-level-report") == 0) {
+            g_beam_level_report = 1;
+        } else if (strcmp(argv[i], "--rollout-watch-key") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-watch-key requires KEY[,DEPTH]\n"); return 1; }
+            g_watch_key = strtoull(argv[i], NULL, 10);
+            const char *comma = strchr(argv[i], ',');
+            g_watch_key_depth = comma ? atoi(comma + 1) : -1;
+        } else if (strcmp(argv[i], "--rollout-watch-keys") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-watch-keys requires K1,K2,...\n"); return 1; }
+            const char *p = argv[i];
+            while (*p && g_watch_nkeys < 16) {
+                g_watch_keys[g_watch_nkeys++] = strtoull(p, NULL, 10);
+                const char *c = strchr(p, ',');
+                if (!c) break;
+                p = c + 1;
+            }
         } else if (strcmp(argv[i], "--trace-csv") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --trace-csv requires FILE\n"); return 1; }
             g_trace_csv = fopen(argv[i], "w");
             if (!g_trace_csv) { perror("fopen --trace-csv"); return 1; }
             fprintf(g_trace_csv, "id,parent_id,depth,popcount,nblocks,nholes,player_pos,exit_pos,block_on_exit\n");
+        } else if (strcmp(argv[i], "--bf-dump") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --bf-dump requires FILE\n"); return 1; }
+            g_bf_dump = fopen(argv[i], "w");
+            if (!g_bf_dump) { perror("fopen --bf-dump"); return 1; }
+            fprintf(g_bf_dump, "depth,branch_factor\n");
+        } else if (strcmp(argv[i], "--rollout-pct-window") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-pct-window requires LO,HI,P\n"); return 1; }
+            if (sscanf(argv[i], "%d,%d,%d", &g_rollout_pctwin_lo,
+                       &g_rollout_pctwin_hi, &g_rollout_pctwin_pct) != 3) {
+                fprintf(stderr, "error: --rollout-pct-window expects LO,HI,P\n"); return 1;
+            }
+        } else if (strcmp(argv[i], "--rollout-bf-target") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-bf-target requires FILE\n"); return 1; }
+            g_bf_target_path = argv[i];   /* loaded after arg parse (smooth may follow) */
+        } else if (strcmp(argv[i], "--rollout-bf-smooth") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --rollout-bf-smooth requires W\n"); return 1; }
+            g_bf_smooth_w = atoi(argv[i]);
+            if (g_bf_smooth_w < 0) { fprintf(stderr, "error: --rollout-bf-smooth W must be >= 0\n"); return 1; }
         } else if (strcmp(argv[i], "--harvest") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --harvest requires FILE\n"); return 1; }
             if (!harvest_open(argv[i], argc, argv)) return 1;
@@ -3880,6 +4209,11 @@ int main(int argc, char **argv) {
             int n = atoi(argv[i]);
             if (n < 0) { fprintf(stderr, "error: --num-walls must be >= 0\n"); return 1; }
             g_min_walls = n;
+        } else if (strcmp(argv[i], "--single-axis-blocks") == 0) {
+            g_single_axis_blocks = 1;
+        } else if (strcmp(argv[i], "--single-axis-strict") == 0) {
+            g_single_axis_blocks = 1;
+            g_axis_both_ways     = 1;
         } else if (strcmp(argv[i], "--max-depth") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --max-depth requires N\n"); return 1; }
             int n = atoi(argv[i]);
@@ -3956,6 +4290,10 @@ int main(int argc, char **argv) {
             print_usage(argv[0]); return 1;
         }
     }
+
+    /* Load the bf-target curve now that --rollout-bf-smooth has also been seen. */
+    if (g_bf_target_path && !load_bf_target(g_bf_target_path, g_bf_smooth_w))
+        return 1;
 
     /* Configure the solver for the requested grid.  This populates the
      * solver's g_rows / g_cols / g_ncells / g_adj / g_all_cells globals,
@@ -4091,7 +4429,7 @@ int main(int argc, char **argv) {
     /* Translate --num-walls into a popcount cap on committed_empty
      * within the active region. */
     {
-        int active_size = __builtin_popcount(g_active_mask);
+        int active_size = __builtin_popcountll(g_active_mask);
         if (g_min_walls >= active_size) {
             fprintf(stderr, "error: --num-walls (%d) >= active region size (%d) leaves no room for the puzzle\n",
                     g_min_walls, active_size);
@@ -4185,6 +4523,21 @@ int main(int argc, char **argv) {
      * just have N workers explore the same subtree redundantly.  Emit
      * a single synthetic task so the wrapper falls through to the
      * single-worker path. */
+    if (g_print_seed_key) {
+        if (!g_have_seed_path) {
+            fprintf(stderr, "error: --print-seed-key requires --seed-path\n");
+            return 1;
+        }
+        BState seed;
+        if (!build_seed_path_seed(&seed)) return 1;
+        printf("depth %d canonical_key %llu state_key %llu\n",
+               seed.depth,
+               (unsigned long long)canonical_state_key(&seed),
+               (unsigned long long)state_key(&seed));
+        free(g_visited); free(g_queue);
+        free(g_shallow); free(g_recent);
+        return 0;
+    }
     if (g_list_tasks && g_have_seed_path) {
         printf("seed-path: %d step%s\ntotal: 1\n",
                g_seed_path_n, g_seed_path_n == 1 ? "" : "s");
@@ -4297,6 +4650,8 @@ int main(int argc, char **argv) {
             printf(", free-fly %lld", g_skipped_dedup);
         if (g_shortcut_state_cap > 0)
             printf(", cap %lld", g_pruned_cap);
+        if (g_single_axis_blocks)
+            printf(", axis %lld", g_pruned_axis);
         printf(")\n");
         printf("  solver calls:   %lld\n", g_solver_calls);
         if (g_two_tables) {
@@ -4358,7 +4713,7 @@ int main(int argc, char **argv) {
             total_time  += g_solver_time_by_depth[b];
             if (g_solver_calls_by_depth[b] > 0) max_seen = b;
         }
-        if (total_calls > 0) {
+        if (total_calls > 0 && g_solver_profile) {
             printf("\nSolver-call profile (by state depth):\n");
             printf("  depth   calls       time(s)   %%calls  %%time   cum%%time\n");
             double cum_time = 0.0;
