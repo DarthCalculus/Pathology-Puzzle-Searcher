@@ -72,8 +72,9 @@ static int      g_allow_exit_transit = 0;   /* 1 = block may transit through exi
  * since a block can only land on the exit via a transit backstep at the
  * root.  Default: 0 (such candidates are rejected as best states). */
 static int      g_allow_block_on_exit = 0;
+static int      g_mandatory_holes    = 0;   /* 1 = enable the solver's mandatory-hole prune */
 static int      g_holeless           = 0;   /* 1 = forbid all holes (no variant 4) */
-static int      g_two_tables         = 0;   /* 1 = use shallow+recent two-table dedup */
+static int      g_two_tables         = 1;   /* 1 = use shallow+recent two-table dedup (default); --no-two-tables to disable */
 static int      g_reverse_order      = 0;   /* 1 = invert expand() emission order (flips DFS priority) */
 static int      g_shortcut_state_cap = 0;   /* >0 = treat shortcut_check as a prune when states_popped exceeds N */
 static int      g_beam_score_branching = 0; /* 1 = beam_score = -branch_factor (branching-only ranking) */
@@ -387,6 +388,7 @@ typedef struct {
     int8_t   score_valid;                /* beam mode: 1 iff score_cached has been populated */
     float    score_cached;               /* beam mode: cached beam_score value (NN or hand-tuned) */
     int32_t  branch_factor;              /* peak heap sz of the forward shortcut_check (0 if not run) */
+    uint8_t  wh;                         /* anti-wiggle walk-history, 5 bits; 0 = no walks since last push */
 } BState;
 
 /* --trace-csv: dump (state_id, parent_id, features) for every accepted
@@ -1885,6 +1887,26 @@ static void try_successor(const BState *s) {
 /* -------------------------------------------------------------------------
  * Successor enumeration from one state.
  * ------------------------------------------------------------------------- */
+/* Anti-wiggle walk history, packed in 5 bits (empty = 0 so zero-initialised
+ * seeds are automatically "no walks since last push"):
+ *   0x00              : 0 walks           (no constraint)
+ *   0x04 | d2         : 1 walk, dir d2                       (0x04..0x07)
+ *   0x10 | d1<<2 | d2 : >=2 walks, older d1, newer d2        (0x10..0x1F)
+ * A consecutive walk triple d1,d2,-d1 (net d2) or reversal d2,-d2 is always
+ * beaten by a single step, hence never in an optimal solution.  So the next
+ * walk may not be the reverse (dir^2) of either of the last two walks.  Any
+ * push resets the run to empty (0).  Directions: 0=U 1=R 2=D 3=L, opp = d^2. */
+static inline uint8_t wh_forbidden(uint8_t h) {
+    if (h == 0)    return 0;
+    if (h & 0x10u) return (uint8_t)((1u << (((h >> 2) & 3) ^ 2))
+                                  | (1u << (( h        & 3) ^ 2)));
+    return (uint8_t)(1u << ((h & 3) ^ 2));
+}
+static inline uint8_t wh_after_walk(uint8_t h, int w) {
+    return (h == 0) ? (uint8_t)(0x04u | w)
+                    : (uint8_t)(0x10u | ((h & 3) << 2) | w);
+}
+
 static void expand(const BState *s) {
     int P = s->player_pos;
     /* Fast occupancy lookup for the current state's blocks and active holes. */
@@ -1927,13 +1949,19 @@ static void expand(const BState *s) {
         BState d_bufs[4];
         int d_n = 0;
 
-        /* Successor 1: walk-back. */
+        /* Successor 1: walk-back.  The player moves P->C, i.e. grid dir D^2.
+         * Anti-wiggle: skip if this walk reverses one of the last two
+         * consecutive walks (provably suboptimal, subtree all over-deep). */
         {
-            BState ns = *s;
-            ns.player_pos      = (int8_t)C;
-            ns.committed_empty = new_E;
-            ns.depth           = s->depth + 1;
-            d_bufs[d_n++] = ns;
+            int w = D ^ 2;
+            if (!(wh_forbidden(s->wh) & (1u << w))) {
+                BState ns = *s;
+                ns.player_pos      = (int8_t)C;
+                ns.committed_empty = new_E;
+                ns.depth           = s->depth + 1;
+                ns.wh              = wh_after_walk(s->wh, w);
+                d_bufs[d_n++] = ns;
+            }
         }
 
         /* Strict-rule fast-out: when transit is disallowed, no push variant
@@ -1955,6 +1983,7 @@ static void expand(const BState *s) {
                     ns.player_pos      = (int8_t)C;
                     ns.committed_empty = new_E;
                     ns.depth           = s->depth + 1;
+                    ns.wh              = 0;   /* push resets the walk run */
                     d_bufs[d_n++] = ns;
                 } else if (hole_occ & (1ULL <<B)) {
                     /* B has an active hole — variant 3 (no consume) is impossible
@@ -1983,6 +2012,7 @@ static void expand(const BState *s) {
                         ns.player_pos      = (int8_t)C;
                         ns.committed_empty = new_E | (1ULL <<B);
                         ns.depth           = s->depth + 1;
+                        ns.wh              = 0;   /* push resets the walk run */
                         d_bufs[d_n++] = ns;
                     }
 
@@ -2009,6 +2039,7 @@ static void expand(const BState *s) {
                         ns.player_pos      = (int8_t)C;
                         ns.committed_empty = new_E | (1ULL <<B);
                         ns.depth           = s->depth + 1;
+                        ns.wh              = 0;   /* push resets the walk run */
                         d_bufs[d_n++] = ns;
                     }
                 }
@@ -3697,6 +3728,9 @@ static void print_usage(const char *prog) {
         "  --allow-exit-transit  allow blocks to be pushed onto the exit and back off during play\n"
         "  --allow-block-on-exit permit the puzzle to start with a block on the exit (implies transit)\n"
         "                          (block still cannot start at exit at puzzle setup).  Default: off.\n"
+        "  --mandatory-holes     enable the solver's mandatory-hole prune (sound speedup; off by\n"
+        "                          default).  Big win on dense/deep walled multi-hole boards,\n"
+        "                          marginal on sparse ones.\n"
         "  --reverse             invert variant priority within each direction.  In DFS (LIFO),\n"
         "                          default order explores un-consume (4) then new-block / push-\n"
         "                          existing (3 / 2) then walk-back (1); with --reverse, walk-back\n"
@@ -3779,7 +3813,9 @@ static void print_usage(const char *prog) {
         "                          the lowest-depth states (evicts deep ones when full) and a\n"
         "                          RECENT table keeps recently-hit states (evicts old ones when\n"
         "                          full).  No more dedup overflow at the cost of some redundant\n"
-        "                          subtree exploration.  Default: off (single table).\n"
+        "                          subtree exploration.  Default: ON.\n"
+        "  --no-two-tables       use the single fixed-size dedup table instead (fills and then\n"
+        "                          silently ends the pass non-exhaustive).  Mainly for A/B.\n"
         "  --dupe-threshold N    only dedup states at depth <= N; deeper states free-fly without\n"
         "                          dedup tracking.  Trades wall-clock for memory headroom on long\n"
         "                          runs that would otherwise hit the dedup table cap.  Default: no\n"
@@ -3929,6 +3965,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--allow-block-on-exit") == 0) {
             g_allow_block_on_exit = 1;
             g_allow_exit_transit  = 1;   /* required to generate block-on-exit states */
+        } else if (strcmp(argv[i], "--mandatory-holes") == 0) {
+            g_mandatory_holes = 1;
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse_order = 1;
         } else if (strcmp(argv[i], "--shortcut-state-cap") == 0) {
@@ -4198,6 +4236,8 @@ int main(int argc, char **argv) {
             g_holeless = 1;
         } else if (strcmp(argv[i], "--two-tables") == 0) {
             g_two_tables = 1;
+        } else if (strcmp(argv[i], "--no-two-tables") == 0) {
+            g_two_tables = 0;
         } else if (strcmp(argv[i], "--list-tasks") == 0) {
             g_list_tasks = 1;
         } else if (strcmp(argv[i], "--task-id") == 0) {
@@ -4385,6 +4425,7 @@ int main(int argc, char **argv) {
             g_active_mask |= 1ULL << (r * g_cols + c);
 
     sokoban_init();
+    sokoban_set_hole_prune(g_mandatory_holes);
 
     /* Validate fixed holes against the active region. */
     for (int i = 0; i < g_fixed_nholes; i++) {

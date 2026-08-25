@@ -120,3 +120,17 @@ void sokoban_init(void);   /* call once before spawning threads */
  * Not thread-safe; call from a single thread before parallel solves.
  */
 void sokoban_set_heap_cap(int n);
+
+/*
+ * sokoban_set_hole_prune(on)
+ *
+ * Enable (on != 0) or disable (the default) the mandatory-hole prune.  A hole
+ * is "mandatory" if the player cannot reach the exit while it stays open, so
+ * any solution must fill it with a block.  During the solve, a successor is
+ * dropped when fewer blocks can still ever reach an unfilled mandatory hole
+ * than there are such holes — a sound relaxation (it can only under-report
+ * dead states), so the optimal solve length is unchanged; it is purely a
+ * speedup.  Exposed as a toggle so the effect can be A/B benchmarked without
+ * rebuilding.  Not thread-safe; set before parallel solves.
+ */
+void sokoban_set_hole_prune(int on);

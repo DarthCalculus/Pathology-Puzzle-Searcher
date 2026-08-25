@@ -5,6 +5,83 @@
 #include <stdio.h>
 #include <limits.h>
 
+#ifdef FWPROF
+/* Forward-solver phase profiler (compile with -DFWPROF for a throwaway
+ * profiling binary; zero cost otherwise).  Times the per-pop phases of
+ * solve_push64_cutoff and dumps a cumulative + delta breakdown to stderr
+ * every FWP_DUMP_EVERY solve calls, so a steady-state window can be read. */
+#include <mach/mach_time.h>
+enum { FWP_SETUP = 0, FWP_UNPACK, FWP_PASS1, FWP_WALK, FWP_PASS2, FWP_NPH };
+static const char *g_fwp_names[FWP_NPH] = {
+    "setup", "unpack", "pass1(cand+mand)", "walk_dists", "pass2(enqueue)" };
+static uint64_t g_fwp[FWP_NPH];       /* accumulated mach ticks per phase   */
+static uint64_t g_fwp_prev[FWP_NPH];  /* snapshot at last dump              */
+static uint64_t g_fwp_solves;
+/* Deadlock-computation sub-timers (overlap the buckets above):
+ *  g_msetup_ticks  = time inside mand_setup()  (subset of FWP_SETUP)
+ *  g_mdead_ticks   = time inside mand_dead()   (subset of FWP_PASS1)
+ * Both are measured with a mach_absolute_time() PAIR around the call, so the
+ * per-call timer overhead is charged to them; fwp_dump() calibrates that
+ * overhead and reports an overhead-corrected figure for the high-frequency
+ * mand_dead timer. */
+static uint64_t g_msetup_ticks;
+static uint64_t g_mctx_ticks;    /* per-pop mand_pop_ctx precompute (subset of FWP_UNPACK) */
+static uint64_t g_mdead_ticks;
+static uint64_t g_mdead_calls;
+#define FWP_DUMP_EVERY 2000000ULL
+#define FWP_DECL()   uint64_t _tp = mach_absolute_time()
+#define FWP_LAP(idx) do { uint64_t _n = mach_absolute_time(); \
+                          g_fwp[idx] += _n - _tp; _tp = _n; } while (0)
+/* Min cost of a back-to-back mach_absolute_time() pair, in ticks. */
+static uint64_t fwp_timer_overhead(void) {
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < 200000; i++) {
+        uint64_t a = mach_absolute_time();
+        uint64_t b = mach_absolute_time();
+        if (b - a < best) best = b - a;
+    }
+    return best;
+}
+static void fwp_dump(void) {
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    uint64_t tot = 0, dtot = 0;
+    for (int i = 0; i < FWP_NPH; i++) { tot += g_fwp[i]; dtot += g_fwp[i] - g_fwp_prev[i]; }
+    if (tot == 0) return;
+    fprintf(stderr, "[FWPROF] solves=%llu  phase breakdown (cumulative %% | delta %%):\n",
+            (unsigned long long)g_fwp_solves);
+    for (int i = 0; i < FWP_NPH; i++) {
+        uint64_t d = g_fwp[i] - g_fwp_prev[i];
+        double cms = (double)g_fwp[i] * tb.numer / tb.denom / 1e6;
+        fprintf(stderr, "    %-18s %5.1f%% | %5.1f%%   (%.0f ms cum)\n",
+                g_fwp_names[i], tot ? 100.0 * g_fwp[i] / tot : 0.0,
+                dtot ? 100.0 * d / dtot : 0.0, cms);
+        g_fwp_prev[i] = g_fwp[i];
+    }
+    /* Deadlock-computation summary (overlapping subsets of the buckets). */
+    uint64_t ovh   = fwp_timer_overhead();
+    uint64_t raw_d = g_mdead_ticks;
+    uint64_t corr  = ovh * g_mdead_calls;                 /* timer overhead in the mdead pair */
+    uint64_t net_d = raw_d > corr ? raw_d - corr : 0;     /* overhead-corrected mand_dead time */
+    double ms = 1.0 * tb.numer / tb.denom / 1e6;
+    fprintf(stderr, "  -- deadlock computation (of %.0f ms solver total) --\n",
+            (double)tot * ms);
+    fprintf(stderr, "    mand_setup        %5.1f%%   (%.0f ms cum)\n",
+            100.0 * g_msetup_ticks / tot, (double)g_msetup_ticks * ms);
+    fprintf(stderr, "    mand_pop_ctx      %5.1f%%   (%.0f ms cum, per-pop precompute)\n",
+            100.0 * g_mctx_ticks / tot, (double)g_mctx_ticks * ms);
+    fprintf(stderr, "    mand_dead raw     %5.1f%%   (%.0f ms cum, %llu calls)\n",
+            100.0 * raw_d / tot, (double)raw_d * ms, (unsigned long long)g_mdead_calls);
+    fprintf(stderr, "    mand_dead corr'd  %5.1f%%   (%.0f ms, minus %.0f ms timer overhead)\n",
+            100.0 * net_d / tot, (double)net_d * ms, (double)corr * ms);
+    fprintf(stderr, "    DEADLOCK TOTAL    %5.1f%%   (setup + ctx + corrected mand_dead)\n",
+            100.0 * (g_msetup_ticks + g_mctx_ticks + net_d) / tot);
+    fflush(stderr);
+}
+#else
+#define FWP_DECL()   ((void)0)
+#define FWP_LAP(idx) ((void)0)
+#endif
+
 /* Runtime grid dimensions (defined here, declared extern in the header). */
 int     g_rows           = 0;
 int     g_cols           = 0;
@@ -574,6 +651,224 @@ static inline uint64_t nbr_mask(uint64_t m) {
 }
 
 /* ========================================================================
+ * MANDATORY-HOLE PRUNE  (ported from ~/solver.c "solver6")
+ *
+ * A hole is MANDATORY if the player cannot reach the exit while it stays
+ * open (flood from player over walls+this-hole only; blocks and all other
+ * holes treated as passable — the most permissive test, so it can only
+ * under-report, never falsely claim a hole mandatory).  Such a hole must
+ * be filled by a block in any solution.  A successor is provably dead when
+ * the number of blocks that could still ever reach an unfilled mandatory
+ * hole is smaller than the number of such holes.
+ *
+ * "Block can still reach hole" uses the relaxed push closure obstructed by
+ * walls only (block_closure), a superset of the cells the block can ever
+ * occupy.  Precomputed per (mask, cell) into closure_tab so the per-state
+ * test is a table lookup and an AND.  Both are relaxations in the direction
+ * that only drops prunes, so the reported optimum is exact.
+ *
+ * State lives thread-local: setup runs once per solve call (cheap — only
+ * builds closure_tab when at least one mandatory hole exists).
+ * ======================================================================== */
+
+static int g_prune_mand = 0;   /* runtime toggle (see sokoban_set_hole_prune); default OFF */
+
+void sokoban_set_hole_prune(int on) { g_prune_mand = on ? 1 : 0; }
+
+static _Thread_local uint32_t g_mand_hmask;                    /* hole-idx mask of mandatory holes */
+static _Thread_local uint64_t g_closure_tab[16][MAX_NCELLS];  /* [mask][cell] relaxed push closure */
+/* Cache validity for g_closure_tab.  The table depends only on the wall set
+ * (block positions never affect it), so it can be reused across the many
+ * consecutive backward-search solves whose walls are unchanged.  g_closure_walls
+ * is the wall set the table was built for; g_closure_masks is the set of block
+ * push-masks currently populated for that wall set.  A NULL grid (walls all-ones
+ * sentinel is impossible since walls come from g_active_mask) can't collide because
+ * we also gate on the grid dims via sokoban_set_grid resetting the cache. */
+static _Thread_local uint64_t g_closure_walls;
+static _Thread_local uint16_t g_closure_masks;
+static _Thread_local int      g_closure_valid;   /* 0 until first build this grid */
+static _Thread_local int      g_closure_ncells;  /* grid the cache was built for */
+
+/* Reachable-cell flood from `start`, treating `blocked` cells as impassable. */
+static uint64_t reach_flood(uint64_t blocked, int start) {
+    uint64_t freem = ~blocked & g_all_cells;
+    if (!((freem >> start) & 1)) return 0;
+    uint64_t comp = 1ULL << start;
+    for (;;) {
+        uint64_t nx = (comp | nbr_mask(comp)) & freem;
+        if (nx == comp) return comp;
+        comp = nx;
+    }
+}
+
+/* Relaxed push closure of a block at `start` with push-mask `mask`: the set
+ * of cells it could ever occupy if only walls obstructed (other blocks
+ * transparent).  A push in direction d needs an open stand cell behind and
+ * an open landing cell ahead. */
+static uint64_t block_closure(int start, int mask, uint64_t walls) {
+    uint64_t set = 1ULL << start;
+    for (;;) {
+        uint64_t add = 0;
+        for (uint64_t t = set; t; t &= t - 1) {
+            int c = __builtin_ctzll(t);
+            for (int d = 0; d < 4; d++) {
+                if (!(mask & (1 << d))) continue;
+                int stand = g_adj[c][d ^ 2];   /* player stands opposite the push */
+                if (stand < 0 || (walls & (1ULL << stand))) continue;
+                int lnd = g_adj[c][d];          /* block lands ahead */
+                if (lnd < 0 || (walls & (1ULL << lnd))) continue;
+                add |= 1ULL << lnd;
+            }
+        }
+        uint64_t ns = set | add;
+        if (ns == set) return set;
+        set = ns;
+    }
+}
+
+/* Per-solve setup: classify mandatory holes and, if any exist, build the
+ * push-closure table for the block masks actually present. */
+static void mand_setup(const Puzzle *pz) {
+    g_mand_hmask = 0;
+    if (!g_prune_mand || pz->num_holes == 0) return;
+
+    const uint64_t walls = pz->walls;
+    uint32_t mh = 0;
+    for (int h = 0; h < pz->num_holes; h++) {
+        int hc = pz->hole_pos[h];
+        if (hc == pz->player_start || hc == pz->exit_pos) continue;
+        uint64_t r = reach_flood(walls | (1ULL << hc), pz->player_start);
+        if (!((r >> pz->exit_pos) & 1)) mh |= 1u << h;
+    }
+    g_mand_hmask = mh;
+    if (!mh) return;
+
+    uint16_t masks_present = 0;
+    for (int i = 0; i < pz->num_blocks; i++)
+        masks_present |= 1u << (pz->block_pushable[i] & 0xF);
+
+    /* Reuse the closure table when the walls are unchanged from the previous
+     * solve; block moves never invalidate it.  On a wall change, rebuild every
+     * present mask; on the same walls but a newly-seen mask, build only that. */
+    uint16_t todo;
+    if (!g_closure_valid || walls != g_closure_walls || g_closure_ncells != g_ncells) {
+        g_closure_walls  = walls;
+        g_closure_masks  = masks_present;
+        g_closure_ncells = g_ncells;
+        g_closure_valid  = 1;
+        todo = masks_present;
+    } else {
+        todo = masks_present & ~g_closure_masks;
+        g_closure_masks |= masks_present;
+    }
+    for (int m = 1; m < 16; m++) {
+        if (!(todo & (1u << m))) continue;
+        for (int c = 0; c < g_ncells; c++)
+            g_closure_tab[m][c] = ((walls >> c) & 1) ? 0 : block_closure(c, m, walls);
+    }
+}
+
+/* Returns 1 if the successor in which block `bi` moves to `new_bpos` (or is
+ * consumed, new_bpos >= g_ncells) leaving hole mask `nhm` is provably dead
+ * because too few blocks can still reach the unfilled mandatory holes. */
+static inline int mand_dead(const Puzzle *pz, const int *bp, int nb,
+                            int bi, int new_bpos, uint32_t nhm) {
+    if (!g_mand_hmask) return 0;
+    uint32_t mleft = g_mand_hmask & nhm;
+    if (!mleft) return 0;
+
+    uint64_t mcells = 0;
+    for (uint32_t t = mleft; t; t &= t - 1)
+        mcells |= 1ULL << pz->hole_pos[__builtin_ctz(t)];
+
+    int need = __builtin_popcount(mleft), have = 0;
+    for (int j = 0; j < nb && have < need; j++) {
+        int p = (j == bi) ? new_bpos : bp[j];
+        if (p >= g_ncells) continue;             /* consumed */
+        uint8_t m = pz->block_pushable[j] & 0xF;
+        if (m == 0) continue;                    /* immovable: reaches nothing */
+        if (g_closure_tab[m][p] & mcells) have++;
+    }
+    return have < need;
+}
+
+/* Per-POP deadlock context, computed once for a popped state and reused across
+ * all of its candidate pushes.  Captures the invariants that a non-hole-filling
+ * push cannot change: the unfilled-mandatory cell set (mcells), how many must be
+ * filled (need), and which/how-many blocks can currently reach them.  hm is the
+ * popped state's hole mask. */
+typedef struct {
+    uint64_t mcells;    /* cells of unfilled mandatory holes in this state */
+    uint32_t canreach;  /* bit j set: block j's closure hits mcells        */
+    int      need;      /* # unfilled mandatory holes                      */
+    int      have;      /* # blocks reaching mcells (exact)                */
+} MandCtx;
+
+static inline void mand_pop_ctx(const Puzzle *pz, const int *bp, int nb,
+                                int hm, MandCtx *mc) {
+    mc->mcells = 0; mc->canreach = 0; mc->need = 0; mc->have = 0;
+    if (!g_mand_hmask) return;
+    uint32_t mleft = g_mand_hmask & (uint32_t)hm;
+    if (!mleft) return;
+    uint64_t mcells = 0;
+    for (uint32_t t = mleft; t; t &= t - 1)
+        mcells |= 1ULL << pz->hole_pos[__builtin_ctz(t)];
+    mc->mcells = mcells;
+    mc->need   = __builtin_popcount(mleft);
+    int have = 0; uint32_t cr = 0;
+    for (int j = 0; j < nb; j++) {
+        int p = bp[j];
+        if (p >= g_ncells) continue;
+        uint8_t m = pz->block_pushable[j] & 0xF;
+        if (m == 0) continue;
+        if (g_closure_tab[m][p] & mcells) { cr |= 1u << j; have++; }
+    }
+    mc->have = have; mc->canreach = cr;
+}
+
+/* O(1) successor deadlock test using the per-pop context.  Exact: returns the
+ * same verdict as mand_dead().  Correctness rests on closure monotonicity — a
+ * real push satisfies the relaxed edge condition, so new_bpos in closure(bpos)
+ * and hence closure(new_bpos) subset closure(bpos): a push can only shrink a
+ * block's reach, never grow it, and only the moved block bi changes.  When the
+ * push fills a MANDATORY hole (need and mcells shrink) we fall back to the full
+ * recompute — the rare productive case.  ch = filled hole index, or -1. */
+static inline int mand_dead_ctx(const Puzzle *pz, const MandCtx *mc,
+                                const int *bp, int nb, int bi,
+                                int new_bpos, uint32_t nhm, int ch) {
+#ifdef MAND_OLD
+    return mand_dead(pz, bp, nb, bi, new_bpos, nhm);   /* A/B baseline: force old path */
+#endif
+    int r;
+    if (!g_mand_hmask) {
+        r = 0;
+    } else if (ch >= 0 && ((g_mand_hmask >> ch) & 1)) {
+        r = mand_dead(pz, bp, nb, bi, new_bpos, nhm);      /* mandatory fill: recount */
+    } else if (mc->need == 0) {
+        r = 0;
+    } else if (mc->have > mc->need) {
+        r = 0;                                             /* slack: no push can kill it */
+    } else {
+        int old_r = (mc->canreach >> bi) & 1;
+        int new_r = 0;
+        if (old_r && new_bpos < g_ncells) {
+            uint8_t m = pz->block_pushable[bi] & 0xF;
+            new_r = (g_closure_tab[m][new_bpos] & mc->mcells) != 0;
+        }
+        r = (mc->have - old_r + new_r) < mc->need;
+    }
+#ifdef MAND_ASSERT
+    int slow = mand_dead(pz, bp, nb, bi, new_bpos, nhm);
+    if (r != slow) {
+        fprintf(stderr, "[MAND_ASSERT] mismatch fast=%d slow=%d  bi=%d new_bpos=%d "
+                "ch=%d need=%d have=%d\n", r, slow, bi, new_bpos, ch, mc->need, mc->have);
+        abort();
+    }
+#endif
+    return r;
+}
+
+/* ========================================================================
  * PUSH-BASED DIJKSTRA SOLVER — 64-bit state key
  *
  * State key: (canonical_player_cell, block_positions, hole_mask).
@@ -720,6 +1015,7 @@ static inline void bfs_tail_reset(BfsProfile *prof, int max_cost) {
 static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush64 *hs = hsp64_get();
     hsp64_clear(hs);
+    mand_setup(pz);
     int peak_heap = 1;
     int n_popped  = 0;
 
@@ -802,6 +1098,15 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
                         }
                     }
                 }
+
+#ifdef FWPROF
+                { uint64_t _d0 = mach_absolute_time();
+                  int _dead = mand_dead(pz, bp, nb, bi, new_bpos, (uint32_t)nhm);
+                  g_mdead_ticks += mach_absolute_time() - _d0; g_mdead_calls++;
+                  if (_dead) continue; }
+#else
+                if (mand_dead(pz, bp, nb, bi, new_bpos, (uint32_t)nhm)) continue;
+#endif
 
                 /* Incremental state update: player lands at bpos; patch
                  * block bi's field (and the hole mask if one was consumed). */
@@ -898,8 +1203,18 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         return -1;
     }
 
+#ifdef FWPROF
+    if (++g_fwp_solves % FWP_DUMP_EVERY == 0) fwp_dump();
+    uint64_t _ts = mach_absolute_time();
+#endif
     HashStatePush64 *hs = hsp64_get();
     hsp64_clear(hs);
+#ifdef FWPROF
+    { uint64_t _m0 = mach_absolute_time(); mand_setup(pz);
+      g_msetup_ticks += mach_absolute_time() - _m0; }
+#else
+    mand_setup(pz);
+#endif
     bfs_tail_reset(prof, max_cost);
     int peak_heap = 1;
     int n_popped  = 0;
@@ -928,6 +1243,9 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
     int      best_win  = INT_MAX;
     uint32_t best_used = 0;
 
+#ifdef FWPROF
+    g_fwp[FWP_SETUP] += mach_absolute_time() - _ts;
+#endif
     int pq_min = 0;
     while (hs->pq_count > 0) {
         Bucket64 *bkt = &hs->bq[pq_min & PQ64_BMASK];
@@ -943,6 +1261,7 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
             int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
             if (twi >= 0 && twi < BFS_TAIL_W) prof->tail_width[twi]++;
         }
+        FWP_DECL();
 
         int sh = g_bits_per_cell, bp[MAX_BLOCKS];
         for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
@@ -952,6 +1271,15 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
         uint64_t cur_holes = 0;
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
+        MandCtx mc;
+#ifdef FWPROF
+        { uint64_t _c0 = mach_absolute_time();
+          mand_pop_ctx(pz, bp, nb, hm, &mc);
+          g_mctx_ticks += mach_absolute_time() - _c0; }
+#else
+        mand_pop_ctx(pz, bp, nb, hm, &mc);
+#endif
+        FWP_LAP(FWP_UNPACK);
 
         /* Pass 1: candidates + slot prefetch (see solve_push64). */
         PushCand cand[MAX_BLOCKS * 4];
@@ -982,6 +1310,15 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
                     }
                 }
 
+#ifdef FWPROF
+                { uint64_t _d0 = mach_absolute_time();
+                  int _dead = mand_dead_ctx(pz, &mc, bp, nb, bi, new_bpos, (uint32_t)nhm, ch);
+                  g_mdead_ticks += mach_absolute_time() - _d0; g_mdead_calls++;
+                  if (_dead) continue; }
+#else
+                if (mand_dead_ctx(pz, &mc, bp, nb, bi, new_bpos, (uint32_t)nhm, ch)) continue;
+#endif
+
                 int      bsh = g_bits_per_cell * (bi + 1);
                 uint64_t ns  = (e.state & ~g_cell_mask) | (uint64_t)bpos;
                 ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
@@ -1004,9 +1341,11 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
             }
         }
 
+        FWP_LAP(FWP_PASS1);
         int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
                         nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
+        FWP_LAP(FWP_WALK);
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
@@ -1044,6 +1383,7 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
                 }
             }
         }
+        FWP_LAP(FWP_PASS2);
     }
 
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
@@ -1330,6 +1670,7 @@ typedef struct {
 static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush128 *hs = hsp128_get();
     hsp128_clear(hs);
+    mand_setup(pz);
     int peak_heap = 1;
     int n_popped  = 0;
 
@@ -1402,6 +1743,15 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
                         }
                     }
                 }
+
+#ifdef FWPROF
+                { uint64_t _d0 = mach_absolute_time();
+                  int _dead = mand_dead(pz, bp, nb, bi, new_bpos, (uint32_t)nhm);
+                  g_mdead_ticks += mach_absolute_time() - _d0; g_mdead_calls++;
+                  if (_dead) continue; }
+#else
+                if (mand_dead(pz, bp, nb, bi, new_bpos, (uint32_t)nhm)) continue;
+#endif
 
                 /* Incremental state patch: player + block bi (+ hole mask). */
                 int         bsh = g_bits_per_cell * (bi + 1);
@@ -1477,6 +1827,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
 
     HashStatePush128 *hs = hsp128_get();
     hsp128_clear(hs);
+    mand_setup(pz);
     bfs_tail_reset(prof, max_cost);
     int peak_heap = 1;
     int n_popped  = 0;
@@ -1526,6 +1877,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
         for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= (1ULL << bp[i]);
         uint64_t cur_holes = 0;
         for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= (1ULL << pz->hole_pos[h]);
+        MandCtx mc; mand_pop_ctx(pz, bp, nb, hm, &mc);
 
         int8_t wdist[MAX_NCELLS];
         walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
@@ -1570,6 +1922,15 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
                         }
                     }
                 }
+
+#ifdef FWPROF
+                { uint64_t _d0 = mach_absolute_time();
+                  int _dead = mand_dead_ctx(pz, &mc, bp, nb, bi, new_bpos, (uint32_t)nhm, ch);
+                  g_mdead_ticks += mach_absolute_time() - _d0; g_mdead_calls++;
+                  if (_dead) continue; }
+#else
+                if (mand_dead_ctx(pz, &mc, bp, nb, bi, new_bpos, (uint32_t)nhm, ch)) continue;
+#endif
 
                 int         bsh = g_bits_per_cell * (bi + 1);
                 __uint128_t ns  = (e.state & ~(__uint128_t)g_cell_mask) | (__uint128_t)bpos;
