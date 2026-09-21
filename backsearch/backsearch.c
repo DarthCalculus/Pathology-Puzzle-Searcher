@@ -178,6 +178,7 @@ static int g_list_tasks  = 0;
  * out-degree along the way.  E[product] is the subtree size, so the estimate is
  * unbiased for the dedup-free DFS tree; the real DFS is ~0.7x of that. */
 static int    g_estimate_probes = 0;
+static const char *g_estimate_dump = NULL;   /* --estimate-dump FILE: per-layer-node estimates as TSV (chunk planning) */
 static int    g_estimate_layer  = 6;
 static int    g_list_layer      = 0;      /* --list-layer K: print the dedup'd depth-K layer as --seed-path strings and exit */
 static int    g_probe_mode      = 0;      /* 1: try_successor appends to g_probe_buf instead of q_push */
@@ -4000,6 +4001,17 @@ static void run_estimate(void) {
         double sum = 0; for (int k = d; k < d + 10 && k < 4096; k++) sum += depth_est[k] / m;
         if (sum > 0) printf("   %3d-%-3d %.3g\n", d, d + 9, sum);
     }
+    if (g_estimate_dump) {   /* every layer node: seed path, depth, blocks, holes, est nodes, est seconds, SE of seconds */
+        FILE *df = fopen(g_estimate_dump, "a");
+        if (df) {
+            for (size_t i = 0; i < ln; i++) {
+                double tvar = time_est2[i] - time_est[i] * time_est[i]; if (tvar < 0) tvar = 0;
+                fprintf(df, "%d\t%s\t%d\t%d\t%d\t%.6g\t%.6g\t%.6g\n", g_exit_pos, layer[i].path, layer[i].st.depth,
+                        layer[i].st.nblocks, layer[i].st.nholes, node_est[i], time_est[i], sqrt(tvar / m));
+            }
+            fclose(df);
+        }
+    }
     /* Heaviest layer nodes (job-splitting hints). */
     int show = ln < 12 ? (int)ln : 12;
     int *idx = malloc(ln * sizeof(int)); for (size_t i = 0; i < ln; i++) idx[i] = (int)i;
@@ -4469,6 +4481,8 @@ static void print_usage(const char *prog) {
         "                          heaviest layer nodes as --seed-path strings for splitting.\n"
         "                          Honours --exit/--task-id/--seed-path and every search cap.\n"
         "  --estimate-depth K    layer depth for --estimate (default 6).\n"
+        "  --estimate-dump FILE  append one TSV line per layer node (exit, seed path, depth, blocks,\n"
+        "                          holes, est. accepted nodes, est. seconds, SE) for chunk planning.\n"
         "  --list-layer K        print the dedup'd depth-K layer, one LAYER line per node\n"
         "                          (exit, --seed-path string, depth, blocks, holes), then exit.\n"
         "                          Feed the paths to independent --seed-path --time 0 jobs to\n"
@@ -4923,6 +4937,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--list-layer") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --list-layer requires K\n"); return 1; }
             g_estimate_layer = atoi(argv[i]); g_list_layer = 1; g_estimate_probes = 1;
+        } else if (strcmp(argv[i], "--estimate-dump") == 0) {
+            if (++i >= argc) { fprintf(stderr, "--estimate-dump needs a file\n"); return 2; }
+            g_estimate_dump = argv[i];
         } else if (strcmp(argv[i], "--estimate-depth") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --estimate-depth requires K\n"); return 1; }
             g_estimate_layer = atoi(argv[i]);
