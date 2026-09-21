@@ -23,10 +23,11 @@ ap.add_argument('--extra', default='--num-holes 3'); ap.add_argument('--chunks',
 ap.add_argument('--layer', type=int, default=8); ap.add_argument('--probes-per-node', type=int, default=20)
 ap.add_argument('--split-depth', type=int, default=4); ap.add_argument('--worker', default='./backsearch_est')
 ap.add_argument('--grid', default='5x5'); ap.add_argument('--max-split-rounds', type=int, default=4)
+ap.add_argument('--cheap-split', action='store_true', help='split heavy nodes by listing their sub-layer (no probes); children share the parent estimate equally')
 a = ap.parse_args()
 HERE = os.path.dirname(os.path.abspath(__file__)); os.chdir(os.path.join(HERE, '..'))
 extra = a.extra.split()
-tmp = a.out + '.dump.tsv'
+tmp = f"{a.out}.dump.{os.getpid()}.tsv"   # private to this planner process (a stray worker must not append to it)
 def log(m): print(time.strftime('[%H:%M:%S] ') + m, flush=True)
 
 def estimate(exit_pos, seed, depth, probes_per_node):
@@ -43,8 +44,11 @@ def estimate(exit_pos, seed, depth, probes_per_node):
     nodes = []
     for l in open(tmp):
         ex, path, d, nb, nh, est_nodes, est_s, se_s = l.rstrip('\n').split('\t')
+        if int(ex) != exit_pos: continue
         nodes.append(dict(exit=int(ex), path=path, depth=int(d), blocks=int(nb), holes=int(nh),
                           est_nodes=float(est_nodes), est_s=float(est_s), se_s=float(se_s)))
+    os.remove(tmp)
+    if seed is None and len(nodes) != n: log(f"  WARNING exit {exit_pos}: dump has {len(nodes)} rows but the layer has {n} nodes")
     return nodes
 
 # 1. per-exit layer estimates
@@ -64,7 +68,12 @@ for rnd in range(a.max_split_rounds):
     keep = []
     for n in nodes:
         if n['est_s'] <= budget: keep.append(n); continue
-        kids = estimate(n['exit'], n['path'], n['depth'] + a.split_depth, a.probes_per_node)   # sub-layer, DFS order
+        if a.cheap_split:
+            cmd = [a.worker, '--grid', a.grid, '--two-tables', '--allow-exit-transit', '--exit', str(n['exit'])] + extra + ['--seed-path', n['path'], '--list-layer', str(n['depth'] + a.split_depth)]
+            lay = [l.split('\t') for l in subprocess.run(cmd, capture_output=True, text=True).stdout.split('\n') if l.startswith('LAYER')]
+            kids = [dict(exit=n['exit'], path=r[2], depth=int(r[3]), blocks=int(r[4]), holes=int(r[5]), est_nodes=0.0, est_s=n['est_s'] / max(1, len(lay)), se_s=0.0) for r in lay]
+        else:
+            kids = estimate(n['exit'], n['path'], n['depth'] + a.split_depth, a.probes_per_node)   # sub-layer, DFS order
         ks = sum(k['est_s'] for k in kids)
         log(f"  {n['path']} (exit {n['exit']}, est {n['est_s']/3600:.1f} h) -> {len(kids)} children, est {ks/3600:.1f} h")
         keep += kids if kids else [n]     # spliced in place: the sub-layer occupies exactly the node's slot in DFS order
