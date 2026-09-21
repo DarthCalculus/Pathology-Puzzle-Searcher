@@ -9,7 +9,7 @@ time: every worker prints a checkpoint and the same command continues from it.
 At the end it prints a report block to paste into the tracker.  Requires a worker built from
 this checkout:  ./build_pgo.sh -o backsearch_worker_nt --no-torch
 """
-import argparse, hashlib, json, os, re, shlex, subprocess, sys, time, urllib.request
+import argparse, hashlib, json, os, re, shlex, signal, subprocess, sys, time, urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument('--chunks', required=True, help='comma-separated chunk ids')
 ap.add_argument('--workers', type=int, default=2); ap.add_argument('--name', required=True)
@@ -69,8 +69,20 @@ def last_level(best_file):
     return level_code('\n'.join(block))
 
 # --- run each chunk as its own resumable campaign --------------------------
+# Ctrl-C: the driver and its workers (same process group) checkpoint on their
+# own; this process just stops starting chunks, waits, and prints the partial
+# report.  A SIGINT sent to this process alone is forwarded to the driver.
+STOP = {"flag": False, "child": None}
+def on_stop(sig, frame):
+    STOP["flag"] = True
+    if STOP["child"] and STOP["child"].poll() is None:
+        try: STOP["child"].send_signal(signal.SIGINT)
+        except Exception: pass
+    print("\n   ** stopping: waiting for the workers to checkpoint ...", flush=True)
+signal.signal(signal.SIGINT, on_stop); signal.signal(signal.SIGTERM, on_stop)
 t_start = time.time(); report_chunks = []
 for cid in ids:
+    if STOP["flag"]: break
     c = by_id[cid]; d = f"results/chunks/chunk_{cid:03d}"; os.makedirs(d, exist_ok=True)
     jf = os.path.join(d, 'jobs.tsv')
     if not os.path.exists(jf):
@@ -86,8 +98,14 @@ for cid in ids:
         json.dump({"grid": grid, "exits": [c['exit']], "layer": plan.get('layer', 8), "extra": extra, "no_transit": False}, open(os.path.join(d, 'config.json'), 'w'))
     print(f"== chunk {cid} (exit {c['exit']}, {len(c['jobs'])} jobs, est {c['est_hours']} h): running with {a.workers} workers", flush=True)
     t0 = time.time()
-    subprocess.run([sys.executable, 'campaign.py', '--out', d, '--exits', str(c['exit']), '--extra', ' '.join(extra),
-                    '--workers', str(a.workers), '--worker', a.worker, '--shuffle'], stdout=open(os.path.join(d, 'driver.out'), 'a'), stderr=subprocess.STDOUT)
+    child = subprocess.Popen([sys.executable, 'campaign.py', '--out', d, '--exits', str(c['exit']), '--extra', ' '.join(extra),
+                              '--workers', str(a.workers), '--worker', a.worker, '--shuffle'],
+                             stdout=open(os.path.join(d, 'driver.out'), 'a'), stderr=subprocess.STDOUT)
+    STOP["child"] = child
+    while child.poll() is None:
+        try: child.wait()
+        except KeyboardInterrupt: pass
+    STOP["child"] = None
     wall = time.time() - t0
     # gather results
     import csv
@@ -112,6 +130,7 @@ for cid in ids:
 
 report = dict(name=a.name, command=argv_line, git=sha, worker_sha256=wsha, workers=a.workers, plan_created=plan.get('created'),
               started=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_start)), wall_s=round(time.time() - t_start), chunks=report_chunks)
+if not report_chunks: print("nothing ran; no report"); sys.exit(1)
 txt = "-----BEGIN CHUNK REPORT-----\n" + json.dumps(report, indent=1) + "\n-----END CHUNK REPORT-----"
 os.makedirs('results/chunks', exist_ok=True)
 rf = f"results/chunks/report_{'_'.join(map(str, ids))}_{time.strftime('%Y%m%d_%H%M')}.txt"; open(rf, 'w').write(txt + '\n')
