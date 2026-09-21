@@ -17,9 +17,13 @@ Backward-DFS Sokoban puzzle generator with task-partitioned parallelism.
 
 The C code uses `clock_gettime(CLOCK_MONOTONIC, ...)` — a POSIX call that isn't available in plain MSVC. Builds need either a POSIX-compatible toolchain (macOS, Linux, MinGW, MSYS2, WSL) or a small port of the timing functions.
 
-### macOS
+### macOS and Linux
 
-The worker is the only piece that needs compilation. The wrapper script and Python filter run as-is.
+The worker is the only piece that needs compilation; the Python tooling runs as-is.
+`build_pgo.sh` works with clang (macOS, or clang + llvm tools on Linux) and with
+GCC (`-fprofile-generate/-use`); pick the compiler with `CC=gcc-13 ./build_pgo.sh`.
+Linux needs zlib headers (`apt install build-essential zlib1g-dev`, plus `llvm`
+if you use clang, otherwise the script falls back to a plain `-O3` build).
 
 **Recommended — profile-guided build** (the forward solver is ~90% of runtime and PGO is worth 10–20% on top of `-O3`; links libtorch automatically if `import torch` works, otherwise a no-op NN stub):
 
