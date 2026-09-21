@@ -1,4 +1,4 @@
-# 5x5_backsearch
+# backsearch
 
 Backward-DFS Sokoban puzzle generator with task-partitioned parallelism.
 

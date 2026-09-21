@@ -3,7 +3,7 @@
 Exhaustive search for the longest [Pathology](https://pathology.thinky.gg) levels
 on small grids, and machine-checked proofs that particular levels are the longest
 possible in their class.  Everything current lives in
-[`5x5_backsearch/`](5x5_backsearch/); results are published with an
+[`backsearch/`](backsearch/); results are published with an
 "exhaustively proven champion" badge on
 [pathology.georgespahn.com](https://pathology.georgespahn.com).
 
@@ -37,8 +37,8 @@ decision-mode Dijkstra with a bucket queue, a shortest-walk-segment prune, one
 multi-start solve for a whole component of walk-back children, and reuse of a
 parent's exhausted solve as a table of bounds for its children.  Every pruning
 rule is exact and has a check build that re-runs the pruned solves without the
-rule.  See [`5x5_backsearch/README.md`](5x5_backsearch/README.md) for the full
-description and [`5x5_backsearch/CHANGES_2026-09-18.md`](5x5_backsearch/CHANGES_2026-09-18.md)
+rule.  See [`backsearch/README.md`](backsearch/README.md) for the full
+description and [`backsearch/CHANGES_2026-09-18.md`](backsearch/CHANGES_2026-09-18.md)
 for the solver work of September 2026.
 
 ## Proven results (5x5, exit anywhere)
@@ -63,7 +63,7 @@ Cells are blank where holes exceed blocks (equivalent to the row's "any" cell) a
 The 149 is davidspencer6174's *Capital C* (7 blocks, 2 holes); it is proven
 longest among all 5x5 levels with at most 2 holes.  4x5 is fully enumerated
 (70).  Per-exit proofs, states searched and CPU time for each entry are listed on
-the site's Proofs page; the raw campaign records are in `5x5_backsearch/results/`.
+the site's Proofs page; the raw campaign records are in `backsearch/results/`.
 
 ## Running it
 
@@ -99,14 +99,14 @@ finishes.
 
 | path | what |
 |---|---|
-| `5x5_backsearch/backsearch.c` | backward generator: DFS, pruning, estimator, seed paths, campaign worker |
-| `5x5_backsearch/sokoban_bfs.c`, `.h` | forward solver: cutoff Dijkstra, multi-start solve, reference tables |
-| `5x5_backsearch/campaign.py` | resumable parallel driver over depth-K seed paths |
-| `5x5_backsearch/results/` | campaign proofs, champions and logs; `prove_loop.sh` and the publishers |
-| `5x5_backsearch/solvebench.c`, `multitest.c` | solver regression harnesses (replay a harvest; multi vs single) |
-| `5x5_backsearch/level_to_pathology.c`, `seed_from_level.c` | format converters |
-| `5x5_backsearch/nn_*.*`, `train_*.py`, `selfplay.py`, `harvest_*.py` | experimental learned surrogates (off by default; the proofs never use them) |
-| `5x5_backsearch/old_experiments/` | superseded rollout / annealing record hunts |
+| `backsearch/backsearch.c` | backward generator: DFS, pruning, estimator, seed paths, campaign worker |
+| `backsearch/sokoban_bfs.c`, `.h` | forward solver: cutoff Dijkstra, multi-start solve, reference tables |
+| `backsearch/campaign.py` | resumable parallel driver over depth-K seed paths |
+| `backsearch/results/` | campaign proofs, champions and logs; `prove_loop.sh` and the publishers |
+| `backsearch/solvebench.c`, `multitest.c` | solver regression harnesses (replay a harvest; multi vs single) |
+| `backsearch/level_to_pathology.c`, `seed_from_level.c` | format converters |
+| `backsearch/nn_*.*`, `train_*.py`, `selfplay.py`, `harvest_*.py` | experimental learned surrogates (off by default; the proofs never use them) |
+| `backsearch/old_experiments/` | superseded rollout / annealing record hunts |
 | `legacy/` | the earlier forward-enumeration searchers for 4x5, 5x5 and 5x6 |
 
 Verification of a new level's length independently of this code is done by the
