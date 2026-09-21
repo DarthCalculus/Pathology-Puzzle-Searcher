@@ -270,6 +270,12 @@ You get a Windows `.exe`, but you'll still need MSYS2 or Git Bash on the target 
 
 ## Quick usage
 
+The worker (`backsearch_worker_nt`) is single-threaded and has no thread flag.
+Parallelism comes from running several workers: `campaign.py --workers N` is the
+recommended way (resumable, exact, one exit split into seed-path jobs); the
+`backsearch` wrapper below is the older alternative and partitions one run into a
+handful of tasks with `--num-threads N`.
+
 ```bash
 # Default 5×5, all canonical exits, run until queue drains
 ./backsearch --grid 5x5 --time 0

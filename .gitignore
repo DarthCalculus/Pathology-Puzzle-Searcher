@@ -4,7 +4,6 @@
 __pycache__/
 *.pyc
 # compiled binaries (rebuild with build_pgo.sh / the cc lines in each source header)
-backsearch/backsearch
 backsearch/backsearch_dbg
 backsearch/backsearch_instr
 backsearch/backsearch_worker*
