@@ -50,9 +50,17 @@ rough: some will finish in minutes, a few may run for days.
 ## 3. While it runs
 
 * Progress lines show jobs done, CPU time and the best length so far.
+* **Expect some chunks to run far longer than their estimate.** The
+  estimates come from random probes of the tree and are off by a lot: a
+  chunk shown as one hour may take a day, and one that contains a deep
+  corridor of the search can take days. The count of finished sub-ranges
+  keeps rising while a few long ones run. Nothing is wrong, and you do not
+  have to see it through.
 * **Ctrl-C is safe at any time.** Each worker prints a checkpoint and the
-  run stops; the same command continues exactly where it left off. Laptop
-  sleep, reboots and crashes are also fine: re-run the command.
+  run stops; the same command continues exactly where it left off, whether
+  you re-run it in five minutes or next week. Laptop sleep, reboots and
+  crashes are also fine: re-run the command. To give a long chunk up, see
+  the end of step 4.
 * Keep the checkout unmodified. The runner refuses to report from a modified
   `backsearch.c`, `sokoban_bfs.c` or `campaign.py`, and `git pull` before a
   new sign-up is a good habit (rebuild after pulling).
