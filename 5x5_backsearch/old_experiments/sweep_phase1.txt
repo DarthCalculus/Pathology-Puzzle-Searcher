@@ -1,0 +1,20 @@
+=== Phase 1: K x P x metric  (M=100 C=20, 3 reps, 10s each) ===
+3,100,20,0             states_popped          | runs: 39 30 25            max:39   med:30  
+3,100,20,0             --beam-score-tailwidth | runs: 23 30 30            max:30   med:30  
+3,100,20,10            states_popped          | runs: 25 51 33            max:51   med:33  
+3,100,20,10            --beam-score-tailwidth | runs: 28 30 57            max:57   med:30  
+3,100,20,25            states_popped          | runs: 21 38 75            max:75   med:38  
+3,100,20,25            --beam-score-tailwidth | runs: 22 35 18            max:35   med:22  
+5,100,20,0             states_popped          | runs: 43 55 36            max:55   med:43  
+5,100,20,0             --beam-score-tailwidth | runs: 70 39 30            max:70   med:39  
+5,100,20,10            states_popped          | runs: 55 68 35            max:68   med:55  
+5,100,20,10            --beam-score-tailwidth | runs: 28 45 39            max:45   med:39  
+5,100,20,25            states_popped          | runs: 49 28 57            max:57   med:49  
+5,100,20,25            --beam-score-tailwidth | runs: 26 35 25            max:35   med:26  
+8,100,20,0             states_popped          | runs: 40 25 40            max:40   med:40  
+8,100,20,0             --beam-score-tailwidth | runs: 68 39 28            max:68   med:39  
+8,100,20,10            states_popped          | runs: 42 70 68            max:70   med:68  
+8,100,20,10            --beam-score-tailwidth | runs: 66 29 52            max:66   med:52  
+8,100,20,25            states_popped          | runs: 32 69 30            max:69   med:32  
+8,100,20,25            --beam-score-tailwidth | runs: 42 58 70            max:70   med:58  
+=== sweep done ===

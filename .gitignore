@@ -1,0 +1,43 @@
+# build products
+*.o
+*.dSYM/
+__pycache__/
+*.pyc
+# compiled binaries (rebuild with build_pgo.sh / the cc lines in each source header)
+5x5_backsearch/backsearch
+5x5_backsearch/backsearch_dbg
+5x5_backsearch/backsearch_instr
+5x5_backsearch/backsearch_worker*
+5x5_backsearch/level_to_pathology
+5x5_backsearch/seed_from_level
+5x5_backsearch/multitest
+5x5_backsearch/solvebench
+5x5_backsearch/pathbf
+5x5_backsearch/sa_search
+legacy/puzzle_search
+legacy/test_puzzle
+legacy/5x5_optACH/*_search
+legacy/5x6/*_search
+# large local data: harvest corpus, NN checkpoints, self-play runs
+5x5_backsearch/corpus/
+5x5_backsearch/corpus.sqlite
+5x5_backsearch/checkpoints/
+5x5_backsearch/selfplay_runs/
+5x5_backsearch/*.bin
+5x5_backsearch/*.bin.gz
+# campaign bulk output: per-job records and worker streams (tens of MB each);
+# the published proofs, champions and logs are tracked
+5x5_backsearch/results/**/done.tsv
+5x5_backsearch/results/**/jobs.tsv
+5x5_backsearch/results/**/workers
+5x5_backsearch/results/**/best[0-9]*_e*.txt
+5x5_backsearch/results/*.out
+5x5_backsearch/results/**/*.tsv.bak
+5x5_backsearch/results/est149_probe*.tsv
+# local backups / superseded copies, never meant for the repo
+5x5/
+5x5_mono/
+5x5_optAC/
+5x5_optC/
+*_bak*/
+.claude/

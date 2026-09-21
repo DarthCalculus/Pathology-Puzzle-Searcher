@@ -1,0 +1,10 @@
+gen   1  depth   8  spawned 40  survived 34  unique 33  kept 33  selective NO(keep-all)
+gen   2  depth  16  spawned 1320  survived 756  unique 635  kept 635  selective NO(keep-all)
+gen   3  depth  24  spawned 25400  survived 1613  unique 1134  kept 1134  selective NO(keep-all)
+gen   4  depth  32  spawned 45360  survived 2709  unique 1009  kept 1009  selective NO(keep-all)
+gen   5  depth  40  spawned 40360  survived 1459  unique 426  kept 426  selective NO(keep-all)
+gen   6  depth  48  spawned 17040  survived 920  unique 234  kept 234  selective NO(keep-all)
+gen   7  depth  56  spawned 9360  survived 1550  unique 234  kept 234  selective NO(keep-all)
+gen   8  depth  64  spawned 9360  survived 741  unique 91  kept 91  selective NO(keep-all)
+gen   9  depth  72  spawned 3640  survived 1273  unique 131  kept 131  selective NO(keep-all)
+gen  10  DEAD-END (0 survivors of 5240 spawned)  DFS-rescue FAILED -> stop

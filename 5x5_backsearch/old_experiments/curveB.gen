@@ -1,0 +1,23 @@
+gen   1  depth   8  spawned 40  survived 37  unique 37  kept 37  selective NO(keep-all)
+gen   2  depth  16  spawned 1480  survived 906  unique 782  kept 782  selective NO(keep-all)
+gen   3  depth  24  spawned 31280  survived 2557  unique 1796  kept 1796  selective NO(keep-all)
+gen   4  depth  32  spawned 71840  survived 11035  unique 3924  kept 2000  selective yes
+gen   5  depth  40  spawned 80000  survived 14078  unique 4003  kept 2000  selective yes
+gen   6  depth  48  spawned 80000  survived 18487  unique 2807  kept 2000  selective yes
+gen   7  depth  56  spawned 80000  survived 22328  unique 3796  kept 2000  selective yes
+gen   8  depth  64  spawned 80000  survived 2030  unique 236  kept 236  selective NO(keep-all)
+gen   9  depth  72  spawned 9440  survived 1713  unique 227  kept 227  selective NO(keep-all)
+gen  10  depth  80  spawned 9080  survived 1299  unique 131  kept 131  selective NO(keep-all)
+gen  11  depth  88  spawned 5240  survived 1430  unique 258  kept 258  selective NO(keep-all)
+gen  12  depth  96  spawned 10320  survived 1337  unique 161  kept 161  selective NO(keep-all)
+gen  13  DEAD-END at depth 96  -> RESTART #1
+gen   1  depth   8  spawned 40  survived 34  unique 34  kept 34  selective NO(keep-all)
+gen   2  depth  16  spawned 1360  survived 915  unique 818  kept 818  selective NO(keep-all)
+gen   3  depth  24  spawned 32720  survived 2353  unique 1578  kept 1578  selective NO(keep-all)
+gen   4  depth  32  spawned 63120  survived 7276  unique 2489  kept 2000  selective yes
+gen   5  depth  40  spawned 80000  survived 4022  unique 1178  kept 1178  selective NO(keep-all)
+gen   6  depth  48  spawned 47120  survived 5201  unique 1296  kept 1296  selective NO(keep-all)
+gen   7  depth  56  spawned 51840  survived 2647  unique 328  kept 328  selective NO(keep-all)
+gen   8  depth  64  spawned 13120  survived 634  unique 99  kept 99  selective NO(keep-all)
+gen   9  depth  72  spawned 3960  survived 46  unique 4  kept 4  selective NO(keep-all)
+[rollout done] restarts=1 best_depth=64

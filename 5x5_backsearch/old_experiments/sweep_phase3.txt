@@ -1,0 +1,8 @@
+=== Phase 3: top configs @ 20s, 5 reps ===
+8,400,40,10        states_popped          | runs: 40 92 70 92 90            max:92   med:90  
+8,200,20,10        states_popped          | runs: 57 88 28 32 52            max:88   med:52  
+8,800,40,10        states_popped          | runs: 82 70 72 75 60            max:82   med:72  
+8,400,40,10        --beam-score-tailwidth | runs: 51 62 72 62 70            max:72   med:62  
+12,400,40,10       states_popped          | runs: 41 41 39 33 62            max:62   med:41  
+8,400,40,25        states_popped          | runs: 46 72 55 68 58            max:72   med:58  
+=== sweep done ===
