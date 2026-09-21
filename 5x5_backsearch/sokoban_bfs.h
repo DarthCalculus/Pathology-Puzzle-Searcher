@@ -134,3 +134,54 @@ void sokoban_set_heap_cap(int n);
  * rebuilding.  Not thread-safe; set before parallel solves.
  */
 void sokoban_set_hole_prune(int on);
+
+/* Decision mode for sokoban_solve_cutoff(): return at the FIRST solution found
+ * within the cutoff (a valid length <= max_cost, not necessarily the shortest)
+ * and order the search by g + walk-distance-to-exit.  Off by default so that
+ * callers needing exact lengths (harvest, verification) are unaffected. */
+void sokoban_set_decision_only(int on);
+
+/* Multi-start decision solve (see sokoban_bfs.c).  All starts[] lie in one
+ * player component of pz's board; for each i sets out[i] = 1 iff a solution
+ * of length <= cut[i] exists from starts[i] (exactly what sokoban_solve_cutoff
+ * from that start would decide).  pred[i] (or NULL): bitmask of starts that
+ * are shortest-path predecessors of start i; a shortcut there implies one at i.
+ * n <= 24.  Returns 0, or -2 when the solve
+ * did not fit (table overflow, heap cap, 128-bit puzzle): then out[] is
+ * meaningless and the caller must fall back to per-start solves. */
+/* Parent-table reuse (see REFERENCE TABLE in sokoban_bfs.c).  After a cutoff
+ * solve returned -1 exhaustively on the small table, sokoban_export_settled()
+ * copies its settled (key, cost) pairs (returns n, or -1 if unavailable / too
+ * many).  sokoban_set_reference() installs such a table for the next cutoff
+ * solves of children whose forward puzzle is identical and whose cutoff is the
+ * parent's + k; sokoban_clear_reference() removes it.  A solve made with a
+ * reference installed is not exportable (its table is incomplete). */
+int  sokoban_export_settled(uint64_t *keys, int32_t *costs, int max);
+void sokoban_set_reference(const uint64_t *keys, const int32_t *costs, int n, int k);
+void sokoban_clear_reference(void);
+void sokoban_set_reference_delta(uint64_t delta, uint64_t walls, int exit_pos);   /* cells floor now, wall for the table owner */
+typedef struct { uint64_t *hk; int32_t *hc; uint32_t mask, cap; int n; } SokRefTable;   /* open-addressing (key -> cost), 0 = empty slot */
+int  sokoban_ref_build(const uint64_t *keys, const int32_t *costs, int n, SokRefTable *t);   /* build once (duplicates keep the minimum) ... */
+void sokoban_ref_attach(const SokRefTable *t);                              /* ... attach by pointer for an expansion (k = 0, no delta/xor) */
+void sokoban_ref_load(const uint64_t *keys, const int32_t *costs, int n);   /* copying variant of build + attach */
+void sokoban_ref_set_k(int k);                                             /* ... then per child: chain offset k (clears delta and xor) */
+void sokoban_ref_set_xor(uint64_t x);                                      /* child key ^ x = owner key for the states they share */
+uint64_t sokoban_zobrist_block(int mask, int cell);
+void sokoban_ref_suspend(int suspend);                                     /* REF_CHECK: disable/enable the loaded table */
+int  sokoban_ref_active(void);
+
+int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *cut, const uint32_t *pred,
+                        const uint8_t *refk, int n, uint8_t *out, BfsProfile *prof);   /* refk: per-start chain offset for an installed reference, or NULL */
+
+/*
+ * sokoban_set_forced_mandatory(cell_mask)
+ *
+ * Bitmask of cell indices whose holes are treated as mandatory unconditionally,
+ * skipping the per-solve reachability check for them (union with the check —
+ * other holes are still classified normally).  Only takes effect when the
+ * mandatory-hole prune is enabled.  WARNING: forcing a hole that is not truly
+ * mandatory is unsound — it can drop states that belong to a valid solution and
+ * thus change which puzzles/solve-lengths are found.  Pass 0 to clear.  Not
+ * thread-safe; set before parallel solves.
+ */
+void sokoban_set_forced_mandatory(uint64_t cell_mask);

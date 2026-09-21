@@ -1,0 +1,6 @@
+  $#...   A=[D]
+  O#AB.   B=[UDL]
+  @COD.   C=[RL]
+  .#EF.   D=[RDL]
+  .....   E=[U]
+            F=[RD]

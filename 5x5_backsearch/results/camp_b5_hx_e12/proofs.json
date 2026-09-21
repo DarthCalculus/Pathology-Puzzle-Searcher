@@ -1,0 +1,15 @@
+[
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 12,
+  "maxBlocks": 5,
+  "maxHoles": null,
+  "maxMoves": 67,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 79693952,
+  "cpuSeconds": 412,
+  "note": "Every 5x5 level with the exit at cell 12 using at most 5 movable blocks (any walls) was enumerated; 67 moves is the longest optimal solution. Campaign results/camp_b5_hx_e12, finished 2026-09-21."
+ }
+]

@@ -1,0 +1,6 @@
+  O....   A=[UR]
+  @AB.C   B=[RDL]
+  .D$#O   C=[D]
+  .EO.F   D=[UR]
+  .....   E=[UL]
+            F=[U]

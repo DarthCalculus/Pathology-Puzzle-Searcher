@@ -1,0 +1,72 @@
+78 (1.0s)
+  $#...   A=[RD]
+  O..A.   B=[DL]
+  #B#C.   C=[DL]
+  .D...   D=[URL]
+  @#...
+
+80 (8.9s)
+  $#...   A=[D]
+  O@.A.   B=[RD]
+  ##B..   C=[URL]
+  #.CD.   D=[UR]
+  #....
+
+82 (20.6s)
+  $#...   A=[UR]
+  O@AB#   B=[UR]
+  ..#..   C=[UR]
+  .C.D.   D=[UDL]
+  #....
+
+88 (21.7s)
+  $#...   A=[R]
+  O@.#.   B=[URDL]
+  .ABC.   C=[RDL]
+  ..D..   D=[UR]
+  #....
+
+96 (31.9s)
+  $#...   A=[UD]
+  O..#.   B=[RD]
+  #A.B.   C=[URD]
+  .C.D.   D=[URDL]
+  ...#@
+
+102 (1.4m)
+  $#...   A=[R]
+  O@.#.   B=[URDL]
+  .ABC.   C=[DL]
+  ..D..   D=[UR]
+  #....
+
+106 (1.6m)
+  $#...   A=[UDL]
+  O#.A.   B=[RDL]
+  .B@#.   C=[RL]
+  .CD..   D=[URD]
+  .....
+
+--- Exit 0 (exhausted) ---
+  elapsed:        133.375 s
+  states checked: 13305675 (shortcut 4673303, dedup 950536)
+  accepted:       7681836  (walk-segment pruned before check: 274691)
+  solver calls:   12355139
+  shallow / recent: 3003607 / 2142221  (evicts 6 / 6)
+  stack peak:     70
+  best depth:     106  (verify 106 OK)
+
+=== Backward search complete ===
+Total elapsed:     133.37 s (no time limit)
+Exits searched:    1 / 1
+States checked:    13305675
+  pruned shortcut: 4673303
+  pruned dedup:    950536
+Solver calls:      12355139
+Best depth:        106  (exit 0)
+
+  $#...   A=[UDL]
+  O#.A.   B=[RDL]
+  .B@#.   C=[RL]
+  .CD..   D=[URD]
+  .....

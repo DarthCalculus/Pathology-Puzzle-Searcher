@@ -73,6 +73,7 @@ static int      g_allow_exit_transit = 0;   /* 1 = block may transit through exi
  * root.  Default: 0 (such candidates are rejected as best states). */
 static int      g_allow_block_on_exit = 0;
 static int      g_mandatory_holes    = 0;   /* 1 = enable the solver's mandatory-hole prune */
+static uint64_t g_forced_mand_cells  = 0;   /* cells forced mandatory via --mandatory-holes c,c,... */
 static int      g_holeless           = 0;   /* 1 = forbid all holes (no variant 4) */
 static int      g_two_tables         = 1;   /* 1 = use shallow+recent two-table dedup (default); --no-two-tables to disable */
 static int      g_reverse_order      = 0;   /* 1 = invert expand() emission order (flips DFS priority) */
@@ -130,6 +131,16 @@ static int      g_axis_both_ways = 0;
  * (including --fixedholes); --num-blocks counts the total nblocks. */
 static int      g_max_blocks        = MAX_BLOCKS;
 static int      g_max_holes         = MAX_HOLES;
+static int      g_num_holes_set     = 0;    /* 1 iff --num-holes was passed explicitly */
+
+/* --place-holes N D [c,c,...]: require at least N active holes (optionally
+ * restricted to the listed cells) to exist by depth D.  A state at depth >= D
+ * that fails any constraint is pruned.  Repeatable; each flag adds one entry.
+ * mask == 0 means "count all holes"; otherwise count only holes at those cells. */
+#define MAX_PLACE 16
+typedef struct { int n; int depth; uint64_t mask; } PlaceHoleReq;
+static PlaceHoleReq g_place[MAX_PLACE];
+static int          g_place_count = 0;
 
 /* Upper bound on a state's depth.  Successors with depth > this are
  * pruned in try_successor.  Used by the wrapper's "shallow scan" pass
@@ -159,6 +170,42 @@ static int      g_max_depth         = INT_MAX;
  */
 static int g_only_task   = -1;   /* -1 = run all tasks merged (default) */
 static int g_list_tasks  = 0;
+
+/* --estimate N [--estimate-depth K]: Knuth tree-size estimation instead of a
+ * DFS.  The depth-K layer is enumerated exactly (with dedup), then each layer
+ * node gets ceil(N / layer) random root-to-leaf probes that use expand() /
+ * try_successor() verbatim (every prune except dedup), multiplying the accepted
+ * out-degree along the way.  E[product] is the subtree size, so the estimate is
+ * unbiased for the dedup-free DFS tree; the real DFS is ~0.7x of that. */
+static int    g_estimate_probes = 0;
+static int    g_estimate_layer  = 6;
+static int    g_list_layer      = 0;      /* --list-layer K: print the dedup'd depth-K layer as --seed-path strings and exit */
+static int    g_probe_mode      = 0;      /* 1: try_successor appends to g_probe_buf instead of q_push */
+static int8_t g_probe_tagD[64], g_probe_tagV[64];
+static int    g_probe_n         = 0;
+static int8_t g_emit_D = -1, g_emit_V = -1; /* set by expand() before each try_successor() */
+static int    g_emit_walk_committed = 0;
+/* Bulk walk-back generation (--no-bulk-walk to disable).  For a state whose
+ * committed cells form a player component, every walk-back descendant that
+ * stays on committed cells shares the same forward puzzle; one multi-start
+ * solve (sokoban_solve_multi) decides all of them and the accepted ones are
+ * pushed directly, so no sequential chain of single checks is needed. */
+static int g_bulk_walk = 1;          /* default on since 2026-09-18 (--no-bulk-walk to disable); see README */
+static int g_bulk_walk_active = 0;   /* effective for the current search mode */
+static int g_bulk_min_depth = 0;     /* --bulk-min-depth D: bulk generation only for states at depth >= D */
+static long long g_bulk_calls = 0, g_bulk_starts = 0, g_bulk_fallbacks = 0;
+#ifdef WBPROF
+static double g_bulk_time = 0;
+#endif   /* walk-back child whose new cell was already committed (same forward board as parent) */
+#ifdef WBPROF
+/* -DWBPROF: split shortcut-check cost by child kind (0 walk over committed cell, 1 walk over new cell, 2 push/new-block/un-consume). */
+static long long g_wb_calls[6], g_wb_pruned[6], g_wb_pops[6], g_bulk_pops = 0, g_bulk_expansions = 0; static double g_wb_time[6];
+extern long long g_refstat[8];
+static int g_cur_ref_k = 0;                    /* chain offset of the reference installed for the check in progress (0 = none) */
+static long long g_rk_calls[4], g_rk_pops[4]; static double g_rk_time[4];   /* by k class: 0 none, 1, 2, 3+ */
+static long long g_rc_n[4], g_rc_pops_with[4], g_rc_pops_without[4];       /* REF_CHECK: pops with vs without the reference */
+static long long g_export_entries = 0;
+#endif
 
 /* --seed-path "D1V1,D2V2,...": apply a specific sequence of backward
  * steps from the standard root, then DFS-explore everything reachable
@@ -389,7 +436,98 @@ typedef struct {
     float    score_cached;               /* beam mode: cached beam_score value (NN or hand-tuned) */
     int32_t  branch_factor;              /* peak heap sz of the forward shortcut_check (0 if not run) */
     uint8_t  wh;                         /* anti-wiggle walk-history, 5 bits; 0 = no walks since last push */
+    int8_t   seg_anchor1;                /* forward walk segment end (push origin / exit) PLUS ONE; 0 = unknown, prune off.
+                                          * +1 encoding so hand-built / zero-initialised states can never claim cell 0. */
+    int8_t   seg_len;                    /* number of walk steps generated so far in this segment */
+    uint8_t  bulk_walk;                  /* 1: produced by bulk walk-back generation; its own walk-backs over committed cells are already covered */
+    int32_t  ptab1;                      /* 1 + index in g_ptab of the settled-label table of the nearest ancestor A (or of this
+                                          * state itself) whose forward puzzle is identical to this one; 0 = none */
+    int16_t  ptab_k;                     /* depth(this) - depth(A): the table prunes a check of a depth+j descendant at nc > g_A + k + j - 2 */
+    uint64_t ptab_delta;                 /* cells floor here but wall in A's puzzle (A's table still bounds continuations avoiding them) */
+    uint64_t ptab_xor;                   /* key translation this -> A (see sokoban_ref_set_xor); 0 for an identical puzzle */
 } BState;
+
+/* Parent-table pool: the settled labels of an accepted state's exhaustive
+ * shortcut check, kept until the state is expanded so that children with an
+ * identical forward puzzle can skip everything the parent already covered. */
+typedef struct { SokRefTable t; int next_free, rc; } PTab;   /* rc: queued states referring to it */
+static PTab *g_ptab = NULL; static int g_ptab_n = 0, g_ptab_cap = 0, g_ptab_free = -1;
+static int  g_ptab_active = 0;                /* DFS mode only */
+static int  g_no_ptab = 0;                    /* --no-parent-table */
+#define HTP_EXPORT_MAX 32768
+static long long g_ptab_saved = 0, g_ptab_used = 0, g_ptab_live = 0, g_ptab_live_peak = 0, g_ptab_live_slots = 0, g_ptab_live_slots_peak = 0;
+static int ptab_alloc(const uint64_t *k, const int32_t *c, int n) {
+    int id;
+    if (g_ptab_free >= 0) { id = g_ptab_free; g_ptab_free = g_ptab[id].next_free; }
+    else {
+        if (g_ptab_n == g_ptab_cap) { g_ptab_cap = g_ptab_cap ? g_ptab_cap * 2 : 1024; g_ptab = realloc(g_ptab, g_ptab_cap * sizeof *g_ptab); memset(g_ptab + g_ptab_n, 0, (g_ptab_cap - g_ptab_n) * sizeof *g_ptab); }
+        id = g_ptab_n++;
+    }
+    PTab *t = &g_ptab[id];
+    sokoban_ref_build(k, c, n, &t->t); t->rc = 0;
+    g_ptab_saved++;
+    if (++g_ptab_live > g_ptab_live_peak) g_ptab_live_peak = g_ptab_live;
+    g_ptab_live_slots += t->t.mask + 1; if (g_ptab_live_slots > g_ptab_live_slots_peak) g_ptab_live_slots_peak = g_ptab_live_slots;
+    return id;
+}
+static void ptab_release(int id) { if (id < 0) return; if (--g_ptab[id].rc > 0) return; g_ptab_live--; g_ptab_live_slots -= g_ptab[id].t.mask + 1; g_ptab[id].next_free = g_ptab_free; g_ptab_free = id; }
+static long long g_ptab_inherited = 0, g_ptab_delta_refs = 0;
+#ifdef REF_CHECK
+static long long g_refchk_n = 0, g_refchk_bad = 0;
+static const PTab *g_refchk_t = NULL; static int g_refchk_k = 0;
+#endif
+
+/* Shortest-walk-segment prune.  Between two pushes the board is fixed, so in
+ * an optimal solution the walk from the player's cell to the next push origin
+ * (seg_anchor) is a shortest path over cells known to be empty.  Cells not yet
+ * committed can only be walls in the final puzzle, blocks/holes introduced
+ * deeper in the backward search sit only on uncommitted cells, and grid paths
+ * between fixed endpoints have fixed parity, so a strictly shorter known path
+ * is a real shortcut of length <= depth-2: the forward solver would prune the
+ * state anyway.  Checking it here costs one bit-parallel BFS instead of a solve.
+ * Returns the BFS distance from `from` to `to` over `passable` (or 127). */
+static int walk_dist_bits(uint64_t passable, int from, int to) {
+    if (from == to) return 0;
+    const int C = g_grid_cols;
+    uint64_t col0 = 0, collast = 0;
+    for (int r = 0; r < g_grid_rows; r++) { col0 |= 1ULL << (r * C); collast |= 1ULL << (r * C + C - 1); }
+    uint64_t reached = 1ULL << from, frontier = reached, target = 1ULL << to;
+    passable |= target;
+    for (int d = 1; frontier; d++) {
+        uint64_t nxt = (frontier >> C) | (frontier << C) | ((frontier & ~collast) << 1) | ((frontier & ~col0) >> 1);
+        frontier = nxt & passable & ~reached;
+        if (frontier & target) return d;
+        reached |= frontier;
+    }
+    return 127;
+}
+static long long g_pruned_walkseg = 0;
+
+static BState g_probe_buf[64];   /* --estimate: children of the node being probed */
+
+/* --fixedholes with an explicit --num-holes larger than the whitelist grants a
+ * "wildcard" budget: that many holes may be placed OUTSIDE the whitelist
+ * (anywhere), on top of holes drawn from the whitelist.  With --num-holes unset
+ * (or <= whitelist size) the budget is 0 and --fixedholes stays a hard
+ * whitelist.  Computed in main() after arg parsing. */
+static int g_wildcard_holes = 0;
+
+/* Count holes in state s that sit outside the --fixedholes whitelist. */
+static inline int nonwl_hole_count(const BState *s) {
+    int n = 0;
+    for (int i = 0; i < s->nholes; i++)
+        if (!(g_fixed_holes_mask & (1ULL << s->hole_pos[i]))) n++;
+    return n;
+}
+
+/* Variant-4 gate: is a new hole at cell B disallowed by --fixedholes?  B is
+ * allowed if there is no whitelist, or B is whitelisted, or a wildcard slot
+ * remains (fewer than g_wildcard_holes holes currently sit outside the list). */
+static inline int v4_hole_blocked(const BState *s, int B) {
+    if (g_fixed_nholes == 0)              return 0;
+    if (g_fixed_holes_mask & (1ULL << B)) return 0;
+    return nonwl_hole_count(s) >= g_wildcard_holes;
+}
 
 /* --trace-csv: dump (state_id, parent_id, features) for every accepted
  * state to FILE.  Used for offline analysis of search-graph structure. */
@@ -1123,7 +1261,7 @@ static int count_potential_children(const BState *s) {
                 count++;  /* variant 3 */
             }
             int v4 = !g_holeless && s->nblocks < g_max_blocks && s->nholes < g_max_holes;
-            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B))) v4 = 0;
+            if (v4_hole_blocked(s, B)) v4 = 0;
             if (v4) count++;  /* variant 4 */
         }
     }
@@ -1677,6 +1815,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->player_pos      = (int8_t)C;
         s->committed_empty = new_E;
         s->depth          += 1;
+        s->seg_len        += 1;
         return 1;
     }
 
@@ -1701,6 +1840,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
             s->player_pos      = (int8_t)C;
             s->committed_empty = new_E;
             s->depth          += 1;
+            s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
             return 1;
         }
         /* Variant 3: introduce a new block.  B must be uncommitted, no
@@ -1717,6 +1857,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->player_pos      = (int8_t)C;
         s->committed_empty = new_E | (1ULL << B);
         s->depth          += 1;
+        s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
         return 1;
     }
 
@@ -1730,7 +1871,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         if (g_holeless) return 0;
         if (s->nblocks >= g_max_blocks) return 0;
         if (s->nholes  >= g_max_holes ) return 0;
-        if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL << B))) return 0;
+        if (v4_hole_blocked(s, B)) return 0;
         s->block_pos [s->nblocks] = (int8_t)P;
         s->block_mask[s->nblocks] = (uint8_t)(1 << D);
         s->nblocks++;
@@ -1740,6 +1881,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->player_pos      = (int8_t)C;
         s->committed_empty = new_E | (1ULL << B);
         s->depth          += 1;
+        s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
         return 1;
     }
     return 0;
@@ -1756,6 +1898,8 @@ static int build_seed_path_seed(BState *out) {
         .nholes          = 0,
         .committed_empty = 1ULL << g_exit_pos,
         .depth           = 0,
+        .seg_anchor1     = (int8_t)(g_exit_pos + 1),
+        .seg_len         = 0,
     };
     for (int i = 0; i < g_seed_path_n; i++) {
         int D = g_seed_path[i].direction;
@@ -1771,7 +1915,9 @@ static int build_seed_path_seed(BState *out) {
     return 1;
 }
 
-static void try_successor(const BState *s) {
+static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_done);
+static void try_successor(const BState *s) { try_successor_x(s, 0, 0, 0); }
+static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_done) {
     g_states_checked++;
     /* Periodic debounce check: if a new-best timer is running and
      * STREAM_DEBOUNCE_S has elapsed since it started, fire the print.
@@ -1797,6 +1943,25 @@ static void try_successor(const BState *s) {
         harvest_emit(s, sid, 'X', -99);
         return;
     }
+    /* --place-holes: enforce each hole-placement constraint.  Holes are
+     * non-decreasing with depth in the backward search, so a state at depth
+     * >= D still short of its quota never places them in time — prune it. */
+    for (int pi = 0; pi < g_place_count; pi++) {
+        if (s->depth < g_place[pi].depth) continue;
+        int cnt;
+        if (g_place[pi].mask == 0) {
+            cnt = s->nholes;
+        } else {
+            cnt = 0;
+            for (int hi = 0; hi < s->nholes; hi++)
+                if (g_place[pi].mask & (1ULL << s->hole_pos[hi])) cnt++;
+        }
+        if (cnt < g_place[pi].n) {
+            g_pruned_short++;
+            harvest_emit(s, sid, 'H', -99);
+            return;
+        }
+    }
     /* --single-axis-blocks: at most one block may be pushed along both
      * axes.  Directions 0=U,2=D form the vertical axis (mask 0x5); 1=R,3=L
      * the horizontal axis (mask 0xA).  A block spans both axes when its
@@ -1814,7 +1979,7 @@ static void try_successor(const BState *s) {
             return;
         }
     }
-    if (s->depth <= g_dupe_threshold) {
+    if (!dedup_done && s->depth <= g_dupe_threshold) {
         uint64_t key = canonical_state_key(s);
         int dup = g_two_tables ? dedup_two_tables(key, s->depth)
                                : dedup_check_and_insert(key, s->depth);
@@ -1831,18 +1996,44 @@ static void try_successor(const BState *s) {
      * depth), so we collect candidates into a pending buffer and
      * batch-evaluate at clip time (beam mode) or expand-end (DFS).
      * One batched libtorch call amortises to ~10μs per state. */
-    if (g_nn_surrogate_loaded && s->depth >= g_nn_surrogate_min_depth) {
+    if (!have_x && g_nn_surrogate_loaded && s->depth >= g_nn_surrogate_min_depth) {
         surrogate_pending_push(s, sid, g_current_parent_id);
         return;
     }
 
-    int x = shortcut_check(s);
+#ifdef WBPROF
+    struct timespec _w0, _w1; clock_gettime(CLOCK_MONOTONIC, &_w0);
+#endif
+    int x = have_x ? given_x : shortcut_check(s);
+#ifdef REF_CHECK
+    if (!have_x && sokoban_ref_active()) {   /* re-run without the reference and compare the decision */
+        sokoban_ref_suspend(1);
+        int pops_with = g_last_peak_heap;
+        int x2 = shortcut_check(s); g_refchk_n++;
+#ifdef WBPROF
+        { int kc = g_refchk_k >= 3 ? 3 : g_refchk_k; g_rc_n[kc]++; g_rc_pops_with[kc] += pops_with; g_rc_pops_without[kc] += g_last_peak_heap; g_last_peak_heap = pops_with; }
+#endif
+        if ((x2 >= 0) != (x >= 0)) { g_refchk_bad++; if (g_refchk_bad <= 5) { fprintf(stderr, "REF MISMATCH depth %d k %d var %d: with ref %d, without %d\n", s->depth, g_refchk_k, g_emit_V, x, x2); print_puzzle_for_exit(s, g_exit_pos); fflush(stdout); } }
+        sokoban_ref_suspend(0);
+    }
+#endif
+#ifdef WBPROF
+    clock_gettime(CLOCK_MONOTONIC, &_w1);
+    if (!have_x) { int k = g_emit_V == 1 ? (g_emit_walk_committed ? 0 : 1) : g_emit_V == 2 ? (g_emit_walk_committed ? 2 : 3) : g_emit_V == 3 ? 4 : 5;
+      g_wb_calls[k]++; if (x != -1) g_wb_pruned[k]++; g_wb_pops[k] += g_last_peak_heap;
+      double _dt = (_w1.tv_sec - _w0.tv_sec) + (_w1.tv_nsec - _w0.tv_nsec) * 1e-9;
+      g_wb_time[k] += _dt;
+      int kc = g_cur_ref_k >= 3 ? 3 : g_cur_ref_k; g_rk_calls[kc]++; g_rk_pops[kc] += g_last_peak_heap; g_rk_time[kc] += _dt; }
+#endif
     /* shortcut_check (cutoff variant) returns:
      *   >= 0 : a shortcut of that length exists (definitely prune).
      *   -1   : no shortcut within the cutoff (accept).
      *   -2   : heap overflow (conservatively prune).
+     *   -3   : hash-probe limit / heap cap hit — the state space was NOT
+     *          fully explored, so "no shortcut" is unproven.  Prune
+     *          conservatively (previously fell through and was accepted).
      *   -4   : --shortcut-state-cap exceeded (prune as too-branchy). */
-    if (x >= 0 || x == -2 || x == -4) {
+    if (x >= 0 || x == -2 || x == -3 || x == -4) {
         g_pruned_short++;
         if (x == -4) g_pruned_cap++;
         harvest_emit(s, sid, x >= 0 ? 'S' : (x == -4 ? 'V' : 'E'), x);
@@ -1869,6 +2060,23 @@ static void try_successor(const BState *s) {
     harvest_emit(s, sid, 'A', -1);
     BState ns = *s;
     ns.branch_factor = g_last_peak_heap;
+    if (g_ptab_active) {
+        int exported = 0;
+        if (!have_x) {
+            /* Every single-solved accepted state owns a table of its own (solved
+             * with a reference, the reference's entries are folded in at +k, see
+             * sokoban_export_settled), so its children reference it at k = 1. */
+            static uint64_t tk[HTP_EXPORT_MAX]; static int32_t tc[HTP_EXPORT_MAX];
+            int n = sokoban_export_settled(tk, tc, HTP_EXPORT_MAX);
+            if (n > 0) { ns.ptab1 = ptab_alloc(tk, tc, n) + 1; ns.ptab_k = 0; ns.ptab_delta = 0; ns.ptab_xor = 0; exported = 1;
+#ifdef WBPROF
+                g_export_entries += n;
+#endif
+            }
+        }
+        if (!exported && s->ptab1) g_ptab_inherited++;   /* keeps the ancestor's table at k (+1 applied by the caller) */
+        if (ns.ptab1) g_ptab[ns.ptab1 - 1].rc++;
+    } else ns.ptab1 = 0;
     if (trace_active) {
         ns.state_id = (int32_t)sid;
         if (g_trace_csv) {
@@ -1880,6 +2088,14 @@ static void try_successor(const BState *s) {
                     __builtin_popcountll(s->committed_empty & g_active_mask),
                     s->nblocks, s->nholes, s->player_pos, g_exit_pos, bx);
         }
+    }
+    if (g_probe_mode) {
+        if (g_probe_n < 64) {
+            g_probe_tagD[g_probe_n] = g_emit_D;
+            g_probe_tagV[g_probe_n] = g_emit_V;
+            g_probe_buf[g_probe_n++] = ns;
+        }
+        return;
     }
     q_push(&ns);
 }
@@ -1907,8 +2123,162 @@ static inline uint8_t wh_after_walk(uint8_t h, int w) {
                     : (uint8_t)(0x10u | ((h & 3) << 2) | w);
 }
 
+/* Decide and push every walk-back descendant of s that stays on committed
+ * cells (see g_bulk_walk).  Returns 0 if the multi solve did not fit, in which
+ * case the caller generates the immediate walk-back children the old way. */
+static int bulk_generate(const BState *s) {
+    const int P = s->player_pos;
+    uint64_t blk = 0, hol = 0;
+    for (int i = 0; i < s->nblocks; i++) blk |= 1ULL << s->block_pos[i];
+    for (int i = 0; i < s->nholes; i++) hol |= 1ULL << s->hole_pos[i];
+    uint64_t passable = s->committed_empty & g_walkable_mask & g_active_mask & ~blk & ~hol & ~(1ULL << g_exit_pos);
+    if (!(passable >> P & 1)) return 1;
+    /* BFS over the component; cells in order of distance from P. */
+    int8_t dist[MAX_NCELLS]; memset(dist, -1, sizeof dist);
+    int q[MAX_NCELLS], qh = 0, qt = 0; q[qt++] = P; dist[P] = 0;
+    while (qh < qt) {
+        int c = q[qh++];
+        for (int d = 0; d < 4; d++) { int nn = g_adj[c][d]; if (nn >= 0 && (passable >> nn & 1) && dist[nn] < 0) { dist[nn] = (int8_t)(dist[c] + 1); q[qt++] = nn; } }
+    }
+    if (qt <= 1) return 1;
+    /* Shortest-walk-segment prune, applied to the whole component at once: a
+     * descendant at C is worth a solve only if C lies "behind" P on a shortest
+     * known path to the segment anchor, i.e. wdist(C, anchor) == seg_len +
+     * dist(P, C).  Anything else has a shorter walk and would be pruned by the
+     * solver anyway (same rule expand() applies chain-wise; see walk_dist_bits). */
+    int8_t adist[MAX_NCELLS]; int have_anchor = 0;
+    if (s->seg_anchor1 > 0) {
+        int A = s->seg_anchor1 - 1;
+        uint64_t pa = s->committed_empty & ~blk & ~hol;
+        if (A != g_exit_pos) pa &= ~(1ULL << g_exit_pos);
+        memset(adist, -1, sizeof adist);
+        int q2[MAX_NCELLS], h2 = 0, t2 = 0; q2[t2++] = A; adist[A] = 0;
+        while (h2 < t2) {
+            int c = q2[h2++];
+            for (int d = 0; d < 4; d++) { int nn = g_adj[c][d]; if (nn >= 0 && (pa >> nn & 1) && adist[nn] < 0) { adist[nn] = (int8_t)(adist[c] + 1); q2[t2++] = nn; } }
+        }
+        have_anchor = 1;
+    }
+    /* Build each surviving descendant and run the dedup insert now, so cells
+     * already visited (from another branch) are not solved again.  The
+     * remaining ones go to the multi solve and then to try_successor_x with
+     * dedup_done = 1. */
+    BState cand[MAX_NCELLS]; int nk = 0;
+    for (int i = 1; i < qt; i++) {
+        int c = q[i];
+        if (have_anchor && adist[c] >= 0 && adist[c] < s->seg_len + dist[c]) { g_pruned_walkseg++; continue; }
+        if (s->depth + dist[c] > g_max_depth) { g_states_checked++; g_pruned_short++; continue; }
+        BState ns = *s;
+        ns.ptab1      = 0;
+        ns.player_pos = (int8_t)c;
+        ns.depth      = s->depth + dist[c];
+        ns.wh         = 0;
+        if (s->seg_anchor1 > 0) { int sl = s->seg_len + dist[c]; ns.seg_len = (int8_t)(sl > 127 ? 127 : sl); }
+        ns.bulk_walk  = 1;
+        if (ns.depth <= g_dupe_threshold) {
+            uint64_t key = canonical_state_key(&ns);
+            int dup = g_two_tables ? dedup_two_tables(key, ns.depth) : dedup_check_and_insert(key, ns.depth);
+            if (dup) { g_states_checked++; g_pruned_dedup++; continue; }
+        } else g_skipped_dedup++;
+        cand[nk++] = ns;
+    }
+    if (!nk) return 1;
+    Puzzle pz; build_partial_puzzle(s, &pz);
+    for (int base = 0; base < nk; base += 24) {
+        int8_t starts[24]; int16_t cut[24]; uint8_t out[24]; uint32_t pred[24]; int n = 0;
+        for (int i = base; i < nk && n < 24; i++) {
+            starts[n] = cand[i].player_pos; cut[n] = (int16_t)(cand[i].depth - 2); n++;
+        }
+        /* pred[j]: starts one step closer to P and adjacent to start j (a
+         * shortcut there implies one at j — see sokoban_solve_multi). */
+        for (int j = 0; j < n; j++) {
+            pred[j] = 0;
+            for (int k = 0; k < n; k++)
+                if (k != j && dist[starts[k]] == dist[starts[j]] - 1)
+                    for (int d = 0; d < 4; d++) if (g_adj[starts[j]][d] == starts[k]) pred[j] |= 1u << k;
+        }
+        if (!n) continue;
+        BfsProfile prof = { .peak_heap_sz = 0, .states_popped = 0 };
+#ifdef WBPROF
+        struct timespec b0, b1; clock_gettime(CLOCK_MONOTONIC, &b0);
+#endif
+        uint8_t refk[24]; int have_ref = 0;
+        if (g_ptab_active && s->ptab1) {   /* table loaded once by expand(); per-start chain offsets */
+            for (int j = 0; j < n; j++) { int kk = s->ptab_k + dist[starts[j]]; refk[j] = (uint8_t)(kk > 250 ? 250 : kk); }
+            sokoban_ref_set_k(0); sokoban_ref_set_xor(s->ptab_xor); sokoban_ref_suspend(0); have_ref = sokoban_ref_active();
+            if (have_ref && s->ptab_delta) sokoban_set_reference_delta(s->ptab_delta, pz.walls, g_exit_pos);
+            for (int j = 0; j < n; j++) { cand[base + j].ptab1 = s->ptab1; cand[base + j].ptab_k = (int16_t)(s->ptab_k + dist[starts[j]]); cand[base + j].ptab_delta = s->ptab_delta; cand[base + j].ptab_xor = s->ptab_xor; }
+        }
+        int rc = sokoban_solve_multi(&pz, starts, cut, pred, have_ref ? refk : NULL, n, out, &prof);
+        sokoban_ref_suspend(1);   /* k = 0 here is meaningless for any other check */
+#ifdef WBPROF
+        clock_gettime(CLOCK_MONOTONIC, &b1); g_bulk_time += (b1.tv_sec - b0.tv_sec) + (b1.tv_nsec - b0.tv_nsec) * 1e-9;
+        g_bulk_pops += prof.states_popped; g_bulk_expansions += prof.peak_heap_sz;
+#endif
+        g_solver_calls++; g_bulk_calls++;
+        if (rc < 0) {
+            /* Did not fit: decide these candidates one by one (they are already
+             * dedup-inserted, so the caller must not regenerate them). */
+            g_bulk_fallbacks++;
+            for (int i = 0; i < n; i++) {
+                g_emit_D = -1; g_emit_V = 1; g_emit_walk_committed = 1;
+                if (have_ref) {   /* same table, this candidate's own chain offset */
+                    sokoban_ref_set_k(cand[base + i].ptab_k); sokoban_ref_set_xor(cand[base + i].ptab_xor); sokoban_ref_suspend(0);
+                    if (cand[base + i].ptab_delta) sokoban_set_reference_delta(cand[base + i].ptab_delta, pz.walls, g_exit_pos);
+#ifdef WBPROF
+                    g_cur_ref_k = cand[base + i].ptab_k;
+#endif
+                }
+                try_successor_x(&cand[base + i], 0, 0, 1);
+                sokoban_ref_suspend(1);
+#ifdef WBPROF
+                g_cur_ref_k = 0;
+#endif
+            }
+            continue;
+        }
+        g_bulk_starts += n;
+#ifdef BULK_CHECK
+        for (int i = 0; i < n; i++) {
+            Puzzle p2 = pz; p2.player_start = starts[i]; BfsProfile pr2 = {0};
+            sokoban_ref_suspend(1);
+            int x = sokoban_solve_cutoff(&p2, NULL, &pr2, cut[i]);
+            int single_short = (x >= 0);
+            if (x != -2 && x != -3 && single_short != out[i]) {
+                static int nrep = 0;
+                if (nrep++ < 4) {
+                    fprintf(stderr, "BULK MISMATCH: depth %d P=%d start %d dist %d cut %d multi=%d single=%d nb=%d nh=%d committed=%llx\n",
+                            s->depth, P, starts[i], dist[starts[i]], cut[i], out[i], x, s->nblocks, s->nholes, (unsigned long long)s->committed_empty);
+                    print_puzzle_for_exit(s, g_exit_pos); fflush(stdout);
+                }
+            }
+        }
+#endif
+        /* Push nearest cells LAST so the DFS pops them first: their subtrees
+         * reach shared states at the lowest depth, so the two-table dedup sees
+         * those keys at their final depth first and re-explores less. */
+        for (int i = n - 1; i >= 0; i--) {
+            g_emit_D = -1; g_emit_V = 1;
+            try_successor_x(&cand[base + i], 1, out[i] ? 0 : -1, 1);   /* 0: a shortcut exists (length not needed); -1: none */
+        }
+    }
+    return 1;
+}
+
 static void expand(const BState *s) {
     int P = s->player_pos;
+    /* Ancestor table: build the lookup once for every check made here (bulk
+     * walk-backs, eligible single children); each caller sets its own chain
+     * offset k and puzzle delta, non-eligible checks run with it suspended. */
+    int ref_loaded = 0;
+    if (g_ptab_active && s->ptab1) { sokoban_ref_attach(&g_ptab[s->ptab1 - 1].t); ref_loaded = 1; g_ptab_used++; }
+    sokoban_ref_suspend(1);
+    /* Walk-backs over committed cells: handled in bulk for the whole component
+     * by the nearest non-bulk ancestor (this state, unless it is itself a bulk
+     * child).  Only if the multi solve did not fit do we fall back to
+     * generating them one step at a time here. */
+    int skip_committed_walks = 0;
+    if (g_bulk_walk_active && s->depth >= g_bulk_min_depth) skip_committed_walks = s->bulk_walk ? 1 : bulk_generate(s);
     /* Fast occupancy lookup for the current state's blocks and active holes. */
     uint64_t blk_occ = 0;
     int8_t blk_idx_at[MAX_NCELLS];
@@ -1947,6 +2317,8 @@ static void expand(const BState *s) {
          * priority within the direction without affecting direction order.
          * Max 3 per direction (walk + var3 + var4). */
         BState d_bufs[4];
+        int8_t d_var[4], d_ref[4] = {0, 0, 0, 0};
+        uint64_t d_xor[4] = {0, 0, 0, 0};
         int d_n = 0;
 
         /* Successor 1: walk-back.  The player moves P->C, i.e. grid dir D^2.
@@ -1954,13 +2326,23 @@ static void expand(const BState *s) {
          * consecutive walks (provably suboptimal, subtree all over-deep). */
         {
             int w = D ^ 2;
-            if (!(wh_forbidden(s->wh) & (1u << w))) {
-                BState ns = *s;
+            g_emit_walk_committed = (s->committed_empty >> C) & 1;   /* origin cell already known: same forward board as the parent */
+            int walk_ok = !(wh_forbidden(s->wh) & (1u << w));
+            if (skip_committed_walks && (s->committed_empty >> C & 1)) walk_ok = 0;
+            if (walk_ok && s->seg_anchor1 > 0) {
+                uint64_t passable = new_E & ~blk_occ & ~hole_occ;
+                if (s->seg_anchor1 - 1 != g_exit_pos) passable &= ~(1ULL << g_exit_pos);  /* walking onto the exit ends the game */
+                if (walk_dist_bits(passable, C, s->seg_anchor1 - 1) < s->seg_len + 1) { walk_ok = 0; g_pruned_walkseg++; }
+            }
+            if (walk_ok) {
+                BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;
+                d_ref[d_n] = 1;   /* same puzzle up to the newly committed cell C (delta) */   /* only bulk_generate() makes bulk children */
                 ns.player_pos      = (int8_t)C;
                 ns.committed_empty = new_E;
                 ns.depth           = s->depth + 1;
                 ns.wh              = wh_after_walk(s->wh, w);
-                d_bufs[d_n++] = ns;
+                ns.seg_len         = (int8_t)(s->seg_len + 1);
+                d_var[d_n] = 1; d_bufs[d_n++] = ns;
             }
         }
 
@@ -1976,7 +2358,10 @@ static void expand(const BState *s) {
                     /* Successor 2: backward-push existing block from B to P.
                      * Mask of that block gets bit D OR'd in. */
                     int idx = blk_idx_at[B];
-                    BState ns = *s;
+                    BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
+                    /* Identical forward puzzle iff the origin cell was already committed and the
+                     * block already had this push direction: then the parent's table applies. */
+                    d_ref[d_n] = (s->block_mask[idx] >> D) & 1;   /* mask unchanged: same puzzle up to cell C */
                     ns.block_pos [idx]  = (int8_t)P;
                     ns.block_mask[idx] |= (uint8_t)(1 << D);
                     sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
@@ -1984,7 +2369,8 @@ static void expand(const BState *s) {
                     ns.committed_empty = new_E;
                     ns.depth           = s->depth + 1;
                     ns.wh              = 0;   /* push resets the walk run */
-                    d_bufs[d_n++] = ns;
+                    ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
+                    d_var[d_n] = 2; d_bufs[d_n++] = ns;
                 } else if (hole_occ & (1ULL <<B)) {
                     /* B has an active hole — variant 3 (no consume) is impossible
                      * since a block can't sit on an active hole.  Variant 4
@@ -2004,7 +2390,7 @@ static void expand(const BState *s) {
                      * occupying B for the entire backward trace up to now),
                      * then push it back to P. */
                     if (!(s->committed_empty & (1ULL <<B)) && s->nblocks < g_max_blocks) {
-                        BState ns = *s;
+                        BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
                         ns.block_pos [ns.nblocks] = (int8_t)P;
                         ns.block_mask[ns.nblocks] = (uint8_t)(1 << D);
                         ns.nblocks++;
@@ -2013,7 +2399,8 @@ static void expand(const BState *s) {
                         ns.committed_empty = new_E | (1ULL <<B);
                         ns.depth           = s->depth + 1;
                         ns.wh              = 0;   /* push resets the walk run */
-                        d_bufs[d_n++] = ns;
+                        ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
+                        d_var[d_n] = 3; d_bufs[d_n++] = ns;
                     }
 
                     /* Successor 4: backward un-consume.  Reverses a forward push
@@ -2026,10 +2413,10 @@ static void expand(const BState *s) {
                      * entered the trace.  Skipped entirely under --holeless. */
                     /* When --fixedholes is non-empty, restrict variant 4's hole
                      * placement: B must be one of the listed cells. */
-                    int v4_blocked = (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B)));
+                    int v4_blocked = v4_hole_blocked(s, B);
                     if (!v4_blocked && !g_holeless
                         && s->nblocks < g_max_blocks && s->nholes < g_max_holes) {
-                        BState ns = *s;
+                        BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
                         ns.block_pos [ns.nblocks] = (int8_t)P;
                         ns.block_mask[ns.nblocks] = (uint8_t)(1 << D);
                         ns.nblocks++;
@@ -2040,7 +2427,12 @@ static void expand(const BState *s) {
                         ns.committed_empty = new_E | (1ULL <<B);
                         ns.depth           = s->depth + 1;
                         ns.wh              = 0;   /* push resets the walk run */
-                        d_bufs[d_n++] = ns;
+                        ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
+                        /* Once the new block is consumed into B the board is the parent's exactly
+                         * (hole keys are per cell), the key differing by the consumed block's term:
+                         * the parent's table applies to that part of the child's search. */
+                        d_ref[d_n] = 1; d_xor[d_n] = sokoban_zobrist_block(1 << D, g_consumed);
+                        d_var[d_n] = 4; d_bufs[d_n++] = ns;
                     }
                 }
             }
@@ -2049,12 +2441,36 @@ static void expand(const BState *s) {
         /* Dispatch this direction's successors.  --reverse flips the
          * variant priority within the direction; direction priority
          * (determined by the outer D loop) is unchanged. */
-        if (g_reverse_order) {
-            for (int i = d_n - 1; i >= 0; i--) try_successor(&d_bufs[i]);
-        } else {
-            for (int i = 0; i < d_n; i++) try_successor(&d_bufs[i]);
+        for (int ii = 0; ii < d_n; ii++) {
+            int i = g_reverse_order ? d_n - 1 - ii : ii;
+            g_emit_D = (int8_t)D; g_emit_V = d_var[i];
+            if (d_ref[i] && ref_loaded) {
+                PTab *t = &g_ptab[s->ptab1 - 1];
+                uint64_t delta = s->ptab_delta | (d_bufs[i].committed_empty & ~s->committed_empty);
+                d_bufs[i].ptab1 = s->ptab1; d_bufs[i].ptab_k = (int16_t)(s->ptab_k + 1); d_bufs[i].ptab_delta = delta; d_bufs[i].ptab_xor = s->ptab_xor ^ d_xor[i];
+                sokoban_ref_set_k(s->ptab_k + 1); sokoban_ref_set_xor(d_bufs[i].ptab_xor); sokoban_ref_suspend(0);
+                if (delta) { sokoban_set_reference_delta(delta, g_active_mask & ~d_bufs[i].committed_empty, g_exit_pos); g_ptab_delta_refs++; }
+#ifdef REF_CHECK
+                g_refchk_t = t; g_refchk_k = s->ptab_k + 1;
+#else
+                (void)t;
+#endif
+#ifdef WBPROF
+                g_cur_ref_k = s->ptab_k + 1;
+#endif
+                try_successor(&d_bufs[i]);
+#ifdef WBPROF
+                g_cur_ref_k = 0;
+#endif
+#ifdef REF_CHECK
+                g_refchk_t = NULL;
+#endif
+                sokoban_ref_suspend(1);
+            } else { sokoban_ref_suspend(1); try_successor(&d_bufs[i]); }
         }
     }
+    if (ref_loaded) sokoban_clear_reference();
+    if (s->ptab1) ptab_release(s->ptab1 - 1);
 }
 
 /* -------------------------------------------------------------------------
@@ -2210,6 +2626,7 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
             ns.player_pos      = (int8_t)C;
             ns.committed_empty = new_E;
             ns.depth           = s->depth + 1;
+            ns.seg_anchor1 = 0; ns.seg_len = 0;   /* segment unknown here: prune disabled until the next push */
             out_buf[n++] = ns;
         }
 
@@ -2231,6 +2648,7 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.player_pos      = (int8_t)C;
                 ns.committed_empty = new_E;
                 ns.depth           = s->depth + 1;
+                ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
                 out_buf[n++] = ns;
             }
         } else if (hole_occ & (1ULL <<B)) {
@@ -2253,11 +2671,12 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.player_pos      = (int8_t)C;
                 ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
+                ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
                 out_buf[n++] = ns;
             }
             /* Variant 4 — un-consume (introduce block + hole). */
             int v4_allowed = 1;
-            if (g_fixed_nholes > 0 && !(g_fixed_holes_mask & (1ULL <<B))) v4_allowed = 0;
+            if (v4_hole_blocked(s, B)) v4_allowed = 0;
             if (g_holeless) v4_allowed = 0;
             if (s->nblocks >= g_max_blocks || s->nholes >= g_max_holes) v4_allowed = 0;
             if (v4_allowed && n < max_out) {
@@ -2271,6 +2690,7 @@ static int enumerate_successors(const BState *s, BState *out_buf, int max_out) {
                 ns.player_pos      = (int8_t)C;
                 ns.committed_empty = new_E | (1ULL <<B);
                 ns.depth           = s->depth + 1;
+                ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
                 out_buf[n++] = ns;
             }
         }
@@ -3429,6 +3849,175 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
 static const BState *g_task_seeds = NULL;
 static int           g_task_seed_count = 0;
 
+/* -------------------------------------------------------------------------
+ * --estimate: Knuth random-probe tree-size estimation (see globals above).
+ * ------------------------------------------------------------------------- */
+typedef struct { BState st; char path[128]; } LayerNode;
+
+static void path_append(char *path, size_t cap, int D, int V) {
+    size_t n = strlen(path);
+    /* --seed-path digits are user-facing: 1 walk, 2 push (existing or new block), 3 un-consume. */
+    int digit = (V == 4) ? 3 : (V == 3) ? 2 : V;
+    snprintf(path + n, cap - n, "%s%c%d", n ? "," : "", "URDL"[D], digit);
+}
+
+static void run_estimate(void) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    refresh_canonical_for_exit(g_exit_pos);
+    if (g_two_tables) {
+        memset(g_shallow, 0, SHALLOW_CAP * sizeof *g_shallow);
+        memset(g_recent,  0, RECENT_CAP  * sizeof *g_recent);
+        g_shallow_count = 0; g_recent_count = 0; g_recent_clock = 1;
+    } else {
+        memset(g_visited, 0, HASH_CAP * sizeof *g_visited);
+    }
+    g_visited_count = 0; g_states_checked = 0; g_pruned_short = 0; g_pruned_dedup = 0;
+    g_solver_calls = 0; g_skipped_dedup = 0;
+    int saved_best = g_best_depth, saved_overall = g_overall_best_depth;
+    g_best_depth = INT_MAX; g_overall_best_depth = INT_MAX;   /* silence new-best streaming */
+
+    /* Roots, exactly as run_exit_search would seed them. */
+    size_t lcap = 4096, ln = 0;
+    LayerNode *layer = malloc(lcap * sizeof *layer);
+    if (g_have_seed_path) {
+        BState seed;
+        if (!build_seed_path_seed(&seed)) { free(layer); return; }
+        layer[ln].st = seed; layer[ln].path[0] = 0;
+        for (int i = 0; i < g_seed_path_n; i++)   /* prefix = the seed path itself, so LAYER lines are complete --seed-path strings */
+            path_append(layer[ln].path, 128, g_seed_path[i].direction, g_seed_path[i].variant);
+        ln++;
+    } else if (g_task_seeds && g_task_seed_count > 0) {
+        for (int i = 0; i < g_task_seed_count; i++) {
+            if (ln == lcap) { lcap *= 2; layer = realloc(layer, lcap * sizeof *layer); }
+            layer[ln].st = g_task_seeds[i]; snprintf(layer[ln].path, 128, "task%d.%d", g_only_task, i); ln++;
+        }
+    } else {
+        BState init = { .player_pos = (int8_t)g_exit_pos, .committed_empty = 1ULL << g_exit_pos, .depth = 0,
+                        .seg_anchor1 = (int8_t)(g_exit_pos + 1), .seg_len = 0 };
+        layer[ln].st = init; layer[ln].path[0] = 0; ln++;
+    }
+    int root_depth = layer[0].st.depth;
+    int K = root_depth + g_estimate_layer;
+
+    /* 1. Exact enumeration of the depth-K layer (dedup ON, probe intercept ON). */
+    g_probe_mode = 1;
+    long long layer_nodes_seen = 0;   /* accepted nodes strictly above the layer */
+    LayerNode *next = malloc(lcap * sizeof *next); size_t ncap = lcap, nn = 0;
+    for (int d = root_depth; d < K; d++) {
+        nn = 0;
+        for (size_t i = 0; i < ln; i++) {
+            g_probe_n = 0;
+            expand(&layer[i].st);
+            for (int c = 0; c < g_probe_n; c++) {
+                if (nn == ncap) { ncap *= 2; next = realloc(next, ncap * sizeof *next); }
+                next[nn].st = g_probe_buf[c];
+                memcpy(next[nn].path, layer[i].path, 128);
+                path_append(next[nn].path, 128, g_probe_tagD[c], g_probe_tagV[c]);
+                nn++;
+            }
+        }
+        layer_nodes_seen += (long long)ln;
+        LayerNode *t = layer; layer = next; next = t; size_t tc = lcap; lcap = ncap; ncap = tc; ln = nn;
+        if (ln == 0) break;
+    }
+    long long layer_checked = g_states_checked, layer_calls = g_solver_calls;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double t_layer = elapsed_s(t0, t1);
+    printf("[estimate] exit %d: depth-%d layer = %zu nodes (%lld accepted above it, %lld states checked, %.2f s)\n",
+           g_exit_pos, K, ln, layer_nodes_seen, layer_checked, t_layer);
+    fflush(stdout);
+    if (ln == 0) { g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall; free(layer); free(next); return; }
+    if (g_list_layer) {
+        /* One job per line: seed path, depth, blocks, holes.  Together with the
+         * ancestors (all depth < K, none can be a record) these subtrees cover
+         * the whole DFS tree of this exit; duplicates were removed by dedup. */
+        for (size_t i = 0; i < ln; i++)
+            printf("LAYER\t%d\t%s\t%d\t%d\t%d\n", g_exit_pos, layer[i].path, layer[i].st.depth,
+                   layer[i].st.nblocks, layer[i].st.nholes);
+        fflush(stdout);
+        g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall; free(layer); free(next); return;
+    }
+
+    /* 2. Probes: no dedup below the layer. */
+    int saved_thr = g_dupe_threshold; g_dupe_threshold = -1;
+    int m = (int)((g_estimate_probes + (long)ln - 1) / (long)ln); if (m < 1) m = 1;
+    double *node_est = calloc(ln, sizeof(double));      /* est accepted nodes in subtree (excl. layer node) */
+    double *node_est2 = calloc(ln, sizeof(double));
+    double *chk_est = calloc(ln, sizeof(double));       /* est states checked in subtree */
+    double *time_est = calloc(ln, sizeof(double)), *time_est2 = calloc(ln, sizeof(double)); /* est expand() seconds in subtree */
+    static double depth_est[4096]; memset(depth_est, 0, sizeof depth_est);
+    int max_probe_depth = 0; long probes = 0;
+    long long chk0 = g_states_checked; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (size_t i = 0; i < ln; i++) {
+        for (int r = 0; r < m; r++) {
+            BState cur = layer[i].st; double w = 1.0, nodes = 0, checked = 0, tw = 0;
+            for (;;) {
+                long long c0 = g_states_checked;
+                g_probe_n = 0;
+                struct timespec e0, e1; clock_gettime(CLOCK_MONOTONIC, &e0);
+                expand(&cur);
+                clock_gettime(CLOCK_MONOTONIC, &e1);
+                tw += w * elapsed_s(e0, e1);
+                checked += w * (double)(g_states_checked - c0);
+                int c = g_probe_n;
+                if (c == 0) break;
+                w *= c;
+                nodes += w;
+                int d = cur.depth + 1; if (d < 4096) depth_est[d] += w;
+                if (d > max_probe_depth) max_probe_depth = d;
+                cur = g_probe_buf[rand() % c];
+            }
+            node_est[i] += nodes / m; node_est2[i] += nodes * nodes / m; chk_est[i] += checked / m; time_est[i] += tw / m; time_est2[i] += tw * tw / m;
+            probes++;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double t_probe = elapsed_s(t0, t1);
+    long long probe_checked = g_states_checked - chk0;
+    double us_per_checked = probe_checked ? t_probe * 1e6 / (double)probe_checked : 0;
+
+    double tot_nodes = 0, tot_var = 0, tot_chk = 0, tot_time = 0, tot_tvar = 0;
+    for (size_t i = 0; i < ln; i++) {
+        tot_nodes += node_est[i]; tot_chk += chk_est[i]; tot_time += time_est[i];
+        double var = node_est2[i] - node_est[i] * node_est[i]; if (var < 0) var = 0;
+        tot_var += var / m;
+        double tvar = time_est2[i] - time_est[i] * time_est[i]; if (tvar < 0) tvar = 0;
+        tot_tvar += tvar / m;
+    }
+    double se = sqrt(tot_var), tse = sqrt(tot_tvar);
+    double est_time = tot_time + t_layer;
+    printf("[estimate] probes=%ld (%d per layer node), %.2f s, %.2f us per state checked (probe rate; %lld checked, %lld solver calls, %lld shortcut-pruned)\n",
+           probes, m, t_probe, us_per_checked, probe_checked, g_solver_calls - layer_calls, g_pruned_short);
+    printf("[estimate] accepted nodes below layer: %.3g  (SE %.2g, %.0f%%)   states checked: %.3g\n",
+           tot_nodes, se, tot_nodes ? 100 * se / tot_nodes : 0, tot_chk);
+    printf("[estimate] est. DFS time (dedup-free, time-weighted probes): %.3g s = %.2f h = %.2f d  (SE %.0f%%);  x0.7 with dedup ~ %.2f h\n",
+           est_time, est_time / 3600, est_time / 86400, tot_time ? 100 * tse / tot_time : 0, 0.7 * est_time / 3600);
+    (void)us_per_checked;
+    printf("[estimate] deepest probe: depth %d\n", max_probe_depth);
+    printf("[estimate] est. nodes per depth band:\n");
+    for (int d = 0; d <= max_probe_depth; d += 10) {
+        double sum = 0; for (int k = d; k < d + 10 && k < 4096; k++) sum += depth_est[k] / m;
+        if (sum > 0) printf("   %3d-%-3d %.3g\n", d, d + 9, sum);
+    }
+    /* Heaviest layer nodes (job-splitting hints). */
+    int show = ln < 12 ? (int)ln : 12;
+    int *idx = malloc(ln * sizeof(int)); for (size_t i = 0; i < ln; i++) idx[i] = (int)i;
+    for (int a = 0; a < show; a++) {
+        int best = a;
+        for (size_t b = a + 1; b < ln; b++) if (node_est[idx[b]] > node_est[idx[best]]) best = (int)b;
+        int t = idx[a]; idx[a] = idx[best]; idx[best] = t;
+    }
+    printf("[estimate] heaviest layer nodes (est nodes, share, seed path):\n");
+    for (int a = 0; a < show; a++)
+        printf("   %.3g  %5.1f%%  %s\n", node_est[idx[a]], tot_nodes ? 100 * node_est[idx[a]] / tot_nodes : 0, layer[idx[a]].path);
+    fflush(stdout);
+
+    free(idx); free(node_est); free(node_est2); free(chk_est); free(time_est); free(time_est2); free(layer); free(next);
+    g_dupe_threshold = saved_thr; g_probe_mode = 0;
+    g_best_depth = saved_best; g_overall_best_depth = saved_overall;
+}
+
 static double run_exit_search(double remaining_s, int *out_exhausted, int *out_dedup_full) {
     refresh_canonical_for_exit(g_exit_pos);
     /* Reset per-exit state. */
@@ -3444,6 +4033,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         memset(g_visited, 0, HASH_CAP * sizeof *g_visited);
     }
     g_visited_count  = 0;
+    g_pruned_walkseg = 0;
     g_q_tail         = 0;
     g_q_peak         = 0;
     g_best_depth     = 0;
@@ -3455,6 +4045,15 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_solver_calls   = 0;
     g_dedup_full     = 0;
     g_skipped_dedup  = 0;
+
+    /* Bulk walk-back generation only fits the plain DFS (children at depth+k
+     * break beam levels and layer listings) and needs no exact solve lengths
+     * (harvest / trace record them). */
+    g_bulk_walk_active = g_bulk_walk && g_beam_width == 0 && g_rollout_steps == 0
+                         && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
+    g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0;
+    g_ptab_active = g_beam_width == 0 && g_rollout_steps == 0 && !g_no_ptab;
+    g_ptab_saved = g_ptab_used = g_ptab_inherited = g_ptab_delta_refs = 0;
 
     if (g_have_seed_path) {
         /* Seed-path mode: start from the standard root and replay the
@@ -3492,6 +4091,8 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
             .nholes          = 0,
             .committed_empty = 1ULL <<g_exit_pos,
             .depth           = 0,
+            .seg_anchor1     = (int8_t)(g_exit_pos + 1),
+            .seg_len         = 0,
         };
         g_best_state = init;
         {
@@ -3543,6 +4144,8 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                     .nholes          = 0,
                     .committed_empty = (1ULL <<g_exit_pos) | (1ULL <<X) | (1ULL <<Y),
                     .depth           = 1,
+                    .seg_anchor1     = (int8_t)(Y + 1),   /* final move is the push from Y */
+                    .seg_len         = 0,
                 };
                 seed.block_pos [0] = (int8_t)g_exit_pos;
                 seed.block_mask[0] = (uint8_t)(1u << D);
@@ -3728,9 +4331,13 @@ static void print_usage(const char *prog) {
         "  --allow-exit-transit  allow blocks to be pushed onto the exit and back off during play\n"
         "  --allow-block-on-exit permit the puzzle to start with a block on the exit (implies transit)\n"
         "                          (block still cannot start at exit at puzzle setup).  Default: off.\n"
-        "  --mandatory-holes     enable the solver's mandatory-hole prune (sound speedup; off by\n"
+        "  --mandatory-holes [c,c,...]\n"
+        "                          enable the solver's mandatory-hole prune (sound speedup; off by\n"
         "                          default).  Big win on dense/deep walled multi-hole boards,\n"
-        "                          marginal on sparse ones.\n"
+        "                          marginal on sparse ones.  Optional cell list: holes at those\n"
+        "                          cells are forced mandatory (union with the reachability check,\n"
+        "                          flood skipped for them).  Forcing a hole that is not truly\n"
+        "                          mandatory is unsound (may drop valid states) — caller's call.\n"
         "  --reverse             invert variant priority within each direction.  In DFS (LIFO),\n"
         "                          default order explores un-consume (4) then new-block / push-\n"
         "                          existing (3 / 2) then walk-back (1); with --reverse, walk-back\n"
@@ -3833,10 +4440,39 @@ static void print_usage(const char *prog) {
         "                          Default: %d (no extra constraint beyond MAX_BLOCKS).\n"
         "  --num-holes N         cap the number of active holes to at most N (counts --fixedholes).\n"
         "                          Default: %d (no extra constraint beyond MAX_HOLES).\n"
-        "  --fixedholes c,c,...  if non-empty, holes are *only* allowed at these cells.  The\n"
-        "                          search may use 0..N holes drawn from this list.  Pairs cleanly\n"
-        "                          with --num-holes (cap) and --holeless (forbid all).  Default:\n"
-        "                          none (holes may appear anywhere in the active region).\n"
+        "  --fixedholes c,c,...  if non-empty, holes are allowed at these cells.  The search may\n"
+        "                          use 0..len holes drawn from this list.  If --num-holes N is set\n"
+        "                          LARGER than the list size, the surplus (N - len) becomes\n"
+        "                          'wildcard' holes allowed anywhere else — e.g. --fixedholes 7,13\n"
+        "                          --num-holes 3 allows holes at 7/13 plus up to 1 hole anywhere.\n"
+        "                          Without an explicit --num-holes it stays a hard whitelist.\n"
+        "                          Pairs with --holeless (forbid all).  Default: holes anywhere.\n"
+        "  --place-holes N D [c,c,...]\n"
+        "                          require at least N active holes to exist by depth D: any state\n"
+        "                          at depth >= D with fewer than N qualifying holes is pruned (its\n"
+        "                          subtree can never place them in time).  Optional cell list\n"
+        "                          restricts the count to holes at those cells (e.g. 2 25 7,13 =\n"
+        "                          both 7 and 13 filled by depth 25).  Repeatable: each flag adds\n"
+        "                          one constraint, all enforced (e.g. --place-holes 1 5 7\n"
+        "                          --place-holes 1 25 13).  NB depth is BACKWARD depth, and holes\n"
+        "                          accumulate with it, so small D forces early hole creation and\n"
+        "                          caps achievable depth.  Default: off.\n"
+        "  --no-bulk-walk        generate walk-back children one step at a time with a solver\n"
+        "                          call each instead of deciding every walk-back descendant over\n"
+        "                          committed cells with one multi-start solve (default on; exact\n"
+        "                          either way; ~10% faster on deep 5x5 classes).  --bulk-walk = on.\n"
+        "  --estimate N          do not search: estimate the size of the DFS tree instead.\n"
+        "                          Enumerates the depth-K layer exactly (K = --estimate-depth,\n"
+        "                          default 6), then runs ~N random root-to-leaf probes (Knuth\n"
+        "                          estimator; every prune except dedup) and prints estimated\n"
+        "                          nodes, states checked, wall time, depth profile and the\n"
+        "                          heaviest layer nodes as --seed-path strings for splitting.\n"
+        "                          Honours --exit/--task-id/--seed-path and every search cap.\n"
+        "  --estimate-depth K    layer depth for --estimate (default 6).\n"
+        "  --list-layer K        print the dedup'd depth-K layer, one LAYER line per node\n"
+        "                          (exit, --seed-path string, depth, blocks, holes), then exit.\n"
+        "                          Feed the paths to independent --seed-path --time 0 jobs to\n"
+        "                          split an exhaustive search across processes / sessions.\n"
         "  --harvest FILE        emit a packed binary record per *visited* state (accepted +\n"
         "                          shortcut-pruned + dedup-pruned + cap-pruned) with full state\n"
         "                          blob, canonical key, and forward-solve value.  If FILE ends in\n"
@@ -3967,6 +4603,24 @@ int main(int argc, char **argv) {
             g_allow_exit_transit  = 1;   /* required to generate block-on-exit states */
         } else if (strcmp(argv[i], "--mandatory-holes") == 0) {
             g_mandatory_holes = 1;
+            /* Optional cell list, e.g. --mandatory-holes 0,1: holes at these
+             * cells are forced mandatory (union with the reachability check;
+             * the flood is skipped for them).  Present iff the next token
+             * begins with a digit — no flag does. */
+            if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                const char *p = argv[++i];
+                while (*p) {
+                    char *end;
+                    long v = strtol(p, &end, 10);
+                    if (end == p || v < 0 || v >= MAX_NCELLS) {
+                        fprintf(stderr, "error: invalid cell '%s' in --mandatory-holes\n", p); return 1;
+                    }
+                    g_forced_mand_cells |= (1ULL << v);
+                    p = end;
+                    if (*p == ',') p++;
+                    else if (*p) { fprintf(stderr, "error: expected ',' in --mandatory-holes\n"); return 1; }
+                }
+            }
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse_order = 1;
         } else if (strcmp(argv[i], "--shortcut-state-cap") == 0) {
@@ -4254,6 +4908,24 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--single-axis-strict") == 0) {
             g_single_axis_blocks = 1;
             g_axis_both_ways     = 1;
+        } else if (strcmp(argv[i], "--bulk-walk") == 0) {
+            g_bulk_walk = 1;
+        } else if (strcmp(argv[i], "--no-bulk-walk") == 0) {
+            g_bulk_walk = 0;
+        } else if (strcmp(argv[i], "--no-parent-table") == 0) {
+            g_no_ptab = 1;
+        } else if (strcmp(argv[i], "--bulk-min-depth") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --bulk-min-depth requires D\n"); return 1; }
+            g_bulk_min_depth = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--estimate") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --estimate requires N\n"); return 1; }
+            g_estimate_probes = atoi(argv[i]);
+        } else if (strcmp(argv[i], "--list-layer") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --list-layer requires K\n"); return 1; }
+            g_estimate_layer = atoi(argv[i]); g_list_layer = 1; g_estimate_probes = 1;
+        } else if (strcmp(argv[i], "--estimate-depth") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --estimate-depth requires K\n"); return 1; }
+            g_estimate_layer = atoi(argv[i]);
         } else if (strcmp(argv[i], "--max-depth") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --max-depth requires N\n"); return 1; }
             int n = atoi(argv[i]);
@@ -4273,6 +4945,47 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "error: --num-holes must be in [0..%d]\n", MAX_HOLES); return 1;
             }
             g_max_holes = n;
+            g_num_holes_set = 1;
+        } else if (strcmp(argv[i], "--place-holes") == 0) {
+            if (i + 2 >= argc) {
+                fprintf(stderr, "error: --place-holes requires at least N D (hole count and by-depth)\n"); return 1;
+            }
+            if (g_place_count >= MAX_PLACE) {
+                fprintf(stderr, "error: too many --place-holes (max %d)\n", MAX_PLACE); return 1;
+            }
+            int pn = atoi(argv[++i]);
+            int pd = atoi(argv[++i]);
+            if (pn < 0 || pd < 0) {
+                fprintf(stderr, "error: --place-holes N D must both be >= 0\n"); return 1;
+            }
+            uint64_t pmask = 0;
+            /* Optional cell list, e.g. --place-holes 2 25 7,13: restrict the
+             * count to holes at these cells.  Present iff the next token starts
+             * with a digit (no flag does). */
+            if (i + 1 < argc && argv[i+1][0] >= '0' && argv[i+1][0] <= '9') {
+                const char *p = argv[++i];
+                while (*p) {
+                    char *end;
+                    long v = strtol(p, &end, 10);
+                    if (end == p || v < 0 || v >= MAX_NCELLS) {
+                        fprintf(stderr, "error: invalid cell '%s' in --place-holes\n", p); return 1;
+                    }
+                    pmask |= (1ULL << v);
+                    p = end;
+                    if (*p == ',') p++;
+                    else if (*p) { fprintf(stderr, "error: expected ',' in --place-holes cells\n"); return 1; }
+                }
+                int npop = __builtin_popcountll(pmask);
+                if (pn > npop) {
+                    fprintf(stderr, "error: --place-holes N (%d) exceeds the %d listed cells\n", pn, npop); return 1;
+                }
+            } else if (pn > MAX_HOLES) {
+                fprintf(stderr, "error: --place-holes N (%d) exceeds MAX_HOLES (%d)\n", pn, MAX_HOLES); return 1;
+            }
+            g_place[g_place_count].n     = pn;
+            g_place[g_place_count].depth = pd;
+            g_place[g_place_count].mask  = pmask;
+            g_place_count++;
         } else if (strcmp(argv[i], "--dupe-threshold") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --dupe-threshold requires N\n"); return 1; }
             int n = atoi(argv[i]);
@@ -4426,6 +5139,7 @@ int main(int argc, char **argv) {
 
     sokoban_init();
     sokoban_set_hole_prune(g_mandatory_holes);
+    sokoban_set_forced_mandatory(g_forced_mand_cells);
 
     /* Validate fixed holes against the active region. */
     for (int i = 0; i < g_fixed_nholes; i++) {
@@ -4456,6 +5170,13 @@ int main(int argc, char **argv) {
      * holes; combined they mean "no holes at all" which is fine.
      * --num-holes can be any value <= MAX_HOLES; the combination "at most
      * N holes, only at these cells" simply means up to min(N, len) holes. */
+
+    /* Wildcard budget: when --num-holes is set larger than the --fixedholes
+     * whitelist, the surplus becomes holes allowed anywhere (outside the list).
+     * Requires an explicit --num-holes so bare --fixedholes stays a hard
+     * whitelist (g_max_holes defaults to MAX_HOLES). */
+    if (g_num_holes_set && g_fixed_nholes > 0 && g_max_holes > g_fixed_nholes)
+        g_wildcard_holes = g_max_holes - g_fixed_nholes;
 
     /* Effective walkable region: active region minus fixed walls. */
     g_walkable_mask = g_active_mask & ~g_fixed_walls_mask;
@@ -4638,6 +5359,9 @@ int main(int argc, char **argv) {
                task_target.hole_loc, task_target.n_seeds);
     }
 
+    /* The shortcut check only asks "is there a solution <= depth-2"; let the
+     * solver stop at the first win unless exact lengths are being recorded. */
+    sokoban_set_decision_only(!HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump);
     int unlimited = (g_time_cap_s == 0);
     for (int ei = 0; ei < n_exits; ei++) {
         /* In --task-id mode, skip exits that don't host the target task. */
@@ -4663,6 +5387,8 @@ int main(int argc, char **argv) {
             g_task_seeds = NULL;
             g_task_seed_count = 0;
         }
+
+        if (g_estimate_probes > 0) { run_estimate(); continue; }
 
         int exhausted, dedup_full;
         double exit_elapsed = run_exit_search(remain, &exhausted, &dedup_full);
@@ -4694,6 +5420,31 @@ int main(int argc, char **argv) {
         if (g_single_axis_blocks)
             printf(", axis %lld", g_pruned_axis);
         printf(")\n");
+#ifdef WBPROF
+        { const char *nm[6] = {"walk/committed ", "walk/new-cell  ", "push-ex/committ", "push-ex/new-cel", "new-block      ", "un-consume     "}; double tot = 0; for (int k = 0; k < 6; k++) tot += g_wb_time[k];
+          for (int k = 0; k < 6; k++) printf("  WBPROF %s calls %10lld  pruned %5.1f%%  solver time %8.2f s (%4.1f%%)  pops %lld\n", nm[k], g_wb_calls[k],
+                 g_wb_calls[k] ? 100.0 * g_wb_pruned[k] / g_wb_calls[k] : 0, g_wb_time[k], tot ? 100 * g_wb_time[k] / tot : 0, g_wb_pops[k]);
+          printf("  WBPROF bulk: label-pops %lld  distinct expansions %lld\n", g_bulk_pops, g_bulk_expansions);
+          { const char *kn[4] = {"no ref", "k=1   ", "k=2   ", "k>=3  "};
+            for (int k = 0; k < 4; k++) if (g_rk_calls[k]) printf("  WBPROF single checks %s: calls %9lld  pops %12lld (%.0f/call)  time %7.2f s\n", kn[k], g_rk_calls[k], g_rk_pops[k], (double)g_rk_pops[k] / g_rk_calls[k], g_rk_time[k]);
+            for (int k = 0; k < 4; k++) if (g_rc_n[k]) printf("  WBPROF REF_CHECK %s: %9lld checks  pops with ref %12lld  without %12lld  (%.1f%% saved)\n", kn[k], g_rc_n[k], g_rc_pops_with[k], g_rc_pops_without[k], g_rc_pops_without[k] ? 100.0 * (g_rc_pops_without[k] - g_rc_pops_with[k]) / g_rc_pops_without[k] : 0);
+            printf("  WBPROF reference: %lld lookups, %lld hits, %lld prunes, %lld delta-blocked; %lld builds inserting %lld entries; %lld clears; %lld entries exported\n",
+                   g_refstat[0], g_refstat[1], g_refstat[2], g_refstat[3], g_refstat[4], g_refstat[5], g_refstat[6], g_export_entries); } }
+#endif
+        printf("  accepted:       %lld  (walk-segment pruned before check: %lld)\n",
+               g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_cap - g_pruned_axis, g_pruned_walkseg);
+        if (g_ptab_active) printf("  parent tables:  %lld saved, %lld used as reference (%lld with a puzzle delta), %lld states inherited an ancestor's; peak %lld live tables, %.1f MB\n", g_ptab_saved, g_ptab_used, g_ptab_delta_refs, g_ptab_inherited, g_ptab_live_peak, g_ptab_live_slots_peak * 12.0 / 1048576);
+#ifdef REF_CHECK
+        printf("  REF_CHECK:      %lld referenced checks re-run, %lld decision mismatches\n", g_refchk_n, g_refchk_bad);
+#endif
+        if (g_bulk_walk_active) {
+            printf("  bulk walk-back: %lld multi-solves covering %lld starts (%.1f/solve), %lld fallbacks",
+                   g_bulk_calls, g_bulk_starts, g_bulk_calls ? (double)g_bulk_starts / g_bulk_calls : 0, g_bulk_fallbacks);
+#ifdef WBPROF
+            printf(", %.2f s", g_bulk_time);
+#endif
+            printf("\n");
+        }
         printf("  solver calls:   %lld\n", g_solver_calls);
         if (g_two_tables) {
             printf("  shallow / recent: %lld / %lld  (evicts %lld / %lld)\n",
@@ -4718,6 +5469,7 @@ int main(int argc, char **argv) {
          * (so streaming sees it).  Nothing to do here. */
     }
 
+    if (g_estimate_probes > 0) return 0;
     printf("\n=== Backward search complete ===\n");
     if (g_time_cap_s == 0)
         printf("Total elapsed:     %.2f s (no time limit)\n", total_elapsed);

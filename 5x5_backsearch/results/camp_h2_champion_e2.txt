@@ -1,0 +1,8 @@
+  OO$.#   A=[L]
+  .AB..   B=[UR]
+  .C@D.   C=[RD]
+  EFGH.   D=[UDL]
+  .....   E=[U]
+            F=[R]
+            G=[U]
+            H=[DL]

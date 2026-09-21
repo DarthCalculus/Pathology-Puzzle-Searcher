@@ -1,0 +1,3 @@
+bx_h0 b0_hx b1_h0 b1_hx b2_h0 b2_h1 b2_hx b3_h0 b3_h1 b3_h2 b3_hx b4_h0 b4_h1 b4_h2
+b5_h0 b5_h1 b5_h2
+b6_h0 b6_h1

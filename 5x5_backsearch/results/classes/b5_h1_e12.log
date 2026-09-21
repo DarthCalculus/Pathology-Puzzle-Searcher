@@ -1,0 +1,51 @@
+57 (1.0s)
+  .....   A=[UD]
+  ..AB.   B=[L]
+  .O$.#   C=[D]
+  .CDE@   D=[R]
+  .....   E=[UDL]
+
+63 (3.4s)
+  .....   A=[R]
+  .AB..   B=[UD]
+  #.$O.   C=[URD]
+  @CDE.   D=[R]
+  .....   E=[D]
+
+65 (7.0s)
+  #....   A=[L]
+  #.AB.   B=[RD]
+  #.$..   C=[R]
+  @CDE#   D=[U]
+  ....O   E=[RD]
+
+67 (11.0s)
+  .....   A=[UR]
+  .ABC@   B=[L]
+  .O$.#   C=[UDL]
+  ..DE.   D=[U]
+  .....   E=[L]
+
+--- Exit 12 (exhausted) ---
+  elapsed:        49.498 s
+  states checked: 7691547 (shortcut 2427838, dedup 564879)
+  accepted:       4698830  (walk-segment pruned before check: 149450)
+  solver calls:   7126668
+  shallow / recent: 2309599 / 2055701  (evicts 3 / 3)
+  stack peak:     79
+  best depth:     67  (verify 67 OK)
+
+=== Backward search complete ===
+Total elapsed:     49.50 s (no time limit)
+Exits searched:    1 / 1
+States checked:    7691547
+  pruned shortcut: 2427838
+  pruned dedup:    564879
+Solver calls:      7126668
+Best depth:        67  (exit 12)
+
+  .....   A=[UR]
+  .ABC@   B=[L]
+  .O$.#   C=[UDL]
+  ..DE.   D=[U]
+  .....   E=[L]

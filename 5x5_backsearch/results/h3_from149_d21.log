@@ -1,0 +1,75 @@
+start 2026-09-17 18:05:51
+[seed-path] seed built: depth=21 player=14 nblocks=2 nholes=1 committed_pop=18
+58 (2.7s)
+  O$.A.   A=[R]
+  @BC.O   B=[UR]
+  .D.E.   C=[URDL]
+  FG.#.   D=[RD]
+  ..O..   E=[L]
+            F=[D]
+            G=[UR]
+
+81 (4.4s)
+  O$.A.   A=[R]
+  .BC.O   B=[UR]
+  .D.E.   C=[URDL]
+  .F.#.   D=[RD]
+  @#O..   E=[L]
+            F=[UR]
+
+93 (24.8s)
+  O$.AO   A=[R]
+  .BC.#   B=[UR]
+  ..DE@   C=[URDL]
+  .F.G.   D=[DL]
+  O..H.   E=[L]
+            F=[UD]
+            G=[RL]
+            H=[L]
+
+113 (33.3s)
+  O$..O   A=[UR]
+  .AB.#   B=[DL]
+  C.@D.   C=[D]
+  .EFG.   D=[L]
+  O....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+149 (1.8m)
+  O$..O   A=[UR]
+  OABC#   B=[RDL]
+  .D@..   C=[UR]
+  EFGH.   D=[RL]
+  .....   E=[U]
+            F=[UR]
+            G=[R]
+            H=[UDL]
+
+--- Exit 1 (exhausted) ---
+  elapsed:        248.880 s
+  states checked: 3199421 (shortcut 1023111, dedup 318117)
+  accepted:       1858193  (walk-segment pruned before check: 14908)
+  solver calls:   2881304
+  shallow / recent: 2826588 / 2826588  (evicts 0 / 0)
+  stack peak:     69
+  best depth:     149  (verify 149 OK)
+
+=== Backward search complete ===
+Total elapsed:     248.88 s (no time limit)
+Exits searched:    1 / 1
+States checked:    3199421
+  pruned shortcut: 1023111
+  pruned dedup:    318117
+Solver calls:      2881304
+Best depth:        149  (exit 1)
+
+  O$..O   A=[UR]
+  OABC#   B=[RDL]
+  .D@..   C=[UR]
+  EFGH.   D=[RL]
+  .....   E=[U]
+            F=[UR]
+            G=[R]
+            H=[UDL]
+end 2026-09-17 18:10:00

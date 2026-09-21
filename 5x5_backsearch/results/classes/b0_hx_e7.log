@@ -1,0 +1,30 @@
+15 (0.0s)
+  ...#@
+  .#$#.
+  ..##.
+  #..#.
+  ##...
+
+--- Exit 7 (exhausted) ---
+  elapsed:        0.005 s
+  states checked: 357 (shortcut 0, dedup 4)
+  accepted:       353  (walk-segment pruned before check: 132)
+  solver calls:   353
+  shallow / recent: 354 / 354  (evicts 0 / 0)
+  stack peak:     9
+  best depth:     15  (verify 15 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.01 s (no time limit)
+Exits searched:    1 / 1
+States checked:    357
+  pruned shortcut: 0
+  pruned dedup:    4
+Solver calls:      353
+Best depth:        15  (exit 7)
+
+  ...#@
+  .#$#.
+  ..##.
+  #..#.
+  ##...

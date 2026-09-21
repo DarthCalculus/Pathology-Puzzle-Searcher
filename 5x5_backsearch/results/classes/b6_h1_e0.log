@@ -1,0 +1,103 @@
+84 (1.1s)
+  $..A.   A=[L]
+  O..B.   B=[RD]
+  .CD#.   C=[L]
+  #E.F.   D=[RD]
+  @....   E=[UD]
+            F=[URL]
+
+92 (4.0s)
+  $#...   A=[RD]
+  O@.A.   B=[DL]
+  .BCD.   C=[R]
+  .E.F.   D=[DL]
+  .#...   E=[DL]
+            F=[URL]
+
+94 (28.7s)
+  $#...   A=[UR]
+  O..A.   B=[DL]
+  ..#B@   C=[D]
+  .C.DE   D=[URL]
+  .....   E=[UD]
+
+96 (1.5m)
+  $#...   A=[R]
+  O@.A.   B=[DL]
+  .BCD.   C=[R]
+  .E.F.   D=[RD]
+  .#...   E=[DL]
+            F=[URDL]
+
+100 (1.8m)
+  $#...   A=[R]
+  O..A.   B=[DL]
+  ..#..   C=[UR]
+  .BCD.   D=[UDL]
+  ..@E.   E=[RL]
+
+104 (4.4m)
+  $#@..   A=[RD]
+  O#AB.   B=[RD]
+  ...C.   C=[RDL]
+  D.EF.   D=[D]
+  .....   E=[RL]
+            F=[UL]
+
+106 (5.8m)
+  $#...   A=[L]
+  O#.A.   B=[RD]
+  .BCD.   C=[URDL]
+  ...E.   D=[DL]
+  @F...   E=[U]
+            F=[L]
+
+113 (7.2m)
+  $#...   A=[RDL]
+  O#@A.   B=[D]
+  ..BC.   C=[UDL]
+  .DE..   D=[UR]
+  ....#   E=[RL]
+
+120 (10.5m)
+  $.A..   A=[L]
+  O#.B.   B=[UDL]
+  @C.D.   C=[RDL]
+  .#EF.   D=[RDL]
+  .....   E=[U]
+            F=[RD]
+
+122 (10.6m)
+  $.A..   A=[L]
+  O#.B.   B=[UDL]
+  @C.D.   C=[RL]
+  .#EF.   D=[RDL]
+  .....   E=[U]
+            F=[RD]
+
+--- Exit 0 (exhausted) ---
+  elapsed:        653.123 s
+  states checked: 43745524 (shortcut 17254494, dedup 3555157)
+  accepted:       22935873  (walk-segment pruned before check: 26145587)
+  parent tables:  9094715 saved, 22880750 used as reference (12335925 with a puzzle delta), 13786035 states inherited an ancestor's; peak 55 live tables, 4.9 MB
+  bulk walk-back: 4143552 multi-solves covering 18007642 starts (4.3/solve), 24 fallbacks
+  solver calls:   26326277
+  shallow / recent: 3083138 / 2491471  (evicts 24 / 22)
+  stack peak:     271
+  best depth:     122  (verify 122 OK)
+
+=== Backward search complete ===
+Total elapsed:     653.12 s (no time limit)
+Exits searched:    1 / 1
+States checked:    43745524
+  pruned shortcut: 17254494
+  pruned dedup:    3555157
+Solver calls:      26326277
+Best depth:        122  (exit 0)
+
+  $.A..   A=[L]
+  O#.B.   B=[UDL]
+  @C.D.   C=[RL]
+  .#EF.   D=[RDL]
+  .....   E=[U]
+            F=[RD]

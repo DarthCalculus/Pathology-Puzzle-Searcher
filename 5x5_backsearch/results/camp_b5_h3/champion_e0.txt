@@ -1,0 +1,5 @@
+  $#...   A=[DL]
+  O#@A.   B=[URDL]
+  O#B..   C=[URDL]
+  O.CD.   D=[UL]
+  .....

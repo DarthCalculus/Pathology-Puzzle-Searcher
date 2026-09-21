@@ -1,0 +1,121 @@
+bx_h0    DONE  e0:38 e1:41 e2:41 e6:50 e7:69 e12:60  cpu 0.08 h
+b0_hx    DONE  e0:16 e1:15 e2:14 e6:14 e7:15 e12:16  cpu 0.00 h
+b1_h0    DONE  e0:17 e1:17 e2:16 e6:15 e7:17 e12:17  cpu 0.00 h
+b1_hx    DONE  e0:40 e1:39 e2:32 e6:25 e7:20 e12:17  cpu 0.00 h
+b2_h0    DONE  e0:26 e1:28 e2:27 e6:24 e7:26 e12:24  cpu 0.00 h
+b2_h1    DONE  e0:75 e1:62 e2:57 e6:42 e7:34 e12:24  cpu 0.00 h
+b2_hx    DONE  e0:75 e1:66 e2:58 e6:46 e7:34 e12:34  cpu 0.00 h
+b3_h0    DONE  e0:27 e1:29 e2:28 e6:40 e7:53 e12:37  cpu 0.00 h
+b3_h1    DONE  e0:94 e1:96 e2:64 e6:60 e7:58 e12:55  cpu 0.01 h
+b3_h2    DONE  e0:94 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.04 h
+b3_hx    DONE  e0:110 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.08 h
+b4_h0    DONE  e0:28 e1:36 e2:35 e6:44 e7:56 e12:48  cpu 0.00 h
+b4_h1    DONE  e0:106 e1:102 e2:83 e6:80 e7:68 e12:56  cpu 0.11 h
+b4_h2    DONE  e0:106 e1:119 e2:92 e6:80 e7:76 e12:58  cpu 0.64 h
+ blocks: max 60 moves  [no champion stored (longest stored: 58)]  Panacea 2026-09-17 13:32:39
+added  #77  5×5 level with exit @ cell 7, ≤ 3 blocks: max 58 moves  [no champion stored (longest stored: 42)]  Panacea 2026-09-17 13:32:39
+added  #78  5×5 level with exit @ cell 12, ≤ 3 blocks: max 55 moves  [no champion stored (longest stored: 54)]  Panacea 2026-09-17 13:32:39
+added  #79  5×5 level with exit @ cell 0, ≤ 4 blocks, ≤ 0 holes: max 28 moves  [no champion stored (longest stored: 21)]  Panacea 2026-09-17 13:32:40
+added  #80  5×5 level with exit @ cell 1, ≤ 4 blocks, ≤ 0 holes: max 36 moves  [no champion stored (longest stored: 22)]  Panacea 2026-09-17 13:32:40
+added  #81  5×5 level with exit @ cell 2, ≤ 4 blocks, ≤ 0 holes: max 35 moves  [no champion stored (longest stored: 18)]  Panacea 2026-09-17 13:32:40
+added  #82  5×5 level with exit @ cell 6, ≤ 4 blocks, ≤ 0 holes: max 44 moves  [no champion stored (longest stored: 20)]  Panacea 2026-09-17 13:32:40
+added  #83  5×5 level with exit @ cell 7, ≤ 4 blocks, ≤ 0 holes: max 56 moves  [no champion stored (longest stored: 26)]  Panacea 2026-09-17 13:32:40
+added  #84  5×5 level with exit @ cell 12, ≤ 4 blocks, ≤ 0 holes: max 48 moves  [no champion stored (longest stored: 26)]  Panacea 2026-09-17 13:32:40
+added  #85  5×5 level with exit @ cell 0, ≤ 4 blocks, ≤ 1 hole: max 106 moves  [no champion stored (longest stored: 100)]  Panacea 2026-09-17 13:32:40
+added  #86  5×5 level with exit @ cell 1, ≤ 4 blocks, ≤ 1 hole: max 102 moves  [no champion stored (longest stored: 96)]  Panacea 2026-09-17 13:32:40
+added  #87  5×5 level with exit @ cell 2, ≤ 4 blocks, ≤ 1 hole: max 83 moves  [no champion stored (longest stored: 76)]  Panacea 2026-09-17 13:32:40
+added  #88  5×5 level with exit @ cell 6, ≤ 4 blocks, ≤ 1 hole: max 80 moves  [no champion stored (longest stored: 78)]  Panacea 2026-09-17 13:32:40
+added  #89  5×5 level with exit @ cell 7, ≤ 4 blocks, ≤ 1 hole: max 68 moves  [no champion stored (longest stored: 39)]  Panacea 2026-09-17 13:32:40
+added  #90  5×5 level with exit @ cell 12, ≤ 4 blocks, ≤ 1 hole: max 56 moves  [no champion stored (longest stored: 54)]  Panacea 2026-09-17 13:32:40
+added  #91  5×5 level with exit @ cell 0, ≤ 4 blocks, ≤ 2 holes: max 106 moves  [no champion stored (longest stored: 100)]  Panacea 2026-09-17 13:32:40
+added  #92  5×5 level with exit @ cell 1, ≤ 4 blocks, ≤ 2 holes: max 119 moves  [1 champion(s): #1353]  Panacea 2026-09-17 13:32:40
+added  #93  5×5 level with exit @ cell 2, ≤ 4 blocks, ≤ 2 holes: max 92 moves  [1 champion(s): #1351]  Panacea 2026-09-17 13:32:41
+added  #94  5×5 level with exit @ cell 6, ≤ 4 blocks, ≤ 2 holes: max 80 moves  [1 champion(s): #1455]  Panacea 2026-09-17 13:32:41
+added  #95  5×5 level with exit @ cell 7, ≤ 4 blocks, ≤ 2 holes: max 76 moves  [no champion stored (longest stored: 42)]  Panacea 2026-09-17 13:32:41
+added  #96  5×5 level with exit @ cell 12, ≤ 4 blocks, ≤ 2 holes: max 58 moves  [1 champion(s): #1457]  Panacea 2026-09-17 13:32:41
+ 
+champion bx_h0 exit 0 (38): 30060/07070/00900/1AB70/40000 -> accepted id 1462
+champion bx_h0 exit 1 (41): 03000/1A070/48AB0/08017/00000 -> accepted id 1463
+champion bx_h0 exit 2 (41): 00301/07074/0AB60/71010/00000 -> accepted id 1464
+champion bx_h0 exit 6 (50): 01401/039J0/0BA09/90100/00000 -> accepted id 1465
+champion bx_h0 exit 7 (69): 00000/08370/01000/7BC60/00460 -> refused: dominated
+champion bx_h0 exit 12 (60): 00000/07600/0B310/09600/46000 -> refused: dominated
+champion b0_hx exit 0 (16): 31000/00010/11110/00010/41000 -> accepted id 1466
+champion b0_hx exit 1 (15): 13000/11110/00000/01111/00004 -> accepted id 1467
+champion b0_hx exit 2 (14): 00311/01111/00000/11110/40000 -> accepted id 1468
+champion b0_hx exit 6 (14): 11400/03110/01110/00010/11000 -> accepted id 1469
+champion b0_hx exit 7 (15): 00014/01310/00110/10010/11000 -> accepted id 1470
+champion b0_hx exit 12 (16): 10000/00110/01310/01010/00014 -> accepted id 1471
+champion b1_h0 exit 0 (17): 31000/01014/01001/001D0/00000 -> accepted id 1472
+champion b1_h0 exit 1 (17): 03100/010C0/01410/00100/10000 -> accepted id 1473
+champion b1_h0 exit 2 (16): 00301/01B00/01410/00110/10000 -> accepted id 1474
+champion b1_h0 exit 6 (15): 11100/031D4/01101/00100/00000 -> accepted id 1475
+champion b1_h0 exit 7 (17): 00001/013A0/00010/11100/40001 -> accepted id 1476
+champion b1_h0 exit 12 (17): 10000/00110/01310/01010/00840 -> accepted id 1477
+champion b1_hx exit 0 (40): 31004/50010/00000/011A1/00001 -> accepted id 1478
+champion b1_hx exit 1 (39): 53114/01000/00000/011A1/00001 -> accepted id 1479
+champion b1_hx exit 2 (32): 50314/01110/00000/0H010/11000 -> accepted id 1480
+champion b1_hx exit 6 (25): 11100/031D0/01000/01000/54001 -> accepted id 1481
+champion b1_hx exit 7 (20): 50011/41311/00111/000A0/00000 -> accepted id 1482
+champion b1_hx exit 12 (17): 10000/00110/01310/08500/14001 -> refused: dominated
+champion b2_h0 exit 0 (26): 30600/00710/11010/00010/41000 -> accepted id 1483
+champion b2_h0 exit 1 (28): 03001/11A64/00010/01100/00000 -> accepted id 1484
+champion b2_h0 exit 2 (27): 10301/48B11/01000/00110/10000 -> accepted id 1485
+champion b2_h0 exit 6 (24): 11400/03110/76000/00110/10000 -> accepted id 1486
+champion b2_h0 exit 7 (26): 04100/08390/10100/10010/11000 -> accepted id 1487
+champion b2_h0 exit 12 (24): 00001/00D01/01314/00710/01000 -> accepted id 1488
+champion b2_h1 exit 0 (75): 31000/50010/14210/0E000/00011 -> refused: duplicate
+champion b2_h1 exit 1 (62): 53100/014G0/000F0/01100/00000 -> accepted id 1489
+champion b2_h1 exit 2 (57): 50311/41100/0C0G0/01100/00000 -> accepted id 1490
+champion b2_h1 exit 6 (42): 11400/53100/010G0/0F000/00011 -> accepted id 1491
+champion b2_h1 exit 7 (34): 50011/41311/00111/0C0A0/00000 -> refused: duplicate
+champion b2_h1 exit 12 (24): 00001/00D01/01314/00710/51000 -> refused: dominated
+champion b2_hx exit 0 (75): 31000/50010/14210/0E000/00011 -> refused: duplicate
+champion b2_hx exit 1 (66): 53100/510G4/00001/010A0/00000 -> refused: duplicate
+champion b2_hx exit 2 (58): 50311/51100/02000/01A00/00411 -> refused: duplicate
+champion b2_hx exit 6 (46): 11100/53100/411G0/000F0/50000 -> refused: duplicate
+champion b2_hx exit 7 (34): 50011/41311/00111/0C0A0/00000 -> refused: duplicate
+champion b2_hx exit 12 (34): 40000/1C510/00310/0B500/10000 -> accepted id 1492
+champion b3_h0 exit 0 (27): 30600/00710/11010/40800/10001 -> accepted id 1493
+champion b3_h0 exit 1 (29): 03100/760C0/01410/00100/10000 -> accepted id 1494
+champion b3_h0 exit 2 (28): 00301/76B00/01410/00100/10000 -> accepted id 1495
+champion b3_h0 exit 6 (40): 11400/03910/00800/1B100/10000 -> accepted id 1496
+champion b3_h0 exit 7 (53): 10000/08370/01100/0D010/41000 -> accepted id 1497
+champion b3_h0 exit 12 (37): 00140/09D00/00310/00710/01000 -> accepted id 1498
+champion b3_h1 exit 0 (94): 31100/510G0/4I0F0/01000/00001 -> refused: tie
+champion b3_h1 exit 1 (96): 53100/410G0/0I0F0/01000/00001 -> refused: duplicate
+champion b3_h1 exit 2 (64): 15311/00140/09FG0/00000/00010 -> accepted id 1499
+champion b3_h1 exit 6 (60): 11400/53G10/0BC00/00010/10000 -> accepted id 1500
+champion b3_h1 exit 7 (58): 50011/413D0/0C0G0/01100/00000 -> accepted id 1501
+champion b3_h1 exit 12 (55): 00140/090F0/0B310/00500/00000 -> accepted id 1502
+champion b3_h2 exit 0 (94): 31100/510G0/4I0F0/01000/00001 -> refused: tie
+champion b3_h2 exit 1 (96): 53100/410G0/0I0F0/01000/00001 -> refused: duplicate
+champion b3_h2 exit 2 (74): 15311/14100/00FG0/05B00/00000 -> refused: duplicate
+champion b3_h2 exit 6 (60): 11400/53G10/0BC00/00010/10000 -> refused: duplicate
+champion b3_h2 exit 7 (58): 50011/413D0/0C0G0/01100/00000 -> refused: duplicate
+champion b3_h2 exit 12 (55): 00140/090F0/0B310/00500/00000 -> refused: duplicate
+champion b3_hx exit 0 (110): 31000/54010/512D0/50200/00000 -> refused: None
+champion b3_hx exit 1 (96): 53100/410G0/0I0F0/01000/00001 -> refused: None
+champion b3_hx exit 2 (74): 15311/14100/00FG0/05B00/00000 -> refused: None
+champion b3_hx exit 6 (60): 11400/53G10/0BC00/00010/10000 -> refused: None
+champion b3_hx exit 7 (58): 50011/413D0/0C0G0/01100/00000 -> refused: None
+champion b3_hx exit 12 (55): 00140/090F0/0B310/00500/00000 -> refused: None
+champion b4_h0 exit 0 (28): 31060/00670/00700/11010/40000 -> refused: None
+champion b4_h0 exit 1 (36): 03001/11A00/048A0/01109/00000 -> refused: None
+champion b4_h0 exit 2 (35): 10301/00B11/0B640/90110/00000 -> refused: None
+champion b4_h0 exit 6 (44): 11000/03900/00890/1B100/40000 -> refused: None
+champion b4_h0 exit 7 (56): 10000/08370/01100/0D410/00060 -> refused: None
+champion b4_h0 exit 12 (48): 00000/07600/00310/0C700/11410 -> refused: None
+champion b4_h1 exit 0 (106): 31000/510G0/0F410/0IE00/00000 -> refused: None
+champion b4_h1 exit 1 (102): 53100/410G0/0I0F0/010C0/00000 -> refused: None
+champion b4_h1 exit 2 (83): 15301/00014/080D0/02B00/01000 -> refused: None
+champion b4_h1 exit 6 (80): 11400/53C10/0BI00/00201/10000 -> refused: None
+champion b4_h1 exit 7 (68): 11105/08394/0E0D0/00110/00000 -> refused: None
+champion b4_h1 exit 12 (56): 00100/09F49/0B310/00500/00000 -> refused: None
+champion b4_h2 exit 0 (106): 31000/510G0/0F410/0IE00/00000 -> refused: None
+champion b4_h2 exit 1 (119): 53104/510F0/0I200/00200/10000 -> refused: None
+champion b4_h2 exit 2 (92): 45311/05100/020G0/09B00/00000 -> refused: None
+champion b4_h2 exit 6 (80): 11400/53C10/0BI00/00201/10005 -> refused: None
+champion b4_h2 exit 7 (76): 50540/0C310/0G0D0/001H0/00000 -> refused: None
+champion b4_h2 exit 12 (58): 00411/00605/0E310/0F700/00005 -> refused: None
+published: ['bx_h0', 'b0_hx', 'b1_h0', 'b1_hx', 'b2_h0', 'b2_h1', 'b2_hx', 'b3_h0', 'b3_h1', 'b3_h2', 'b3_hx', 'b4_h0', 'b4_h1', 'b4_h2']

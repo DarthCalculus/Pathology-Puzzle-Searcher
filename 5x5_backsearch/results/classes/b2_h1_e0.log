@@ -1,0 +1,30 @@
+75 (1.0s)
+  $#...   A=[URDL]
+  O..#.   B=[URD]
+  #@A#.
+  .B...
+  ...##
+
+--- Exit 0 (exhausted) ---
+  elapsed:        1.104 s
+  states checked: 703799 (shortcut 233080, dedup 36645)
+  accepted:       434074  (walk-segment pruned before check: 33416)
+  solver calls:   667154
+  shallow / recent: 660905 / 660905  (evicts 0 / 0)
+  stack peak:     56
+  best depth:     75  (verify 75 OK)
+
+=== Backward search complete ===
+Total elapsed:     1.10 s (no time limit)
+Exits searched:    1 / 1
+States checked:    703799
+  pruned shortcut: 233080
+  pruned dedup:    36645
+Solver calls:      667154
+Best depth:        75  (exit 0)
+
+  $#...   A=[URDL]
+  O..#.   B=[URD]
+  #@A#.
+  .B...
+  ...##

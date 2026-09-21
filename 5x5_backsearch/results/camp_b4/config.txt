@@ -1,0 +1,1 @@
+grid=5x5 exits=[0, 1, 2, 6, 7, 12] layer=7 extra=['--allow-exit-transit', '--num-blocks', '4'] worker=./backsearch_worker_nt

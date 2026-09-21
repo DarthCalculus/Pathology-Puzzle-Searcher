@@ -1,0 +1,144 @@
+42 (1.1s)
+  O#OAO   A=[L]
+  .$#B.   B=[UL]
+  C..D.   C=[U]
+  OEFGH   D=[L]
+  @.I.O   E=[U]
+            F=[RD]
+            G=[UDL]
+            H=[U]
+            I=[R]
+
+48 (2.8s)
+  O#@..   A=[DL]
+  .$#AB   B=[D]
+  C.#..   C=[U]
+  ODEF.   D=[U]
+  O..GO   E=[UR]
+            F=[DL]
+            G=[L]
+
+52 (6.8s)
+  O#OAO   A=[L]
+  .$#BO   B=[DL]
+  .#.CD   C=[UR]
+  E@F..   D=[U]
+  O.G.O   E=[U]
+            F=[UR]
+            G=[R]
+
+54 (17.1s)
+  O##.O   A=[U]
+  A$.BO   B=[DL]
+  O#C..   C=[U]
+  D@EFG   D=[U]
+  O.H.O   E=[UR]
+            F=[UR]
+            G=[U]
+            H=[R]
+
+59 (21.4s)
+  O#OAO   A=[L]
+  B$#C.   B=[U]
+  O#.D.   C=[UL]
+  @.EFG   D=[L]
+  O.H.O   E=[RDL]
+            F=[UDL]
+            G=[U]
+            H=[R]
+
+60 (55.1s)
+  O#OAO   A=[L]
+  B$#C.   B=[U]
+  O#@..   C=[UDL]
+  .DEFG   D=[UR]
+  OO.HO   E=[DL]
+            F=[DL]
+            G=[D]
+            H=[L]
+
+61 (1.1m)
+  O#OAO   A=[L]
+  B$#CO   B=[U]
+  O#OD.   C=[UDL]
+  @EFGH   D=[UR]
+  .I..O   E=[RD]
+            F=[U]
+            G=[UR]
+            H=[U]
+            I=[R]
+
+62 (3.1m)
+  #..AO   A=[L]
+  O$#B.   B=[UL]
+  @#.C.   C=[L]
+  .D.EF   D=[RDL]
+  O.G.O   E=[UDL]
+            F=[U]
+            G=[R]
+
+64 (4.4m)
+  ##OAO   A=[L]
+  O$#BC   B=[UDL]
+  O#@..   C=[U]
+  .DEFG   D=[RD]
+  OO.HO   E=[DL]
+            F=[UL]
+            G=[D]
+            H=[L]
+
+66 (5.1m)
+  ##@..   A=[UDL]
+  O$#AB   B=[D]
+  O#OC.   C=[L]
+  .DEF.   D=[RD]
+  OO.GO   E=[DL]
+            F=[UL]
+            G=[L]
+
+70 (8.3m)
+  ##OAO   A=[L]
+  #$#BC   B=[UDL]
+  OD@..   C=[U]
+  .EFGH   D=[R]
+  OO.IO   E=[UR]
+            F=[DL]
+            G=[RDL]
+            H=[D]
+            I=[L]
+
+72 (8.3m)
+  ##@..   A=[UDL]
+  #$#AB   B=[D]
+  OCOD.   C=[R]
+  .EFG.   D=[L]
+  OO.HO   E=[UR]
+            F=[DL]
+            G=[RDL]
+            H=[L]
+
+--- Exit 6 (exhausted) ---
+  elapsed:        548.885 s
+  states checked: 73781419 (shortcut 33506008, dedup 6789796)
+  solver calls:   66991623
+  shallow / recent: 3102853 / 2137029  (evicts 45 / 38)
+  stack peak:     84
+  best depth:     72  (verify 72 OK)
+
+=== Backward search complete ===
+Total elapsed:     548.88 s (no time limit)
+Exits searched:    1 / 1
+States checked:    73781419
+  pruned shortcut: 33506008
+  pruned dedup:    6789796
+Solver calls:      66991623
+Best depth:        72  (exit 6)
+
+  ##@..   A=[UDL]
+  #$#AB   B=[D]
+  OCOD.   C=[R]
+  .EFG.   D=[L]
+  OO.HO   E=[UR]
+            F=[DL]
+            G=[RDL]
+            H=[L]

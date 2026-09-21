@@ -1,0 +1,98 @@
+24 (1.1s)
+  ...##   A=[D]
+  A$B..   B=[RL]
+  O#..C   C=[U]
+  .@DE.   D=[R]
+  .F...   E=[UR]
+            F=[R]
+
+44 (7.5s)
+  O..A.   A=[R]
+  B$C..   B=[D]
+  ...D.   C=[RL]
+  #.EF.   D=[UR]
+  ##@..   E=[D]
+            F=[URL]
+
+48 (9.3s)
+  O..A.   A=[R]
+  B$C..   B=[D]
+  ..DE.   C=[RL]
+  .#.F.   D=[URD]
+  ...#@   E=[RD]
+            F=[UL]
+
+66 (11.9s)
+  O..A.   A=[R]
+  B$C..   B=[D]
+  ..DE.   C=[RL]
+  .#.F.   D=[UD]
+  ...#@   E=[RD]
+            F=[URL]
+
+70 (17.7s)
+  O..A.   A=[R]
+  B$.C.   B=[D]
+  @DE#.   C=[RL]
+  ..F..   D=[RD]
+  ....#   E=[DL]
+            F=[URL]
+
+78 (25.5s)
+  O..A.   A=[R]
+  B$C.#   B=[D]
+  @DE..   C=[RL]
+  .#.F.   D=[URDL]
+  .....   E=[URD]
+            F=[DL]
+
+102 (40.5s)
+  .O...   A=[D]
+  A$BC.   B=[RL]
+  @DE..   C=[UD]
+  .#.F.   D=[RD]
+  .....   E=[URD]
+            F=[UL]
+
+104 (1.1m)
+  .O..#   A=[D]
+  A$B..   B=[RL]
+  @CDE.   C=[RD]
+  .#.F.   D=[URD]
+  .....   E=[UD]
+            F=[UL]
+
+108 (13.8m)
+  .A@..   A=[R]
+  O$B#.   B=[RD]
+  .CD..   C=[U]
+  ..EF.   D=[RDL]
+  #....   E=[RL]
+            F=[UL]
+
+--- Exit 6 (exhausted) ---
+  elapsed:        1005.744 s
+  states checked: 109961315 (shortcut 39648257, dedup 8860172)
+  accepted:       61452886  (walk-segment pruned before check: 88495710)
+  parent tables:  24832767 saved, 61400114 used as reference (30048420 with a puzzle delta), 36567347 states inherited an ancestor's; peak 54 live tables, 4.7 MB
+  bulk walk-back: 11549671 multi-solves covering 50048114 starts (4.3/solve), 4 fallbacks
+  solver calls:   62602700
+  shallow / recent: 2419941 / 3269934  (evicts 75 / 57)
+  stack peak:     248
+  best depth:     108  (verify 108 OK)
+
+=== Backward search complete ===
+Total elapsed:     1005.74 s (no time limit)
+Exits searched:    1 / 1
+States checked:    109961315
+  pruned shortcut: 39648257
+  pruned dedup:    8860172
+Solver calls:      62602700
+Best depth:        108  (exit 6)
+
+  .A@..   A=[R]
+  O$B#.   B=[RD]
+  .CD..   C=[U]
+  ..EF.   D=[RDL]
+  #....   E=[RL]
+            F=[UL]

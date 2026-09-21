@@ -1,0 +1,41 @@
+36 (1.0s)
+  ..$..   A=[U]
+  ABCD.   B=[L]
+  ...E.   C=[UR]
+  ..F#G   D=[R]
+  ##@..   E=[L]
+            F=[U]
+            G=[U]
+
+41 (2.7s)
+  ..$.#   A=[U]
+  .A.B@   B=[U]
+  .CDE.   C=[UL]
+  F#.#.   D=[UR]
+  .....   E=[L]
+            F=[U]
+
+--- Exit 2 (exhausted) ---
+  elapsed:        3.293 s
+  states checked: 928903 (shortcut 418359, dedup 58826)
+  accepted:       451718  (walk-segment pruned before check: 9254)
+  solver calls:   870077
+  shallow / recent: 865876 / 865876  (evicts 0 / 0)
+  stack peak:     41
+  best depth:     41  (verify 41 OK)
+
+=== Backward search complete ===
+Total elapsed:     3.29 s (no time limit)
+Exits searched:    1 / 1
+States checked:    928903
+  pruned shortcut: 418359
+  pruned dedup:    58826
+Solver calls:      870077
+Best depth:        41  (exit 2)
+
+  ..$.#   A=[U]
+  .A.B@   B=[U]
+  .CDE.   C=[UL]
+  F#.#.   D=[UR]
+  .....   E=[L]
+            F=[U]

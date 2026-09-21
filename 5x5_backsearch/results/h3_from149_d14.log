@@ -1,0 +1,74 @@
+start 2026-09-18 16:50:24
+[seed-path] seed built: depth=14 player=17 nblocks=2 nholes=1 committed_pop=13
+48 (1.5s)
+  O$...   A=[UR]
+  .AB.#   B=[RDL]
+  .@C..   C=[L]
+  .ODEF   D=[UL]
+  ....O   E=[UR]
+            F=[D]
+
+60 (4.9s)
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  ...D.   C=[UR]
+  .OEF.   D=[L]
+  ...@.   E=[UL]
+            F=[RD]
+
+70 (15.0s)
+  O$O..   A=[UR]
+  .ABC#   B=[RDL]
+  ...D.   C=[UR]
+  .OEF.   D=[L]
+  ...@.   E=[U]
+            F=[UL]
+
+85 (1.2m)
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .OEF.   D=[RL]
+  .....   E=[D]
+            F=[UL]
+
+91 (5.5m)
+  O$O.O   A=[UR]
+  .ABC#   B=[RD]
+  ..@D.   C=[UR]
+  .EFG.   D=[L]
+  .....   E=[UR]
+            F=[R]
+            G=[UL]
+
+97 (13.4m)
+  O$...   A=[UR]
+  OABC#   B=[RD]
+  .DOE@   C=[UR]
+  .FGH.   D=[R]
+  .....   E=[RL]
+            F=[UL]
+            G=[R]
+            H=[UL]
+
+99 (13.4m)
+  O$O..   A=[UR]
+  .ABC#   B=[RD]
+  .DOE@   C=[UR]
+  .FGH.   D=[R]
+  .....   E=[L]
+            F=[UR]
+            G=[R]
+            H=[UL]
+
+114 (46.9m)
+  O$...   A=[UR]
+  .A.B.   B=[D]
+  C@DE.   C=[D]
+  .F.GH   D=[D]
+  OI..O   E=[RL]
+            F=[D]
+            G=[URDL]
+            H=[U]
+            I=[R]
+

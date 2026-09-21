@@ -1,0 +1,55 @@
+bx_h0    DONE  e0:38 e1:41 e2:41 e6:50 e7:69 e12:60  cpu 0.08 h  (published)
+b0_hx    DONE  e0:16 e1:15 e2:14 e6:14 e7:15 e12:16  cpu 0.00 h  (published)
+b1_h0    DONE  e0:17 e1:17 e2:16 e6:15 e7:17 e12:17  cpu 0.00 h  (published)
+b1_hx    DONE  e0:40 e1:39 e2:32 e6:25 e7:20 e12:17  cpu 0.00 h  (published)
+b2_h0    DONE  e0:26 e1:28 e2:27 e6:24 e7:26 e12:24  cpu 0.00 h  (published)
+b2_h1    DONE  e0:75 e1:62 e2:57 e6:42 e7:34 e12:24  cpu 0.00 h  (published)
+b2_hx    DONE  e0:75 e1:66 e2:58 e6:46 e7:34 e12:34  cpu 0.00 h  (published)
+b3_h0    DONE  e0:27 e1:29 e2:28 e6:40 e7:53 e12:37  cpu 0.00 h  (published)
+b3_h1    DONE  e0:94 e1:96 e2:64 e6:60 e7:58 e12:55  cpu 0.01 h  (published)
+b3_h2    DONE  e0:94 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.04 h  (published)
+b3_hx    DONE  e0:110 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.08 h  (published)
+b4_h0    DONE  e0:28 e1:36 e2:35 e6:44 e7:56 e12:48  cpu 0.00 h  (published)
+b4_h1    DONE  e0:106 e1:102 e2:83 e6:80 e7:68 e12:56  cpu 0.11 h  (published)
+b4_h2    DONE  e0:106 e1:119 e2:92 e6:80 e7:76 e12:58  cpu 0.64 h  (published)
+b5_h0    DONE  e0:35 e1:37 e2:35 e6:50 e7:67 e12:56  cpu 0.00 h
+b5_h1    DONE  e0:113 e1:108 e2:92 e6:102 e7:86 e12:67  cpu 0.70 h
+b5_h2    DONE  e0:118 e1:121 e2:92 e6:102 e7:92 e12:67  cpu 4.82 h
+added  #97  5×5 level with exit @ cell 0, ≤ 5 blocks, ≤ 0 holes: max 35 moves  [no champion stored (longest stored: 27)]  Panacea 2026-09-17 15:52:54
+added  #98  5×5 level with exit @ cell 1, ≤ 5 blocks, ≤ 0 holes: max 37 moves  [no champion stored (longest stored: 31)]  Panacea 2026-09-17 15:52:54
+added  #99  5×5 level with exit @ cell 2, ≤ 5 blocks, ≤ 0 holes: max 35 moves  [no champion stored (longest stored: 29)]  Panacea 2026-09-17 15:52:54
+added  #100  5×5 level with exit @ cell 6, ≤ 5 blocks, ≤ 0 holes: max 50 moves  [no champion stored (longest stored: 40)]  Panacea 2026-09-17 15:52:54
+added  #101  5×5 level with exit @ cell 7, ≤ 5 blocks, ≤ 0 holes: max 67 moves  [no champion stored (longest stored: 53)]  Panacea 2026-09-17 15:52:54
+added  #102  5×5 level with exit @ cell 12, ≤ 5 blocks, ≤ 0 holes: max 56 moves  [no champion stored (longest stored: 40)]  Panacea 2026-09-17 15:52:54
+added  #103  5×5 level with exit @ cell 0, ≤ 5 blocks, ≤ 1 hole: max 113 moves  [no champion stored (longest stored: 112)]  Panacea 2026-09-17 15:52:55
+added  #104  5×5 level with exit @ cell 1, ≤ 5 blocks, ≤ 1 hole: max 108 moves  [1 champion(s): #1441]  Panacea 2026-09-17 15:52:55
+added  #105  5×5 level with exit @ cell 2, ≤ 5 blocks, ≤ 1 hole: max 92 moves  [no champion stored (longest stored: 76)]  Panacea 2026-09-17 15:52:55
+added  #106  5×5 level with exit @ cell 6, ≤ 5 blocks, ≤ 1 hole: max 102 moves  [no champion stored (longest stored: 78)]  Panacea 2026-09-17 15:52:55
+added  #107  5×5 level with exit @ cell 7, ≤ 5 blocks, ≤ 1 hole: max 86 moves  [no champion stored (longest stored: 58)]  Panacea 2026-09-17 15:52:55
+added  #108  5×5 level with exit @ cell 12, ≤ 5 blocks, ≤ 1 hole: max 67 moves  [1 champion(s): #25]  Panacea 2026-09-17 15:52:55
+added  #109  5×5 level with exit @ cell 0, ≤ 5 blocks, ≤ 2 holes: max 118 moves  [no champion stored (longest stored: 112)]  Panacea 2026-09-17 15:52:55
+added  #110  5×5 level with exit @ cell 1, ≤ 5 blocks, ≤ 2 holes: max 121 moves  [no champion stored (longest stored: 119)]  Panacea 2026-09-17 15:52:55
+added  #111  5×5 level with exit @ cell 2, ≤ 5 blocks, ≤ 2 holes: max 92 moves  [1 champion(s): #1351]  Panacea 2026-09-17 15:52:55
+added  #112  5×5 level with exit @ cell 6, ≤ 5 blocks, ≤ 2 holes: max 102 moves  [no champion stored (longest stored: 80)]  Panacea 2026-09-17 15:52:56
+added  #113  5×5 level with exit @ cell 7, ≤ 5 blocks, ≤ 2 holes: max 92 moves  [no champion stored (longest stored: 58)]  Panacea 2026-09-17 15:52:56
+added  #114  5×5 level with exit @ cell 12, ≤ 5 blocks, ≤ 2 holes: max 67 moves  [1 champion(s): #25]  Panacea 2026-09-17 15:52:56
+ 
+champion b5_h0 exit 0 (35): 30060/00900/10690/410B0/00000 -> accepted id 1503
+champion b5_h0 exit 1 (37): 13014/00700/0B690/90100/00000 -> accepted id 1504
+champion b5_h0 exit 2 (35): 00301/70B11/0B640/90110/00000 -> accepted id 1505
+champion b5_h0 exit 6 (50): 01401/039J0/0BA00/90100/00001 -> accepted id 1506
+champion b5_h0 exit 7 (67): 10000/08370/01000/0CD10/00460 -> accepted id 1507
+champion b5_h0 exit 12 (56): 00000/07600/0B310/1DF40/00011 -> accepted id 1508
+champion b5_h1 exit 0 (113): 31000/514F0/009G0/0BI00/00001 -> accepted id 1509
+champion b5_h1 exit 1 (108): 13100/584G0/000I0/01EC0/00000 -> refused: tie
+champion b5_h1 exit 2 (92): 15300/0CB00/0H4D0/01B10/00000 -> accepted id 1510
+champion b5_h1 exit 6 (102): 11400/53C10/0BF00/00IA0/10000 -> accepted id 1511
+champion b5_h1 exit 7 (86): 00105/08394/0E0I0/00D10/00000 -> accepted id 1512
+champion b5_h1 exit 12 (67): 00000/0B6G4/05301/00760/00000 -> refused: tie
+champion b5_h2 exit 0 (118): 31000/519G0/4F510/0IE00/00000 -> accepted id 1513
+champion b5_h2 exit 1 (121): 53084/0B0F0/000G1/0B000/11005 -> accepted id 1514
+champion b5_h2 exit 2 (92): 15300/0CB00/0H4D0/01B10/00000 -> refused: duplicate
+champion b5_h2 exit 6 (102): 11400/53C10/0BF00/00IA0/10000 -> refused: duplicate
+champion b5_h2 exit 7 (92): 04105/0E395/0IB00/0B010/00000 -> accepted id 1515
+champion b5_h2 exit 12 (67): 00005/0B604/053G1/00760/00000 -> refused: dominated
+published: ['b5_h0', 'b5_h1', 'b5_h2']

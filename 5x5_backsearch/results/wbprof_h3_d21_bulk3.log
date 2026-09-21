@@ -1,0 +1,74 @@
+[seed-path] seed built: depth=21 player=14 nblocks=2 nholes=1 committed_pop=18
+58 (3.2s)
+  O$.A.   A=[R]
+  @BC.O   B=[UR]
+  ..DE.   C=[URDL]
+  FGO#.   D=[D]
+  .....   E=[L]
+            F=[D]
+            G=[UR]
+
+73 (5.8s)
+  O$.A.   A=[R]
+  OBC.O   B=[UR]
+  D.EF@   C=[URDL]
+  .G.#.   D=[U]
+  .....   E=[URD]
+            F=[L]
+            G=[DL]
+
+81 (8.6s)
+  O$.A.   A=[R]
+  .BC.O   B=[UR]
+  ..DE.   C=[URDL]
+  .FO#.   D=[D]
+  @#...   E=[L]
+            F=[UR]
+
+113 (20.3s)
+  O$..O   A=[UR]
+  .AB.#   B=[DL]
+  C.@D.   C=[D]
+  OEFG.   D=[L]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+149 (1.1m)
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+--- Exit 1 (exhausted) ---
+  elapsed:        190.835 s
+  states checked: 3430617 (shortcut 1267464, dedup 304960)
+  WBPROF walk/committed calls          0  pruned   0.0%  solver time     0.00 s ( 0.0%)
+  WBPROF walk/new-cell  calls     465012  pruned  81.0%  solver time    30.36 s (23.4%)
+  WBPROF push-type      calls    1126506  pruned  56.1%  solver time    99.33 s (76.6%)
+  accepted:       1858193  (walk-segment pruned before check: 689341)
+  bulk walk-back: 393859 multi-solves covering 1534139 starts (3.9/solve), 3 fallbacks, 57.78 s
+  solver calls:   1985377
+  shallow / recent: 2949013 / 2949013  (evicts 0 / 0)
+  stack peak:     245
+  best depth:     149  (verify 149 OK)
+
+=== Backward search complete ===
+Total elapsed:     190.83 s (no time limit)
+Exits searched:    1 / 1
+States checked:    3430617
+  pruned shortcut: 1267464
+  pruned dedup:    304960
+Solver calls:      1985377
+Best depth:        149  (exit 1)
+
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]

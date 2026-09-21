@@ -1,0 +1,30 @@
+34 (0.0s)
+  @....   A=[RD]
+  #AO#.   B=[UR]
+  ..$#.
+  .BO..
+  #....
+
+--- Exit 12 (exhausted) ---
+  elapsed:        0.033 s
+  states checked: 50764 (shortcut 18183, dedup 674)
+  accepted:       31907  (walk-segment pruned before check: 1478)
+  solver calls:   50090
+  shallow / recent: 50075 / 50075  (evicts 0 / 0)
+  stack peak:     30
+  best depth:     34  (verify 34 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.03 s (no time limit)
+Exits searched:    1 / 1
+States checked:    50764
+  pruned shortcut: 18183
+  pruned dedup:    674
+Solver calls:      50090
+Best depth:        34  (exit 12)
+
+  @....   A=[RD]
+  #AO#.   B=[UR]
+  ..$#.
+  .BO..
+  #....

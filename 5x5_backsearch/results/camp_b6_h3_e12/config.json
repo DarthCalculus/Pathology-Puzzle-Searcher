@@ -1,0 +1,1 @@
+{"grid": "5x5", "exits": [12], "layer": 8, "extra": ["--allow-exit-transit", "--num-blocks", "6", "--num-holes", "3"], "no_transit": false}

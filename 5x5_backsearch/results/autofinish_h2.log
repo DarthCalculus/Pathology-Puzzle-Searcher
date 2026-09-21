@@ -1,0 +1,40 @@
+[2026-09-15 11:35:47] watching for the camp_h2 driver to exit
+[2026-09-16 09:18:38] restart watcher: waiting for all running depth-11 children to finish
+[2026-09-16 12:25:04] idle watcher: waiting for driver 17253 to have no running workers
+[2026-09-16 12:33:34] driver idle -> restarting under fixed campaign.py
+[2026-09-16 12:33:39] watching for the camp_h2 driver to exit
+[2026-09-16 12:33:39] driver restarted (pid 52873); autofinish re-armed
+[2026-09-16 22:07:49] driver exited
+[results/camp_h2] jobs done 225878/225878  exhausted 225829  split 49  NOT exhausted 0  states 8,311,438,305  cpu 134h45m  best depth 149
+   exit 0: 18440/18440 jobs, best 124, cpu 6h38m
+   exit 1: 65676/65676 jobs, best 149, cpu 69h01m
+   exit 2: 40928/40928 jobs, best 112, cpu 14h15m
+   exit 6: 53814/53814 jobs, best 124, cpu 30h31m
+   exit 7: 38401/38401 jobs, best 103, cpu 12h59m
+   exit 12: 8619/8619 jobs, best 80, cpu 1h18m
+{"complete": true, "missing": 0, "bad": 0, "best": {"1": 149, "2": 112, "6": 124, "7": 103, "0": 124, "12": 80}, "bestjob": {"1": "R2,U1,U3,U1,L1,L1,D1,D1,R1,L2,L2", "2": "R2,U1,U3,U2,U1,L1,L1,D1", "7": "R2,U1,L1,L1,D1,U2,R1,R1,D1,D1,L1", "0": "U1,U1,U3,U1,L1,L1,D1,D1", "6": "U2,L1,D1,D1,R2,R2,U1,U1,U3,L1,D1", "12": "U2,R1,D1,D1,L2,L2,L1,U1"}, "states": {"1": 2656040212, "2": 984671662, "6": 2117978320, "7": 1666281906, "0": 530276455, "12": 356189750}, "cpu": {"1": 248503, "2": 51317, "6": 109903, "7": 46787, "0": 23938, "12": 4697}}
+X11 forwarding request failed on channel 0
+<anonymous_script>:1
+6 proofs
+  ^
+
+SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)
+    at JSON.parse (<anonymous>)
+    at Object.<anonymous> (/opt/pathology/server/tools/add_proof.js:70:18)
+    at Module._compile (node:internal/modules/cjs/loader:1872:14)
+    at Object..js (node:internal/modules/cjs/loader:2003:10)
+    at Module.load (node:internal/modules/cjs/loader:1594:32)
+    at Module._load (node:internal/modules/cjs/loader:1396:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:154:5)
+    at node:internal/main/run_main_module:33:47
+
+Node.js v24.19.0
+[2026-09-16 22:07:55] proofs step done (see above; a REFUSED line means a stored level contradicts the search)
+[2026-09-16 22:18:00] exit 0 max 124: level 30060/519G0/4I5F0/017C0/00000 -> submit: {"accepted":true,"level":{"id":1459,"data":"30060\n519G0\n4I5F0\n017C0\n00000","rows":5,"cols":5,"exitCell":0,"moves":124,"path":"DDRRRRUUUULLDURRDDDDLLUUUDDDRRUULDLDRUURUULDLDURRDDLUDDLLLUURRDULLDDRRURRULRUULDDLDDLLUURRURRDDLRUULLDRLLLDDRRURULLRDDLLUUUU","blocks":7,"holes":2,"walls":2,"pushesOverEx
+[2026-09-17 01:18:08] exit 1: could not extract the 149-move level from job R2,U1,U3,U1,L1,L1,D1,D1,R1,L2,L2
+[2026-09-17 01:21:48] exit 2 max 112: level 55301/06B00/0C4G0/787D0/00000 -> submit: {"accepted":false,"reason":"dominated","dominatedBy":{"id":1327,"data":"05301\n06B00\n0C4G0\n787D0\n00000","rows":5,"cols":5,"exitCell":2,"moves":112,"path":"URRDDDLLLLUUUDDDRRRRUUULLLRRRDDDLLUUDDRRULRUULDRDDLLLLUURRRURDDULLLLDDRRRUDLLLUURRDRDLLRUULLDRDRRURULLRDDLLUUUUR","blocks":8,"holes":1,"walls"
+[2026-09-17 01:48:46] exit 6 max 124: level 08400/53CD0/07I00/50270/00060 -> submit: {"accepted":true,"level":{"id":1460,"data":"05050\n93600\n4CJ20\n0B067\n00000","rows":5,"cols":5,"exitCell":6,"moves":124,"path":"DDRRRRUUULLRRDDDLLUUDDRRULRUULDRDDLLLLUURRRURDDULLLLDDRUDRRULRRUULDRDLDLLLUURRLLDDRRURUUDDLLURDRRUULULDDDRURULDLURULLLDURRDL","blocks":8,"holes":2,"walls":0,"pushesOverEx
+[2026-09-17 01:59:38] exit 7 max 103: level 45580/08370/09800/020A7/00000 -> submit: {"accepted":true,"level":{"id":1461,"data":"06554\n07360\n00690\n7B020\n00000","rows":5,"cols":5,"exitCell":7,"moves":103,"path":"DDDLDLLLUUDDRRRURUULDLLRRRDDLLUDRRUULDLDLLURURLDDRURRUULDRDLLDLLURURLDDRURUUDDLLURDRUURULLLRRDDLLUDRRUL","blocks":8,"holes":2,"walls":0,"pushesOverExit":true,"pushesKnown
+[2026-09-17 02:00:19] exit 12 max 80: level 00000/0A609/0B315/07F47/00005 -> submit: {"accepted":false,"reason":"tie","dominatedBy":{"id":1309,"data":"00000\n0EEH0\n023H0\n04100\n58560","rows":5,"cols":5,"exitCell":12,"moves":80,"path":"LUUURRRRDDDDLURUUULLDRULLLDRRLLDDRULUURRDLULDDDDRRRURUUDDLDLLUUURRLLDDDRRUUULLDR","blocks":7,"holes":2,"walls":1,"pushesOverExit":true,"pushesKnown"
+[2026-09-17 02:00:28] all done

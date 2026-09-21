@@ -1,0 +1,30 @@
+16 (0.1s)
+  $#...
+  ...#.
+  ####.
+  ...#.
+  @#...
+
+--- Exit 0 (exhausted) ---
+  elapsed:        0.011 s
+  states checked: 812 (shortcut 0, dedup 0)
+  accepted:       812  (walk-segment pruned before check: 326)
+  solver calls:   812
+  shallow / recent: 813 / 813  (evicts 0 / 0)
+  stack peak:     11
+  best depth:     16  (verify 16 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.01 s (no time limit)
+Exits searched:    1 / 1
+States checked:    812
+  pruned shortcut: 0
+  pruned dedup:    0
+Solver calls:      812
+Best depth:        16  (exit 0)
+
+  $#...
+  ...#.
+  ####.
+  ...#.
+  @#...

@@ -1,0 +1,5 @@
+  .OOO@   A=[R]
+  .A$B.   B=[D]
+  .CD..   C=[URDL]
+  ..E#.   D=[URDL]
+  .....   E=[UL]

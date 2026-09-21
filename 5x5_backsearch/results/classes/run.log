@@ -1,0 +1,135 @@
+2026-09-17 09:11:22 running       84 (class,exit) jobs on 3 workers
+2026-09-17 09:11:22 done b0 hx e1:  elapsed: 0.014 s  best depth: 15 (verify 15 OK) 
+2026-09-17 09:11:22 done b0 hx e0:  elapsed: 0.011 s  best depth: 16 (verify 16 OK) 
+2026-09-17 09:11:22 done b0 hx e2:  elapsed: 0.011 s  best depth: 14 (verify 14 OK) 
+2026-09-17 09:11:22 done b0 hx e12:  elapsed: 0.000 s  best depth: 16 (verify 16 OK) 
+2026-09-17 09:11:22 done b0 hx e7:  elapsed: 0.005 s  best depth: 15 (verify 15 OK) 
+2026-09-17 09:11:22 done b0 hx e6:  elapsed: 0.004 s  best depth: 14 (verify 14 OK) 
+2026-09-17 09:11:23 done b1 h0 e0:  elapsed: 0.026 s  best depth: 17 (verify 17 OK) 
+2026-09-17 09:11:23 done b1 h0 e2:  elapsed: 0.026 s  best depth: 16 (verify 16 OK) 
+2026-09-17 09:11:23 done b1 h0 e1:  elapsed: 0.029 s  best depth: 17 (verify 17 OK) 
+2026-09-17 09:11:23 done b1 h0 e6:  elapsed: 0.004 s  best depth: 15 (verify 15 OK) 
+2026-09-17 09:11:23 done b1 h0 e12:  elapsed: 0.002 s  best depth: 17 (verify 17 OK) 
+2026-09-17 09:11:23 done b1 h0 e7:  elapsed: 0.009 s  best depth: 17 (verify 17 OK) 
+2026-09-17 09:11:23 done b1 hx e0:  elapsed: 0.097 s  best depth: 40 (verify 40 OK) 
+2026-09-17 09:11:23 done b1 hx e2:  elapsed: 0.086 s  best depth: 32 (verify 32 OK) 
+2026-09-17 09:11:23 done b1 hx e1:  elapsed: 0.118 s  best depth: 39 (verify 39 OK) 
+2026-09-17 09:11:23 done b1 hx e6:  elapsed: 0.009 s  best depth: 25 (verify 25 OK) 
+2026-09-17 09:11:23 done b1 hx e7:  elapsed: 0.007 s  best depth: 20 (verify 20 OK) 
+2026-09-17 09:11:23 done b1 hx e12:  elapsed: 0.002 s  best depth: 17 (verify 17 OK) 
+2026-09-17 09:11:23 done b2 h0 e0:  elapsed: 0.017 s  best depth: 26 (verify 26 OK) 
+2026-09-17 09:11:23 done b2 h0 e1:  elapsed: 0.055 s  best depth: 28 (verify 28 OK) 
+2026-09-17 09:11:23 done b2 h0 e2:  elapsed: 0.044 s  best depth: 27 (verify 27 OK) 
+2026-09-17 09:11:23 done b2 h0 e6:  elapsed: 0.033 s  best depth: 24 (verify 24 OK) 
+2026-09-17 09:11:23 done b2 h0 e12:  elapsed: 0.073 s  best depth: 24 (verify 24 OK) 
+2026-09-17 09:11:23 done b2 h0 e7:  elapsed: 0.164 s  best depth: 26 (verify 26 OK) 
+2026-09-17 09:11:24 done b2 h1 e2:  elapsed: 0.356 s  best depth: 57 (verify 57 OK) 
+2026-09-17 09:11:24 done b2 h1 e6:  elapsed: 0.140 s  best depth: 42 (verify 42 OK) 
+2026-09-17 09:11:24 done b2 h1 e7:  elapsed: 0.097 s  best depth: 34 (verify 34 OK) 
+2026-09-17 09:11:24 done b2 h1 e12:  elapsed: 0.031 s  best depth: 24 (verify 24 OK) 
+2026-09-17 09:11:24 done b2 h1 e1:  elapsed: 0.929 s  best depth: 62 (verify 62 OK) 
+2026-09-17 09:11:24 done b2 h1 e0:  elapsed: 1.104 s  best depth: 75 (verify 75 OK) 
+2026-09-17 09:11:25 done b2 hx e2:  elapsed: 0.572 s  best depth: 58 (verify 58 OK) 
+2026-09-17 09:11:25 done b2 hx e6:  elapsed: 0.216 s  best depth: 46 (verify 46 OK) 
+2026-09-17 09:11:25 done b2 hx e7:  elapsed: 0.128 s  best depth: 34 (verify 34 OK) 
+2026-09-17 09:11:25 done b2 hx e12:  elapsed: 0.033 s  best depth: 34 (verify 34 OK) 
+2026-09-17 09:11:25 done b3 h0 e0:  elapsed: 0.051 s  best depth: 27 (verify 27 OK) 
+2026-09-17 09:11:26 done b3 h0 e1:  elapsed: 0.264 s  best depth: 29 (verify 29 OK) 
+2026-09-17 09:11:26 done b3 h0 e2:  elapsed: 0.117 s  best depth: 28 (verify 28 OK) 
+2026-09-17 09:11:26 done b3 h0 e6:  elapsed: 0.207 s  best depth: 40 (verify 40 OK) 
+2026-09-17 09:11:26 done b3 h0 e7:  elapsed: 0.192 s  best depth: 53 (verify 53 OK) 
+2026-09-17 09:11:26 done b3 h0 e12:  elapsed: 0.065 s  best depth: 37 (verify 37 OK) 
+2026-09-17 09:11:27 done b2 hx e1:  elapsed: 2.473 s  best depth: 66 (verify 66 OK) 
+2026-09-17 09:11:27 done b2 hx e0:  elapsed: 3.341 s  best depth: 75 (verify 75 OK) 
+2026-09-17 09:11:30 done b3 h1 e2:  elapsed: 2.441 s  best depth: 64 (verify 64 OK) 
+2026-09-17 09:11:32 done b3 h1 e6:  elapsed: 1.765 s  best depth: 60 (verify 60 OK) 
+2026-09-17 09:11:33 done b3 h1 e7:  elapsed: 1.108 s  best depth: 58 (verify 58 OK) 
+2026-09-17 09:11:33 done b3 h1 e12:  elapsed: 0.299 s  best depth: 55 (verify 55 OK) 
+2026-09-17 09:11:37 done b3 h1 e1:  elapsed: 10.293 s  best depth: 96 (verify 96 OK) 
+2026-09-17 09:11:39 done b3 h1 e0:  elapsed: 12.581 s  best depth: 94 (verify 94 OK) 
+2026-09-17 09:11:49 done b3 h2 e2:  elapsed: 9.628 s  best depth: 74 (verify 74 OK) 
+2026-09-17 09:11:55 done b3 h2 e6:  elapsed: 6.145 s  best depth: 60 (verify 60 OK) 
+2026-09-17 09:11:58 done b3 h2 e7:  elapsed: 3.084 s  best depth: 58 (verify 58 OK) 
+2026-09-17 09:11:59 done b3 h2 e12:  elapsed: 0.777 s  best depth: 55 (verify 55 OK) 
+2026-09-17 09:12:31 done b3 h2 e1:  elapsed: 53.928 s  best depth: 96 (verify 96 OK) 
+2026-09-17 09:12:46 done b3 h2 e0:  elapsed: 72.918 s  best depth: 94 (verify 94 OK) 
+2026-09-17 09:13:05 done b3 hx e2:  elapsed: 18.479 s  best depth: 74 (verify 74 OK) 
+2026-09-17 09:13:14 done b3 hx e6:  elapsed: 9.219 s  best depth: 60 (verify 60 OK) 
+2026-09-17 09:13:18 done b3 hx e7:  elapsed: 4.260 s  best depth: 58 (verify 58 OK) 
+2026-09-17 09:13:19 done b3 hx e12:  elapsed: 1.019 s  best depth: 55 (verify 55 OK) 
+2026-09-17 09:13:19 done b4 h0 e0:  elapsed: 0.103 s  best depth: 28 (verify 28 OK) 
+2026-09-17 09:13:20 done b4 h0 e1:  elapsed: 0.499 s  best depth: 36 (verify 36 OK) 
+2026-09-17 09:13:20 done b4 h0 e2:  elapsed: 0.265 s  best depth: 35 (verify 35 OK) 
+2026-09-17 09:13:21 done b4 h0 e6:  elapsed: 1.016 s  best depth: 44 (verify 44 OK) 
+2026-09-17 09:13:22 done b4 h0 e7:  elapsed: 1.060 s  best depth: 56 (verify 56 OK) 
+2026-09-17 09:13:23 done b4 h0 e12:  elapsed: 0.366 s  best depth: 48 (verify 48 OK) 
+2026-09-17 09:14:15 done b3 hx e1:  elapsed: 104.517 s  best depth: 96 (verify 96 OK) 
+2026-09-17 09:14:30 done b3 hx e0:  elapsed: 151.239 s  best depth: 110 (verify 110 OK) 
+2026-09-17 09:15:02 done b4 h1 e2:  elapsed: 32.154 s  best depth: 83 (verify 83 OK) 
+2026-09-17 09:15:36 done b4 h1 e0:  elapsed: 133.375 s  best depth: 106 (verify 106 OK) 
+2026-09-17 09:15:43 done b4 h1 e6:  elapsed: 40.117 s  best depth: 80 (verify 80 OK) 
+2026-09-17 09:15:48 done b4 h1 e12:  elapsed: 5.843 s  best depth: 56 (verify 56 OK) 
+2026-09-17 09:15:57 done b4 h1 e7:  elapsed: 20.794 s  best depth: 68 (verify 68 OK) 
+2026-09-17 09:16:53 done b4 h1 e1:  elapsed: 157.864 s  best depth: 102 (verify 102 OK) 
+2026-09-17 09:19:49 done b4 h2 e2:  elapsed: 175.604 s  best depth: 92 (verify 92 OK) 
+2026-09-17 09:22:39 done b4 h2 e6:  elapsed: 169.889 s  best depth: 80 (verify 80 OK) 
+2026-09-17 09:24:06 done b4 h2 e7:  elapsed: 87.172 s  best depth: 76 (verify 76 OK) 
+2026-09-17 09:24:28 done b4 h2 e12:  elapsed: 21.921 s  best depth: 58 (verify 58 OK) 
+2026-09-17 09:24:29 done bx h0 e0:  elapsed: 0.277 s  best depth: 38 (verify 38 OK) 
+2026-09-17 09:24:35 done bx h0 e1:  elapsed: 6.442 s  best depth: 41 (verify 41 OK) 
+2026-09-17 09:24:38 done bx h0 e2:  elapsed: 3.293 s  best depth: 41 (verify 41 OK) 
+2026-09-17 09:26:41 done bx h0 e6:  elapsed: 122.512 s  best depth: 50 (verify 50 OK) 
+2026-09-17 09:28:48 done bx h0 e7:  elapsed: 127.203 s  best depth: 69 (verify 69 OK) 
+2026-09-17 09:29:26 done bx h0 e12:  elapsed: 38.114 s  best depth: 60 (verify 60 OK) 
+2026-09-17 09:30:41 done b4 h2 e0:  elapsed: 892.587 s  best depth: 106 (verify 106 OK) 
+2026-09-17 09:31:37 done b4 h2 e1:  elapsed: 939.718 s  best depth: 119 (verify 119 OK) 
+2026-09-17 09:31:37 all done
+2026-09-17 09:32:32 running       18 (class,exit) jobs on 3 workers
+2026-09-17 09:32:33 done b5 h0 e0:  elapsed: 0.244 s  best depth: 35 (verify 35 OK) 
+2026-09-17 09:32:33 done b5 h0 e2:  elapsed: 0.655 s  best depth: 35 (verify 35 OK) 
+2026-09-17 09:32:34 done b5 h0 e1:  elapsed: 1.439 s  best depth: 37 (verify 37 OK) 
+2026-09-17 09:32:36 done b5 h0 e12:  elapsed: 1.887 s  best depth: 56 (verify 56 OK) 
+2026-09-17 09:32:38 done b5 h0 e6:  elapsed: 4.935 s  best depth: 50 (verify 50 OK) 
+2026-09-17 09:32:39 done b5 h0 e7:  elapsed: 5.306 s  best depth: 67 (verify 67 OK) 
+2026-09-17 09:36:17 done b5 h1 e2:  elapsed: 218.530 s  best depth: 92 (verify 92 OK) 
+2026-09-17 09:41:27 done b5 h1 e0:  elapsed: 531.553 s  best depth: 113 (verify 113 OK) 
+2026-09-17 09:42:03 done b5 h1 e6:  elapsed: 346.244 s  best depth: 102 (verify 102 OK) 
+2026-09-17 09:42:53 done b5 h1 e12:  elapsed: 49.498 s  best depth: 67 (verify 67 OK) 
+2026-09-17 09:44:53 done b5 h1 e7:  elapsed: 205.589 s  best depth: 86 (verify 86 OK) 
+2026-09-17 09:52:23 done b5 h1 e1:  elapsed: 1185.072 s  best depth: 108 (verify 108 OK) 
+2026-09-17 10:16:53 done b5 h2 e2:  elapsed: 1470.490 s  best depth: 92 (verify 92 OK) 
+2026-09-17 10:55:13 done b5 h2 e6:  elapsed: 2299.590 s  best depth: 102 (verify 102 OK) 
+2026-09-17 10:59:53 done b5 h2 e0:  elapsed: 4620.046 s  best depth: 118 (verify 118 OK) 
+2026-09-17 11:03:55 done b5 h2 e12:  elapsed: 241.820 s  best depth: 67 (verify 67 OK) 
+2026-09-17 11:12:33 done b5 h2 e7:  elapsed: 1040.086 s  best depth: 92 (verify 92 OK) 
+2026-09-17 11:52:49 done b5 h2 e1:  elapsed: 7676.080 s  best depth: 121 (verify 121 OK) 
+2026-09-17 11:52:49 all done
+2026-09-17 15:51:59 stage B finished (camp_h1 driver exited)
+2026-09-18 13:05:06 stage C start
+2026-09-18 13:05:06 running       12 (class,exit) jobs on 3 workers
+2026-09-18 13:05:07 done b6 h0 e0:  elapsed: 0.524 s 
+2026-09-18 13:05:10 done b6 h0 e2:  elapsed: 3.872 s 
+2026-09-18 13:05:13 done b6 h0 e1:  elapsed: 6.787 s 
+2026-09-18 13:05:25 done b6 h0 e12:  elapsed: 12.088 s 
+2026-09-18 13:05:40 done b6 h0 e6:  elapsed: 33.547 s 
+2026-09-18 13:05:44 done b6 h0 e7:  elapsed: 33.650 s 
+2026-09-18 13:23:46 done b6 h1 e2:  elapsed: 1082.104 s 
+2026-09-18 13:25:47 done b6 h1 e6: 
+2026-09-18 13:25:47 done b6 h1 e0: 
+2026-09-18 13:25:47 done b6 h1 e1: 
+2026-09-18 13:25:49 stage C start
+2026-09-18 13:25:49 running        5 (class,exit) jobs on 1 workers
+2026-09-18 13:28:01 done b6 h1 e0: 
+2026-09-18 13:28:02 stage C stopped by hand (code work first)
+2026-09-18 14:03:15 stage C start
+2026-09-18 14:03:15 running        5 (class,exit) jobs on 1 workers
+2026-09-18 21:01:32 stage C relaunched at 2 workers with the reviewed worker (d11 run finished 17:08)
+2026-09-18 21:01:32 stage C start
+2026-09-18 21:01:32 running        5 (class,exit) jobs on 2 workers
+2026-09-18 21:12:26 done b6 h1 e0:  elapsed: 653.123 s 
+2026-09-18 21:29:11 done b6 h1 e6:  elapsed: 1005.744 s 
+2026-09-18 21:38:19 done b6 h1 e7:  elapsed: 547.326 s 
+2026-09-18 21:39:56 done b6 h1 e12:  elapsed: 96.731 s 
+2026-09-18 21:47:37 done b6 h1 e1:  elapsed: 2764.546 s 
+2026-09-18 21:47:37 all done
+2026-09-19 06:04:12 stage C finished

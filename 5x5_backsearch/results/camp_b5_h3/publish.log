@@ -1,0 +1,10 @@
+[2026-09-20 20:07:18] NOT complete: 262812 missing, 0 non-exhausted -> nothing published
+[2026-09-21 00:49:15] maxima: e0:127, e1:126, e2:94, e6:102, e7:115, e12:67
+[2026-09-21 00:49:20] add_proof: added  #145  5×5 level with exit @ cell 0, ≤ 5 blocks, ≤ 3 holes: max 127 moves  [1 champion(s): #1312]  Panacea 2026-09-21 04:49:19 | added  #146  5×5 level with exit @ cell 1, ≤ 5 blocks, ≤ 3 holes: max 126 moves  [no champion stored (longest stored: 121)]  Panacea 2026-09-21 04:49:19 | added  #147  5×5 level with exit @ cell 2, ≤ 5 blocks, ≤ 3 holes: max 94 moves  [no champion stored (longest stored: 92)]  Panacea 2026-09-21 04:49:19 | added  #148  5×5 level with exit @ cell 6, ≤ 5 blocks, ≤ 3 holes: max 102 moves  [1 champion(s): #1511]  Panacea 2026-09-21 04:49:20 | added  #149  5×5 level with exit @ cell 7, ≤ 5 blocks, ≤ 3 holes: max 115 moves  [1 champion(s): #1313]  Panacea 2026-09-21 04:49:20 | added  #150  5×5 level with exit @ cell 12, ≤ 5 blocks, ≤ 3 holes: max 67 moves  [1 champion(s): #25]  Panacea 2026-09-21 04:49:20
+[2026-09-21 01:06:52] champion exit 0 (127) 31000/514D0/51200/502A0/00000: refused: tie
+[2026-09-21 01:33:50] champion exit 1 (126) 53005/0BFB1/00001/0B0G0/11045: accepted id 1548
+[2026-09-21 01:36:58] champion exit 2 (94) 50301/51B00/0C4D0/50HG0/10000: accepted id 1549
+[2026-09-21 01:41:35] champion exit 6 (102) 11400/53C10/0BF00/00IA0/10000: refused: duplicate
+[2026-09-21 01:42:49] champion exit 7 (115) 05554/08390/02200/00A10/00000: refused: duplicate
+[2026-09-21 01:43:51] champion exit 12 (67) 00000/0B6G4/05301/00760/00000: refused: tie
+[2026-09-21 01:44:52] done

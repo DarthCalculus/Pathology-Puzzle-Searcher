@@ -41,3 +41,4 @@ legacy/5x6/*_search
 5x5_optC/
 *_bak*/
 .claude/
+*.exe

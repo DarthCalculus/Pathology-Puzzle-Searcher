@@ -1,0 +1,30 @@
+17 (0.0s)
+  ....#   A=[UL]
+  .#$A.
+  ...#.
+  ###..
+  @...#
+
+--- Exit 7 (exhausted) ---
+  elapsed:        0.009 s
+  states checked: 5469 (shortcut 1636, dedup 18)
+  accepted:       3815  (walk-segment pruned before check: 530)
+  solver calls:   5451
+  shallow / recent: 5455 / 5455  (evicts 0 / 0)
+  stack peak:     18
+  best depth:     17  (verify 17 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.01 s (no time limit)
+Exits searched:    1 / 1
+States checked:    5469
+  pruned shortcut: 1636
+  pruned dedup:    18
+Solver calls:      5451
+Best depth:        17  (exit 7)
+
+  ....#   A=[UL]
+  .#$A.
+  ...#.
+  ###..
+  @...#

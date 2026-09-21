@@ -1,0 +1,30 @@
+34 (0.1s)
+  O..##   A=[RD]
+  @#$##   B=[UL]
+  ..###
+  .A.B.
+  .....
+
+--- Exit 7 (exhausted) ---
+  elapsed:        0.097 s
+  states checked: 171493 (shortcut 58752, dedup 2972)
+  accepted:       109769  (walk-segment pruned before check: 7394)
+  solver calls:   168521
+  shallow / recent: 168348 / 168348  (evicts 0 / 0)
+  stack peak:     32
+  best depth:     34  (verify 34 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.10 s (no time limit)
+Exits searched:    1 / 1
+States checked:    171493
+  pruned shortcut: 58752
+  pruned dedup:    2972
+Solver calls:      168521
+Best depth:        34  (exit 7)
+
+  O..##   A=[RD]
+  @#$##   B=[UL]
+  ..###
+  .A.B.
+  .....

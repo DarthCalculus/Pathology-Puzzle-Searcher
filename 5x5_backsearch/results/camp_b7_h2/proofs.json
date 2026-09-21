@@ -1,0 +1,80 @@
+[
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 0,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 124,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 536174930,
+  "cpuSeconds": 10377,
+  "note": "Every 5x5 level with the exit at cell 0 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 124 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ },
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 1,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 149,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 2199995412,
+  "cpuSeconds": 64303,
+  "note": "Every 5x5 level with the exit at cell 1 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 149 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ },
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 2,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 104,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 734031783,
+  "cpuSeconds": 13190,
+  "note": "Every 5x5 level with the exit at cell 2 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 104 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ },
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 6,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 124,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 1526114567,
+  "cpuSeconds": 26217,
+  "note": "Every 5x5 level with the exit at cell 6 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 124 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ },
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 7,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 102,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 1095707068,
+  "cpuSeconds": 11514,
+  "note": "Every 5x5 level with the exit at cell 7 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 102 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ },
+ {
+  "rows": 5,
+  "cols": 5,
+  "exitCell": 12,
+  "maxBlocks": 7,
+  "maxHoles": 2,
+  "maxMoves": 80,
+  "method": "exhaustive backward search (backsearch_worker + campaign.py, real rules: blocks may transit the exit, no block starts on the exit)",
+  "attribution": "Panacea",
+  "states": 212939296,
+  "cpuSeconds": 1436,
+  "note": "Every 5x5 level with the exit at cell 12 using at most 7 movable blocks and at most 2 holes (any walls) was enumerated; 80 moves is the longest optimal solution. Campaign results/camp_b7_h2, finished 2026-09-20."
+ }
+]

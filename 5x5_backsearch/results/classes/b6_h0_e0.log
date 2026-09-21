@@ -1,0 +1,31 @@
+35 (0.6s)
+  $..A.   A=[L]
+  ..B..   B=[D]
+  #.CD.   C=[L]
+  @#.E.   D=[D]
+  .....   E=[UR]
+
+--- Exit 0 (exhausted) ---
+  elapsed:        0.524 s
+  states checked: 196581 (shortcut 107967, dedup 5285)
+  accepted:       83329  (walk-segment pruned before check: 173475)
+  bulk walk-back: 8242 multi-solves covering 17549 starts (2.1/solve), 0 fallbacks
+  solver calls:   181989
+  shallow / recent: 190438 / 190438  (evicts 0 / 0)
+  stack peak:     53
+  best depth:     35  (verify 35 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.52 s (no time limit)
+Exits searched:    1 / 1
+States checked:    196581
+  pruned shortcut: 107967
+  pruned dedup:    5285
+Solver calls:      181989
+Best depth:        35  (exit 0)
+
+  $..A.   A=[L]
+  ..B..   B=[D]
+  #.CD.   C=[L]
+  @#.E.   D=[D]
+  .....   E=[UR]

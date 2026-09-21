@@ -1,0 +1,30 @@
+40 (0.1s)
+  $#..@   A=[UL]
+  O..#.
+  .....
+  .##A#
+  ....#
+
+--- Exit 0 (exhausted) ---
+  elapsed:        0.097 s
+  states checked: 62642 (shortcut 18376, dedup 1863)
+  accepted:       42403  (walk-segment pruned before check: 4528)
+  solver calls:   60779
+  shallow / recent: 60582 / 60582  (evicts 0 / 0)
+  stack peak:     32
+  best depth:     40  (verify 40 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.10 s (no time limit)
+Exits searched:    1 / 1
+States checked:    62642
+  pruned shortcut: 18376
+  pruned dedup:    1863
+Solver calls:      60779
+Best depth:        40  (exit 0)
+
+  $#..@   A=[UL]
+  O..#.
+  .....
+  .##A#
+  ....#

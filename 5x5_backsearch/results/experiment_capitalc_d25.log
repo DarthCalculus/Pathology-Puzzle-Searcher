@@ -1,0 +1,56 @@
+start 10:12:42
+[seed-path] seed built: depth=25 player=22 nblocks=2 nholes=1 committed_pop=18
+91 (1.9s)
+  O$.AO   A=[R]
+  .BC.#   B=[UR]
+  ..DE.   C=[URDL]
+  .F.G.   D=[DL]
+  ....@   E=[L]
+            F=[UD]
+            G=[RL]
+
+93 (5.2s)
+  O$.A.   A=[R]
+  .BC.#   B=[UR]
+  ..DE@   C=[URDL]
+  .F.G.   D=[DL]
+  O..H.   E=[L]
+            F=[UD]
+            G=[RL]
+            H=[L]
+
+149 (22.0s)
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+--- Exit 1 (exhausted) ---
+  elapsed:        46.786 s
+  states checked: 482667 (shortcut 153007, dedup 46422)
+  accepted:       283238  (walk-segment pruned before check: 3335)
+  solver calls:   436245
+  shallow / recent: 428904 / 428904  (evicts 0 / 0)
+  stack peak:     66
+  best depth:     149  (verify 149 OK)
+
+=== Backward search complete ===
+Total elapsed:     46.79 s (no time limit)
+Exits searched:    1 / 1
+States checked:    482667
+  pruned shortcut: 153007
+  pruned dedup:    46422
+Solver calls:      436245
+Best depth:        149  (exit 1)
+
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]
+end 10:13:29

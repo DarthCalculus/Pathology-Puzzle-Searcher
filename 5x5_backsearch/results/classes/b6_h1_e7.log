@@ -1,0 +1,82 @@
+38 (1.0s)
+  #.AO#   A=[R]
+  @B$#.   B=[RD]
+  .CD.E   C=[RDL]
+  ...F.   D=[L]
+  ##...   E=[U]
+            F=[UR]
+
+49 (4.0s)
+  ....#   A=[UR]
+  .A$B.   B=[DL]
+  ..CD@   C=[R]
+  .#.EF   D=[D]
+  .....   E=[R]
+            F=[U]
+
+66 (5.3s)
+  ....#   A=[UR]
+  .A$B.   B=[DL]
+  .OC@.   C=[R]
+  ..DEF   D=[UR]
+  .....   E=[UDL]
+            F=[U]
+
+68 (6.4s)
+  O.A@.   A=[R]
+  .B$#.   B=[RD]
+  .CD..   C=[UR]
+  ..EF.   D=[DL]
+  #....   E=[UR]
+            F=[UL]
+
+84 (9.2s)
+  O.A@.   A=[R]
+  .#$B.   B=[UDL]
+  ..CD.   C=[UD]
+  .E.F.   D=[RDL]
+  #....   E=[RD]
+            F=[DL]
+
+86 (5.4m)
+  ..#.O   A=[R]
+  .A$B@   B=[D]
+  .C.D.   C=[URD]
+  ..EF.   D=[RL]
+  .....   E=[RD]
+            F=[UL]
+
+88 (8.7m)
+  .@A.O   A=[L]
+  .B$#.   B=[URD]
+  .CD..   C=[RDL]
+  .E.F.   D=[U]
+  ....#   E=[RD]
+            F=[DL]
+
+--- Exit 7 (exhausted) ---
+  elapsed:        547.326 s
+  states checked: 93669789 (shortcut 34227293, dedup 7242945)
+  accepted:       52199551  (walk-segment pruned before check: 85014873)
+  parent tables:  23239810 saved, 52161815 used as reference (28900386 with a puzzle delta), 28922005 states inherited an ancestor's; peak 52 live tables, 4.0 MB
+  bulk walk-back: 9925767 multi-solves covering 39504552 starts (4.0/solve), 1 fallbacks
+  solver calls:   56848059
+  shallow / recent: 3210953 / 2818381  (evicts 62 / 49)
+  stack peak:     254
+  best depth:     88  (verify 88 OK)
+
+=== Backward search complete ===
+Total elapsed:     547.33 s (no time limit)
+Exits searched:    1 / 1
+States checked:    93669789
+  pruned shortcut: 34227293
+  pruned dedup:    7242945
+Solver calls:      56848059
+Best depth:        88  (exit 7)
+
+  .@A.O   A=[L]
+  .B$#.   B=[URD]
+  .CD..   C=[RDL]
+  .E.F.   D=[U]
+  ....#   E=[RD]
+            F=[DL]

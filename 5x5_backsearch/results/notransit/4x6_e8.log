@@ -1,0 +1,52 @@
+32 (1.0s)
+  .@OOAO   A=[L]
+  B#$#CO   B=[D]
+  ..#.DE   C=[UL]
+  O.F..O   D=[UR]
+            E=[U]
+            F=[R]
+
+33 (2.6s)
+  OAO#@.   A=[R]
+  .#$.BC   B=[DL]
+  D##EF.   C=[D]
+  OO..GO   D=[U]
+            E=[U]
+            F=[L]
+            G=[L]
+
+37 (4.8s)
+  OA.#@.   A=[R]
+  .B$.CD   B=[U]
+  E.#FG.   C=[DL]
+  OO..HO   D=[D]
+            E=[U]
+            F=[U]
+            G=[L]
+            H=[L]
+
+--- Exit 8 (exhausted) ---
+  elapsed:        4.813 s
+  states checked: 4018500 (shortcut 2269303, dedup 124370)
+  solver calls:   3894130
+  shallow / recent: 2452438 / 2195665  (evicts 1 / 1)
+  stack peak:     41
+  best depth:     37  (verify 37 OK)
+
+=== Backward search complete ===
+Total elapsed:     4.81 s (cap 55.00 s)
+Exits searched:    1 / 1
+States checked:    4018500
+  pruned shortcut: 2269303
+  pruned dedup:    124370
+Solver calls:      3894130
+Best depth:        37  (exit 8)
+
+  OA.#@.   A=[R]
+  .B$.CD   B=[U]
+  E.#FG.   C=[DL]
+  OO..HO   D=[D]
+            E=[U]
+            F=[U]
+            G=[L]
+            H=[L]

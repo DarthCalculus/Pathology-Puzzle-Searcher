@@ -1,0 +1,1 @@
+grid=5x5 exits=[2] layer=6 extra=[] worker=./backsearch_worker_nt

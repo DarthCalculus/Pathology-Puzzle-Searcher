@@ -1,0 +1,7 @@
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]

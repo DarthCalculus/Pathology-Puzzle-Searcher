@@ -1,0 +1,37 @@
+48 (1.0s)
+  @....   A=[D]
+  #AB..   B=[L]
+  .C$#.   C=[UR]
+  .OD..   D=[R]
+  .....
+
+56 (5.4s)
+  ..#..   A=[D]
+  .AB@C   B=[RDL]
+  .D$#.   C=[D]
+  ..O..   D=[UR]
+  .....
+
+--- Exit 12 (exhausted) ---
+  elapsed:        5.843 s
+  states checked: 1829513 (shortcut 561291, dedup 115924)
+  accepted:       1152298  (walk-segment pruned before check: 54579)
+  solver calls:   1713589
+  shallow / recent: 1701015 / 1701015  (evicts 0 / 0)
+  stack peak:     64
+  best depth:     56  (verify 56 OK)
+
+=== Backward search complete ===
+Total elapsed:     5.84 s (no time limit)
+Exits searched:    1 / 1
+States checked:    1829513
+  pruned shortcut: 561291
+  pruned dedup:    115924
+Solver calls:      1713589
+Best depth:        56  (exit 12)
+
+  ..#..   A=[D]
+  .AB@C   B=[RDL]
+  .D$#.   C=[D]
+  ..O..   D=[UR]
+  .....

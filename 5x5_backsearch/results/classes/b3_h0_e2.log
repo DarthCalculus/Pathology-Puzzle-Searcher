@@ -1,0 +1,30 @@
+28 (0.1s)
+  ..$.#   A=[U]
+  ABC..   B=[L]
+  .#@#.   C=[UR]
+  ..#..
+  #....
+
+--- Exit 2 (exhausted) ---
+  elapsed:        0.117 s
+  states checked: 138066 (shortcut 66184, dedup 1216)
+  accepted:       70666  (walk-segment pruned before check: 2753)
+  solver calls:   136850
+  shallow / recent: 136813 / 136813  (evicts 0 / 0)
+  stack peak:     27
+  best depth:     28  (verify 28 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.12 s (no time limit)
+Exits searched:    1 / 1
+States checked:    138066
+  pruned shortcut: 66184
+  pruned dedup:    1216
+Solver calls:      136850
+Best depth:        28  (exit 2)
+
+  ..$.#   A=[U]
+  ABC..   B=[L]
+  .#@#.   C=[UR]
+  ..#..
+  #....

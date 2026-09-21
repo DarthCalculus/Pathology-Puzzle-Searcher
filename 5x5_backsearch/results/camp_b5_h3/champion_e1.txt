@@ -1,0 +1,5 @@
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  ....#   C=[UR]
+  .D.E.   D=[UR]
+  ##.@O   E=[UDL]

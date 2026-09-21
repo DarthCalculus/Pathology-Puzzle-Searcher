@@ -1,0 +1,183 @@
+error: unknown arg '--bulk-min-depth 50'
+Usage: /private/tmp/claude-502/-Users-george-PathologyRecords/92d6b5c4-ca51-4888-97d7-50af2caf7f30/scratchpad/bsw_prof4 [--grid RxC] [--time SEC] [--exit N] [--allow-exit-transit]
+                       [--fixedwalls c,c,...] [--fixedholes c,c,...]
+  --grid RxC            grid dimensions; R*C must be <= 64 (= MAX_NCELLS).  Default: 5x5
+  --time SEC            wall-clock cap in seconds, shared across exits.  Default: 0
+                          (0 = no time limit, run until queue is empty for every exit)
+  --exit N              restrict to one exit cell.  Default: iterate canonical {0,1,2,6,7,12}
+  --exitloc c,c,...     iterate the listed exit cells (comma-separated).  Overrides the
+                          canonical default; --exit takes priority if both are given.
+  --allow-exit-transit  allow blocks to be pushed onto the exit and back off during play
+  --allow-block-on-exit permit the puzzle to start with a block on the exit (implies transit)
+                          (block still cannot start at exit at puzzle setup).  Default: off.
+  --mandatory-holes [c,c,...]
+                          enable the solver's mandatory-hole prune (sound speedup; off by
+                          default).  Big win on dense/deep walled multi-hole boards,
+                          marginal on sparse ones.  Optional cell list: holes at those
+                          cells are forced mandatory (union with the reachability check,
+                          flood skipped for them).  Forcing a hole that is not truly
+                          mandatory is unsound (may drop valid states) — caller's call.
+  --reverse             invert variant priority within each direction.  In DFS (LIFO),
+                          default order explores un-consume (4) then new-block / push-
+                          existing (3 / 2) then walk-back (1); with --reverse, walk-back
+                          (1) goes first and un-consume (4) last.  Direction priority
+                          (L, D, R, U) is unchanged.  Default: off.
+  --shortcut-state-cap N treat shortcut_check as a prune when the forward solver expanded
+                          more than N unique states (states_popped) without finding a
+                          shortcut.  Heuristic: states whose forward search explodes are
+                          unlikely to deepen further.  Per-exit stats line gains a 'cap K'
+                          field showing how many states were pruned this way.
+                          Default: 0 (disabled).
+  --beam-score-branching  beam mode: replace the hand-tuned score (room/blocks/holes/kids/
+                          hole-adj-exit/mask-pop) with -branch_factor, where branch_factor
+                          is the peak heap size from this state's shortcut_check call.
+                          Lower forward-search explosion ranks higher.  Overrides NN/blend
+                          terms — this is a pure branching-only ranker.  Requires --beam.
+                          Default: off.
+  --beam-score-branching-mid  like --beam-score-branching, but each beam level computes
+                          the target branch_factor across all candidates at that level
+                          (median by default, tunable via --branching-target-pct) and
+                          ranks by -|bf - target|.  Rationale: very low bf = trivial
+                          state with no real puzzle; very high bf = shortcut nearby.
+                          The middle of the per-depth range is empirically where the
+                          deepest puzzles live.  Implies --beam-score-branching.
+                          Default: off.
+  --branching-target-pct P  percentile target used by --beam-score-branching-mid (0..100).
+                          50 = median.  Higher values (60-80) bias toward slightly more
+                          branchy states.  Default: 50.
+  --beam-score-tailwidth  redefine branch_factor as a deep-weighted sum of the forward
+                          frontier's WIDTH in the cost-levels just below the cutoff
+                          (max_cost = depth-2), instead of total states_popped.  Captures
+                          'is the search tree narrow near the goal' — a forced corridor,
+                          the hallmark of a deep level.  Implies --beam-score-branching
+                          (ranks by -branch_factor, smaller = narrower = better).  Combine
+                          with --beam-score-branching-mid to rank by percentile instead.
+                          Default: off.
+  --tailwidth-window K    number of deepest cost-levels summed by --beam-score-tailwidth,
+                          weighted linearly toward the deepest (the level at max_cost).
+                          Default: 24.
+  --rollout K[,M[,C[,P]]] population / stochastic-beam search (own mode; ignores --beam/DFS).
+                          Carry up to M endpoints across generations.  Each generation every
+                          member spawns C random rollouts of K backward steps (each step
+                          uniform among non-shortcut moves); surviving endpoints are pooled,
+                          deduped by canonical key, ranked by branch_factor, and the next
+                          population is an M-wide band centered on the P-th percentile.  If
+                          no rollout survives, DFS-rescue any valid K-step continuation;
+                          if none exists, stop.  branch_factor honours --beam-score-tailwidth
+                          (else states_popped); smaller ranks first, so P picks how deep into
+                          the branchiness distribution the band sits.  M=1 is single-trajectory.
+                          Defaults: K=10, M=100, C=10, P=50 (e.g. --rollout 10,100,10,50).
+  --solver-profile      print the per-depth solver-call profile table at the end of the
+                          run.  Default: off (the table can be ~90 rows).
+  --rollout-trace       log per-generation selectivity to stderr (depth, spawned, survived,
+                          unique-after-dedup, kept, and whether the band actually filters or
+                          keeps-all).  Diagnostic for tuning M/C/P.  Default: off.
+  --quiet               collapse the per-generation trace into a single self-overwriting
+                          status line (only one visible at a time); new-best puzzles still
+                          print normally.  Implies --rollout-trace.  Default: off.
+  --rollout-pushoff     seed every rollout trajectory from the V3 'block pulled off the exit'
+                          opening (block on the exit cell, player adjacent) instead of the bare
+                          root.  Needs --allow-exit-transit to apply; else falls back to root.
+  --rollout-dfs-fill N  when the deduped survivor pool has < N unique states, exhaustively DFS-
+                          enumerate distinct depth+K states (in random successor order) from the
+                          spawning members to top it up to N, since random rollouts run dry with
+                          depth.  Default: auto = M in rand-gens (keep the whole randomly-produced
+                          pool, no selection); OFF in percentile mode (exhaustive fill surfaces
+                          degenerate low-branch_factor states that a low-P band chases into early
+                          dead-ends).  Pass an explicit N to force it on anywhere; 0 disables.
+  --rollout-restarts N  stop after N dead-end restarts (episodes) instead of on --time.  Lets you
+                          compare deepest-depth-per-restart across P/M without the throughput bias
+                          of a wall-clock cap.  Default: 0 (off; use --time).
+  --rollout-rand-gens N for the first N generations pick the M survivors as a pure random subset
+                          (no branch_factor ranking) to inject diversity at the top, then revert
+                          to percentile-P selection.  Pair with a low P (e.g. 0).  Random gens
+                          produce only ~M candidates (not the full M*C pool, which would be
+                          randomly discarded anyway), so they run ~C x faster.  Default: 0.
+  --holeless            forbid all holes (disables variant-4 un-consume).  Incompatible
+                          with --fixedholes.  Default: off (holes allowed).
+  --two-tables          use a two-table dedup that auto-evicts: a SHALLOW table keeps
+                          the lowest-depth states (evicts deep ones when full) and a
+                          RECENT table keeps recently-hit states (evicts old ones when
+                          full).  No more dedup overflow at the cost of some redundant
+                          subtree exploration.  Default: ON.
+  --no-two-tables       use the single fixed-size dedup table instead (fills and then
+                          silently ends the pass non-exhaustive).  Mainly for A/B.
+  --dupe-threshold N    only dedup states at depth <= N; deeper states free-fly without
+                          dedup tracking.  Trades wall-clock for memory headroom on long
+                          runs that would otherwise hit the dedup table cap.  Default: no
+                          threshold (all states deduped).
+  --fixedwalls c,c,...  cells that must be walls in the reported puzzle setup.
+                          The search prevents these cells from being walked on or used
+                          for blocks/holes.  Default: none.
+  --num-walls N         require at least N cells of the active region to remain walls
+  --single-axis-blocks  allow at most one block pushed along both axes; others single-axis
+  --single-axis-strict  implies --single-axis-blocks; shortcut check treats each block as
+                        pushable both ways on any axis it was pulled along
+                          in the reported puzzle (any cells, the search picks).  Counted
+                          as TOTAL walls including any --fixedwalls.  Default: 0.
+  --num-blocks N        cap the number of blocks introduced by the search to at most N.
+                          Default: 32 (no extra constraint beyond MAX_BLOCKS).
+  --num-holes N         cap the number of active holes to at most N (counts --fixedholes).
+                          Default: 64 (no extra constraint beyond MAX_HOLES).
+  --fixedholes c,c,...  if non-empty, holes are allowed at these cells.  The search may
+                          use 0..len holes drawn from this list.  If --num-holes N is set
+                          LARGER than the list size, the surplus (N - len) becomes
+                          'wildcard' holes allowed anywhere else — e.g. --fixedholes 7,13
+                          --num-holes 3 allows holes at 7/13 plus up to 1 hole anywhere.
+                          Without an explicit --num-holes it stays a hard whitelist.
+                          Pairs with --holeless (forbid all).  Default: holes anywhere.
+  --place-holes N D [c,c,...]
+                          require at least N active holes to exist by depth D: any state
+                          at depth >= D with fewer than N qualifying holes is pruned (its
+                          subtree can never place them in time).  Optional cell list
+                          restricts the count to holes at those cells (e.g. 2 25 7,13 =
+                          both 7 and 13 filled by depth 25).  Repeatable: each flag adds
+                          one constraint, all enforced (e.g. --place-holes 1 5 7
+                          --place-holes 1 25 13).  NB depth is BACKWARD depth, and holes
+                          accumulate with it, so small D forces early hole creation and
+                          caps achievable depth.  Default: off.
+  --no-bulk-walk        generate walk-back children one step at a time with a solver
+                          call each instead of deciding every walk-back descendant over
+                          committed cells with one multi-start solve (default on; exact
+                          either way; ~10 0.000000aster on deep 5x5 classes).  --bulk-walk = on.
+  --estimate N          do not search: estimate the size of the DFS tree instead.
+                          Enumerates the depth-K layer exactly (K = --estimate-depth,
+                          default 6), then runs ~N random root-to-leaf probes (Knuth
+                          estimator; every prune except dedup) and prints estimated
+                          nodes, states checked, wall time, depth profile and the
+                          heaviest layer nodes as --seed-path strings for splitting.
+                          Honours --exit/--task-id/--seed-path and every search cap.
+  --estimate-depth K    layer depth for --estimate (default 6).
+  --list-layer K        print the dedup'd depth-K layer, one LAYER line per node
+                          (exit, --seed-path string, depth, blocks, holes), then exit.
+                          Feed the paths to independent --seed-path --time 0 jobs to
+                          split an exhaustive search across processes / sessions.
+  --harvest FILE        emit a packed binary record per *visited* state (accepted +
+                          shortcut-pruned + dedup-pruned + cap-pruned) with full state
+                          blob, canonical key, and forward-solve value.  If FILE ends in
+                          .gz it is gzip-compressed on the fly (~6x smaller).  Use
+                          harvest_load.py to post-process into a SQLite DB with derived
+                          max_descendant_depth.  See harvest_format.h for record layout.
+                          Default: off.
+  --nn-value-model PATH replace beam_score() with a libtorch TorchScript model that
+                          predicts max_descendant_depth.  Expects a companion
+                          PATH.meta.json carrying target_scale and the canonical grid.
+                          Use export_torchscript.py to generate.  Default: off (hand-
+                          tuned beam features).
+  --nn-blend ALPHA      weighted-average blend: score = (1-α)*hand + α*nn.  α=1.0 →
+                          pure NN.  α=0 short-circuits NN inference for zero overhead.
+  --nn-additive LAMBDA  additive blend: score = hand_tuned + λ*nn.  Use when the NN
+                          should refine hand-tuned signal instead of replacing it.
+  --nn-surrogate-model PATH  load a fast shortcut-prune predictor.  Reads PATH.meta.json
+                          for task=regression|classification.  Regression: predicts
+                          forward_solve, prune if pred+margin ≤ depth-2.  Classification:
+                          predicts P(prune), prune if sigmoid(logit) ≥ threshold.
+  --nn-surrogate-margin K   regression-mode safety margin (default 0).
+  --nn-surrogate-threshold P  classification-mode prune threshold ∈ [0,1] (default 0.9).
+  --nn-surrogate-min-depth N  only consult surrogate at depth ≥ N (default 30) — at
+                          shallow depths the exact solver is faster than NN inference.
+
+Visited table is 24 MB (2^1797752992 slots × 16 B).  On overflow the search
+exits the current root gracefully.  To enlarge, recompile with -DHASH_LG2=N.
+
+New bests are streamed to stdout as they are found, prefixed with elapsed time.

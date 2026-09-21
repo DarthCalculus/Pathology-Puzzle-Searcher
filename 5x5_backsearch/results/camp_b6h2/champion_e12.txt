@@ -1,0 +1,6 @@
+  .....   A=[UR]
+  .AB..   B=[L]
+  .O$C.   C=[UDL]
+  .DEF.   D=[RD]
+  #@..O   E=[U]
+            F=[UR]

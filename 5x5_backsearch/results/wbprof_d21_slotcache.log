@@ -1,0 +1,84 @@
+[seed-path] seed built: depth=21 player=14 nblocks=2 nholes=1 committed_pop=18
+69 (2.1s)
+  O$.A.   A=[R]
+  OBC.O   B=[UR]
+  ..DE@   C=[URDL]
+  .F.#.   D=[URD]
+  .....   E=[L]
+            F=[UL]
+
+73 (4.9s)
+  O$.A.   A=[R]
+  OBC.O   B=[UR]
+  D.EF@   C=[URDL]
+  .G.#.   D=[U]
+  .....   E=[URD]
+            F=[L]
+            G=[DL]
+
+81 (6.1s)
+  O$.A.   A=[R]
+  .BC.O   B=[UR]
+  .D.E.   C=[URDL]
+  .F.#.   D=[RD]
+  @#O..   E=[L]
+            F=[UR]
+
+93 (17.3s)
+  O$.AO   A=[R]
+  .BC.#   B=[UR]
+  ..DE@   C=[URDL]
+  .F.G.   D=[DL]
+  O..H.   E=[L]
+            F=[UD]
+            G=[RL]
+            H=[L]
+
+113 (25.1s)
+  O$..O   A=[UR]
+  .AB.#   B=[DL]
+  C.@D.   C=[D]
+  .EFG.   D=[L]
+  O....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+149 (1.5m)
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]
+
+--- Exit 1 (exhausted) ---
+  elapsed:        188.477 s
+  states checked: 3365546 (shortcut 1152301, dedup 355052)
+  WBPROF walk/committed calls         15  pruned   0.0%  solver time     0.31 s ( 0.2%)  pops 515385
+  WBPROF walk/new-cell  calls     449514  pruned  81.7%  solver time    30.56 s (23.7%)  pops 191764902
+  WBPROF push-type      calls    1056989  pruned  54.0%  solver time    98.08 s (76.1%)  pops 574127188
+  WBPROF bulk: label-pops 636329201  distinct expansions 199959623
+  accepted:       1858193  (walk-segment pruned before check: 662070)
+  bulk walk-back: 381093 multi-solves covering 1503976 starts (3.9/solve), 3 fallbacks, 55.69 s
+  solver calls:   1887611
+  shallow / recent: 2948053 / 2948053  (evicts 0 / 0)
+  stack peak:     250
+  best depth:     149  (verify 149 OK)
+
+=== Backward search complete ===
+Total elapsed:     188.48 s (no time limit)
+Exits searched:    1 / 1
+States checked:    3365546
+  pruned shortcut: 1152301
+  pruned dedup:    355052
+Solver calls:      1887611
+Best depth:        149  (exit 1)
+
+  O$..O   A=[UR]
+  .ABC#   B=[RDL]
+  .D@..   C=[UR]
+  .EFG.   D=[RL]
+  .....   E=[UR]
+            F=[R]
+            G=[UDL]

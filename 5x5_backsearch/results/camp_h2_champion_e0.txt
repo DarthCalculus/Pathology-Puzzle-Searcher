@@ -1,0 +1,7 @@
+  $..A.   A=[L]
+  O#BC.   B=[D]
+  @DOE.   C=[UDL]
+  .#FG.   D=[RL]
+  .....   E=[RDL]
+            F=[U]
+            G=[RD]

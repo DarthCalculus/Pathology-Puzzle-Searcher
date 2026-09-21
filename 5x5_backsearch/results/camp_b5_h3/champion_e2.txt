@@ -1,0 +1,5 @@
+  O.$.#   A=[UR]
+  O#A..   B=[RD]
+  .B@C.   C=[DL]
+  O.DE.   D=[URL]
+  #....   E=[UDL]

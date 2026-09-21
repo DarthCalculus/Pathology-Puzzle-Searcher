@@ -1,0 +1,114 @@
+39 (1.0s)
+  .....   A=[D]
+  .AB..   B=[L]
+  .C$#.   C=[UR]
+  @DEO.   D=[RD]
+  OF...   E=[R]
+            F=[L]
+
+44 (2.6s)
+  @....   A=[D]
+  #AB..   B=[DL]
+  .C$#.   C=[UR]
+  .ODO.   D=[R]
+  .....
+
+54 (3.9s)
+  .A@.#   A=[R]
+  .BC..   B=[UR]
+  .D$#.   C=[DL]
+  .OEO.   D=[UR]
+  .....   E=[R]
+
+59 (8.9m)
+  .A.@O   A=[L]
+  .BCD.   B=[UR]
+  .O$E.   C=[UD]
+  .FG..   D=[RD]
+  .....   E=[UDL]
+            F=[D]
+            G=[R]
+
+62 (9.0m)
+  ....O   A=[UR]
+  .ABC.   B=[UD]
+  @O$D.   C=[RD]
+  EFG..   D=[UDL]
+  .....   E=[U]
+            F=[D]
+            G=[R]
+
+64 (9.7m)
+  .A@B.   A=[L]
+  OCDE.   B=[RL]
+  .O$..   C=[L]
+  .FGH.   D=[UD]
+  .I...   E=[RD]
+            F=[D]
+            G=[R]
+            H=[UDL]
+            I=[R]
+
+68 (10.7m)
+  .....   A=[URL]
+  .ABCD   B=[UD]
+  @E$F.   C=[RD]
+  O.G..   D=[D]
+  .H.#O   E=[D]
+            F=[UDL]
+            G=[R]
+            H=[R]
+
+70 (19.1m)
+  .A@B.   A=[RL]
+  .CDEO   B=[R]
+  ..$O.   C=[DL]
+  .FGH.   D=[UD]
+  ...I.   E=[R]
+            F=[URD]
+            G=[R]
+            H=[D]
+            I=[L]
+
+76 (29.9m)
+  O....   A=[D]
+  A@BC.   B=[URL]
+  O#$D.   C=[D]
+  E.FG.   D=[UL]
+  .....   E=[U]
+            F=[R]
+            G=[RD]
+
+80 (47.8m)
+  .....   A=[UL]
+  .AB.C   B=[L]
+  .D$#O   C=[D]
+  .EF@G   D=[UR]
+  ....O   E=[U]
+            F=[RDL]
+            G=[U]
+
+--- Exit 12 (exhausted) ---
+  elapsed:        5616.778 s
+  states checked: 339124244 (shortcut 105810066, dedup 32900024)
+  solver calls:   306224220
+  shallow / recent: 3220256 / 2544242  (evicts 305 / 179)
+  stack peak:     102
+  best depth:     80  (verify 80 OK)
+
+=== Backward search complete ===
+Total elapsed:     5616.78 s (no time limit)
+Exits searched:    1 / 1
+States checked:    339124244
+  pruned shortcut: 105810066
+  pruned dedup:    32900024
+Solver calls:      306224220
+Best depth:        80  (exit 12)
+
+  .....   A=[UL]
+  .AB.C   B=[L]
+  .D$#O   C=[D]
+  .EF@G   D=[UR]
+  ....O   E=[U]
+            F=[RDL]
+            G=[U]

@@ -1,0 +1,45 @@
+bx_h0    DONE  e0:38 e1:41 e2:41 e6:50 e7:69 e12:60  cpu 0.08 h  (published)
+b0_hx    DONE  e0:16 e1:15 e2:14 e6:14 e7:15 e12:16  cpu 0.00 h  (published)
+b1_h0    DONE  e0:17 e1:17 e2:16 e6:15 e7:17 e12:17  cpu 0.00 h  (published)
+b1_hx    DONE  e0:40 e1:39 e2:32 e6:25 e7:20 e12:17  cpu 0.00 h  (published)
+b2_h0    DONE  e0:26 e1:28 e2:27 e6:24 e7:26 e12:24  cpu 0.00 h  (published)
+b2_h1    DONE  e0:75 e1:62 e2:57 e6:42 e7:34 e12:24  cpu 0.00 h  (published)
+b2_hx    DONE  e0:75 e1:66 e2:58 e6:46 e7:34 e12:34  cpu 0.00 h  (published)
+b3_h0    DONE  e0:27 e1:29 e2:28 e6:40 e7:53 e12:37  cpu 0.00 h  (published)
+b3_h1    DONE  e0:94 e1:96 e2:64 e6:60 e7:58 e12:55  cpu 0.01 h  (published)
+b3_h2    DONE  e0:94 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.04 h  (published)
+b3_hx    DONE  e0:110 e1:96 e2:74 e6:60 e7:58 e12:55  cpu 0.08 h  (published)
+b4_h0    DONE  e0:28 e1:36 e2:35 e6:44 e7:56 e12:48  cpu 0.00 h  (published)
+b4_h1    DONE  e0:106 e1:102 e2:83 e6:80 e7:68 e12:56  cpu 0.11 h  (published)
+b4_h2    DONE  e0:106 e1:119 e2:92 e6:80 e7:76 e12:58  cpu 0.64 h  (published)
+b5_h0    DONE  e0:35 e1:37 e2:35 e6:50 e7:67 e12:56  cpu 0.00 h  (published)
+b5_h1    DONE  e0:113 e1:108 e2:92 e6:102 e7:86 e12:67  cpu 0.70 h  (published)
+b5_h2    DONE  e0:118 e1:121 e2:92 e6:102 e7:92 e12:67  cpu 4.82 h  (published)
+b6_h0    DONE  e0:35 e1:41 e2:41 e6:50 e7:69 e12:60  cpu 0.03 h
+b6_h1    DONE  e0:122 e1:108 e2:101 e6:108 e7:88 e12:68  cpu 1.71 h
+added  #121  5×5 level with exit @ cell 0, ≤ 6 blocks, ≤ 0 holes: max 35 moves  [1 champion(s): #1503]  Panacea 2026-09-19 01:47:41
+added  #122  5×5 level with exit @ cell 1, ≤ 6 blocks, ≤ 0 holes: max 41 moves  [no champion stored (longest stored: 37)]  Panacea 2026-09-19 01:47:41
+added  #123  5×5 level with exit @ cell 2, ≤ 6 blocks, ≤ 0 holes: max 41 moves  [1 champion(s): #1464]  Panacea 2026-09-19 01:47:42
+added  #124  5×5 level with exit @ cell 6, ≤ 6 blocks, ≤ 0 holes: max 50 moves  [1 champion(s): #1506]  Panacea 2026-09-19 01:47:42
+added  #125  5×5 level with exit @ cell 7, ≤ 6 blocks, ≤ 0 holes: max 69 moves  [1 champion(s): #1316]  Panacea 2026-09-19 01:47:42
+added  #126  5×5 level with exit @ cell 12, ≤ 6 blocks, ≤ 0 holes: max 60 moves  [1 champion(s): #1315]  Panacea 2026-09-19 01:47:42
+added  #127  5×5 level with exit @ cell 0, ≤ 6 blocks, ≤ 1 hole: max 122 moves  [1 champion(s): #6]  Panacea 2026-09-19 01:47:42
+added  #128  5×5 level with exit @ cell 1, ≤ 6 blocks, ≤ 1 hole: max 108 moves  [1 champion(s): #1441]  Panacea 2026-09-19 01:47:42
+added  #129  5×5 level with exit @ cell 2, ≤ 6 blocks, ≤ 1 hole: max 101 moves  [1 champion(s): #1326]  Panacea 2026-09-19 01:47:43
+added  #130  5×5 level with exit @ cell 6, ≤ 6 blocks, ≤ 1 hole: max 108 moves  [no champion stored (longest stored: 102)]  Panacea 2026-09-19 01:47:43
+added  #131  5×5 level with exit @ cell 7, ≤ 6 blocks, ≤ 1 hole: max 88 moves  [no champion stored (longest stored: 86)]  Panacea 2026-09-19 01:47:43
+added  #132  5×5 level with exit @ cell 12, ≤ 6 blocks, ≤ 1 hole: max 68 moves  [1 champion(s): #24]  Panacea 2026-09-19 01:47:43
+ 
+champion b6_h0 exit 0 (35): 30060/00900/10690/410B0/00000 -> refused: duplicate
+champion b6_h0 exit 1 (41): 03000/1A077/48AB0/01010/00000 -> accepted id 1535
+champion b6_h0 exit 2 (41): 00301/07074/0AB60/71010/00000 -> refused: duplicate
+champion b6_h0 exit 6 (50): 01401/03900/0BAJ0/90100/00001 -> refused: tie
+champion b6_h0 exit 7 (69): 10000/08370/01000/0BC60/00460 -> refused: tie
+champion b6_h0 exit 12 (60): 00000/07600/0B310/09600/46000 -> refused: dominated
+champion b6_h1 exit 0 (122): 30600/510G0/4I0F0/017C0/00000 -> refused: tie
+champion b6_h1 exit 1 (108): 13100/584G0/000I0/01EC0/00000 -> refused: tie
+champion b6_h1 exit 2 (101): 50300/41087/080F0/01BG0/00000 -> refused: tie
+champion b6_h1 exit 6 (108): 08400/53C10/07F00/00IA0/10000 -> accepted id 1536
+champion b6_h1 exit 7 (88): 04605/0E310/0F700/0C0D0/00001 -> accepted id 1537
+champion b6_h1 exit 12 (68): 00000/0A600/0B314/07F07/00005 -> refused: tie
+published: ['b6_h0', 'b6_h1']

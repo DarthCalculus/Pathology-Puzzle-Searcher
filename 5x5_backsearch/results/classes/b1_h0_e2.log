@@ -1,0 +1,30 @@
+16 (0.0s)
+  ..$.#   A=[UR]
+  .#A..
+  .#@#.
+  ..##.
+  #....
+
+--- Exit 2 (exhausted) ---
+  elapsed:        0.026 s
+  states checked: 9698 (shortcut 3601, dedup 9)
+  accepted:       6088  (walk-segment pruned before check: 632)
+  solver calls:   9689
+  shallow / recent: 9691 / 9691  (evicts 0 / 0)
+  stack peak:     20
+  best depth:     16  (verify 16 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.03 s (no time limit)
+Exits searched:    1 / 1
+States checked:    9698
+  pruned shortcut: 3601
+  pruned dedup:    9
+Solver calls:      9689
+Best depth:        16  (exit 2)
+
+  ..$.#   A=[UR]
+  .#A..
+  .#@#.
+  ..##.
+  #....

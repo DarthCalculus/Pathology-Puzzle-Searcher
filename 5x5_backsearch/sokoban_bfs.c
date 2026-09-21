@@ -165,7 +165,7 @@ void sokoban_set_grid(int rows, int cols) {
  * Allocated for the worst case; only [0, g_ncells] are populated. */
 static uint64_t z_player[MAX_NCELLS];
 static uint64_t z_block [16][MAX_NCELLS + 1];
-static uint64_t z_hole  [MAX_HOLES];
+static uint64_t z_hole  [MAX_NCELLS];   /* indexed by the hole's CELL: keys of states with an extra (filled) hole then equal the keys without it */
 
 static void zobrist_init(void) {
     /* xorshift64 with fixed seed for reproducibility */
@@ -174,7 +174,7 @@ static void zobrist_init(void) {
     for (int c = 0; c < g_ncells;    c++) z_player[c]       = ZN();
     for (int m = 0; m < 16;          m++)
         for (int c = 0; c <= g_ncells; c++) z_block[m][c]   = ZN();
-    for (int h = 0; h < MAX_HOLES;   h++) z_hole[h]          = ZN();
+    for (int h = 0; h < MAX_NCELLS;  h++) z_hole[h]          = ZN();
 #undef ZN
 }
 
@@ -182,12 +182,13 @@ static void zobrist_init(void) {
  * masks contribute the same XOR regardless of which index they occupy. */
 static inline uint64_t zpack64(int pl, const int *bp,
                                 const uint8_t *masks, int nb,
-                                int hm, int nh) {
+                                int hm, int nh, const int *hole_pos) {
     uint64_t h = z_player[pl];
     for (int i = 0; i < nb; i++) h ^= z_block[masks[i] & 0xF][bp[i]];
-    for (int j = 0; j < nh; j++) if (hm & (1 << j)) h ^= z_hole[j];
+    for (int j = 0; j < nh; j++) if (hm & (1 << j)) h ^= z_hole[hole_pos[j]];
     return h;
 }
+uint64_t sokoban_zobrist_block(int mask, int cell) { return z_block[mask & 0xF][cell]; }
 #endif /* USE_ZOBRIST */
 
 void sokoban_init(void) {
@@ -642,6 +643,36 @@ static void walk_dists_from(uint64_t blocked, int start, uint64_t interesting,
     }
 }
 
+/* Same as walk_dists_from() but stops after `lim` steps: cells farther than
+ * lim (or unreachable) stay -1.  Used by the cutoff solver, where a cell that
+ * is more than `slack` moves away can never lead to a state within the cutoff. */
+static void walk_dists_from_lim(uint64_t blocked, int start, uint64_t interesting,
+                                int8_t *out, int lim) {
+    memset(out, -1, (size_t)g_ncells);
+    if ((blocked >> start) & 1) return;
+    const uint64_t col0    = g_col0_mask;
+    const uint64_t collast = g_collast_mask;
+    const int      shc     = g_cols;
+    uint64_t free_mask = ~blocked & g_all_cells;
+    uint64_t reached   = 1ULL << start;
+    uint64_t frontier  = reached;
+    out[start] = 0;
+    uint64_t remaining = interesting & free_mask & ~reached;
+    int8_t dist = 0;
+    while (frontier && remaining && dist < lim) {
+        dist++;
+        uint64_t nxt = (frontier >> shc)
+                     | (frontier << shc)
+                     | ((frontier & ~collast) << 1)
+                     | ((frontier & ~col0)    >> 1);
+        frontier = nxt & free_mask & ~reached;
+        reached |= frontier;
+        for (uint64_t tmp = frontier & remaining; tmp; tmp &= tmp - 1)
+            out[__builtin_ctzll(tmp)] = dist;
+        remaining &= ~frontier;
+    }
+}
+
 /* Neighbor mask: all cells orthogonally adjacent to a set bit of m. */
 static inline uint64_t nbr_mask(uint64_t m) {
     return ((m >> g_cols)
@@ -673,7 +704,14 @@ static inline uint64_t nbr_mask(uint64_t m) {
 
 static int g_prune_mand = 0;   /* runtime toggle (see sokoban_set_hole_prune); default OFF */
 
+static int g_decision_only = 0;
+void sokoban_set_decision_only(int on) { g_decision_only = on; }
+
 void sokoban_set_hole_prune(int on) { g_prune_mand = on ? 1 : 0; }
+/* Cells whose holes are forced mandatory without a reachability check (union
+ * with the check).  Set via sokoban_set_forced_mandatory; 0 = none. */
+static uint64_t g_forced_mand_cells = 0;
+void sokoban_set_forced_mandatory(uint64_t cell_mask) { g_forced_mand_cells = cell_mask; }
 
 static _Thread_local uint32_t g_mand_hmask;                    /* hole-idx mask of mandatory holes */
 static _Thread_local uint64_t g_closure_tab[16][MAX_NCELLS];  /* [mask][cell] relaxed push closure */
@@ -737,6 +775,7 @@ static void mand_setup(const Puzzle *pz) {
     for (int h = 0; h < pz->num_holes; h++) {
         int hc = pz->hole_pos[h];
         if (hc == pz->player_start || hc == pz->exit_pos) continue;
+        if ((g_forced_mand_cells >> hc) & 1) { mh |= 1u << h; continue; }  /* forced: skip the reach check */
         uint64_t r = reach_flood(walls | (1ULL << hc), pz->player_start);
         if (!((r >> pz->exit_pos) & 1)) mh |= 1u << h;
     }
@@ -899,11 +938,12 @@ static inline int mand_dead_ctx(const Puzzle *pz, const MandCtx *mc,
 #define HTP_MASK  (HTP_SIZE - 1)
 #define HP64_SIZE (1 << 20)    /* pending-entry cap (-2 on overflow)  */
 
-#define PQ64_NBUCKETS 128      /* power of two > max edge weight (≤64) */
+#define PQ64_NBUCKETS 256      /* power of two > max f-step (2 x max edge weight, edge <= 64) */
 #define PQ64_BMASK    (PQ64_NBUCKETS - 1)
 
 typedef struct {
-    int      prio;        /* priority: total cost (walks + pushes)  */
+    int      prio;        /* bucket priority: g, or f = g + h in the cutoff solver */
+    int      g;           /* exact cost so far (walks + pushes)      */
     int      player_pos;  /* exact player cell (not in state key)   */
     uint32_t used;        /* accumulated used-direction bits         */
     uint32_t slot;        /* hash-table slot holding this state      */
@@ -931,12 +971,33 @@ typedef struct {
     int len, cap;
 } Bucket64;
 
+/* Two backing tables.  The SMALL one (64K slots, 1 MB) is L2-resident and
+ * serves the overwhelming majority of shortcut checks, which touch ~100
+ * states.  If a solve inserts more than half of it, the solver aborts and
+ * re-runs on the BIG table; the wasted work is bounded by that threshold
+ * and the case is rare, so probe saturation (-3) becomes unreachable in
+ * practice. */
+#define HTP_SMALL_LG2 16
+#define HTP_SMALL_SIZE (1u << HTP_SMALL_LG2)
+
 typedef struct {
-    HSlot64  slot[HTP_SIZE];     /* key+gen+cost       — 256 MB */
+    HSlot64 *slot;               /* active table (== slot_small or slot_big) */
+    uint32_t ht_mask;            /* active table size - 1                     */
+    uint32_t ht_limit;           /* insert count that triggers overflow       */
+    uint32_t ht_count;           /* inserts this solve                        */
+    int      overflow;           /* set when ht_count reached ht_limit        */
+    HSlot64 *slot_small;         /* HTP_SMALL_SIZE slots, 1 MB                */
+    HSlot64 *slot_big;           /* HTP_SIZE slots, 256 MB, lazily allocated  */
     uint32_t ht_seq;
     Bucket64 bq[PQ64_NBUCKETS];  /* Dial bucket queue (lazy alloc) */
     int      pq_count;           /* pending entries across buckets */
     int      probe_failed;       /* set when probe limit hit */
+    void    *ms_lab;             /* multi-start label vectors, one per SMALL slot (lazy) */
+    uint32_t *touched;           /* slots inserted this solve (small table only) */
+    uint32_t  ntouched;
+    int       last_exhaustive;   /* last cutoff solve on the small table ran to completion with no win */
+    int       last_ref_used;     /* ... with a reference table installed (its own labels alone are then incomplete) */
+    int       last_maxcost;
 } HashStatePush64;
 
 static _Thread_local HashStatePush64 *hsp64_tls;
@@ -945,32 +1006,57 @@ static HashStatePush64 *hsp64_get(void) {
     if (!hsp64_tls) {
         hsp64_tls = calloc(1, sizeof *hsp64_tls);
         hsp64_tls->ht_seq = 1;
+        hsp64_tls->slot_small = calloc(HTP_SMALL_SIZE, sizeof(HSlot64));
+        hsp64_tls->touched = malloc(HTP_SMALL_SIZE * sizeof(uint32_t));
     }
     return hsp64_tls;
 }
 
+/* Select the active table.  big=0 -> small L2 table; big=1 -> 16M table. */
+static void hsp64_select(HashStatePush64 *hs, int big) {
+    if (big) {
+        if (!hs->slot_big) hs->slot_big = calloc(HTP_SIZE, sizeof(HSlot64));
+        hs->slot = hs->slot_big;   hs->ht_mask = HTP_MASK;
+        hs->ht_limit = (uint32_t)(HTP_SIZE * 0.85);
+    } else {
+        hs->slot = hs->slot_small; hs->ht_mask = HTP_SMALL_SIZE - 1;
+        hs->ht_limit = HTP_SMALL_SIZE / 2;
+    }
+}
+
 static void hsp64_clear(HashStatePush64 *hs) {
     if (++hs->ht_seq == 0) {
-        memset(hs->slot, 0, sizeof(hs->slot));
+        memset(hs->slot_small, 0, HTP_SMALL_SIZE * sizeof(HSlot64));
+        if (hs->slot_big) memset(hs->slot_big, 0, (size_t)HTP_SIZE * sizeof(HSlot64));
         hs->ht_seq = 1;
     }
     for (int i = 0; i < PQ64_NBUCKETS; i++) hs->bq[i].len = 0;
     hs->pq_count = 0;
     hs->probe_failed = 0;
+    hs->ht_count = 0;
+    hs->overflow = 0;
+    hs->ntouched = 0;
+    hs->last_exhaustive = 0;
 }
 
 /* Update stored cost for key k.
  * Returns the slot index if new_cost is an improvement (caller should
- * enqueue), or -1 otherwise. */
+ * enqueue), or -1 otherwise.  Sets hs->overflow (and returns -1) when the
+ * active table has reached its insert limit; the caller must then retry
+ * the solve on the big table. */
 static inline int hsp64_update(HashStatePush64 *hs, uint64_t k, int new_cost) {
-    uint64_t h = h64(k) & HTP_MASK;
+    const uint32_t mask = hs->ht_mask;
+    uint64_t h = h64(k) & mask;
     for (int i = 0; i < HT_PROBE_LIMIT; i++) {
-        uint32_t idx = (uint32_t)((h + i) & HTP_MASK);
+        uint32_t idx = (uint32_t)((h + i) & mask);
         HSlot64 *s = &hs->slot[idx];
         if (s->gen != hs->ht_seq) {
+            if (hs->ht_count >= hs->ht_limit) { hs->overflow = 1; return -1; }
+            hs->ht_count++;
             s->gen  = hs->ht_seq;
             s->key  = k;
             s->cost = new_cost;
+            if (hs->slot == hs->slot_small) hs->touched[hs->ntouched++] = idx;
             return (int)idx;
         }
         if (s->key == k) {
@@ -1014,6 +1100,9 @@ static inline void bfs_tail_reset(BfsProfile *prof, int max_cost) {
 
 static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     HashStatePush64 *hs = hsp64_get();
+    int use_big = 0;
+retry:
+    hsp64_select(hs, use_big);
     hsp64_clear(hs);
     mand_setup(pz);
     int peak_heap = 1;
@@ -1032,10 +1121,10 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
     uint64_t init_st = pack5(pz->player_start, ib, nb, ihm);
     {
         HeapEntry64 e0;
-        e0.prio = 0; e0.player_pos = pz->player_start;
+        e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
         e0.used = 0; e0.state = init_st;
 #ifdef USE_ZOBRIST
-        e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh);
+        e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh, pz->hole_pos);
 #endif
         e0.slot = (uint32_t)hsp64_update(hs, HE64_KEY(e0), 0);
         bq64_push(hs, &e0);
@@ -1119,11 +1208,11 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
                 /* Incremental Zobrist: XOR out moved pieces, XOR in new. */
                 uint64_t nk = e.key ^ z_player[e.player_pos] ^ z_player[bpos]
                             ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
-                if (ch >= 0) nk ^= z_hole[ch];
+                if (ch >= 0) nk ^= z_hole[pz->hole_pos[ch]];
 #else
                 uint64_t nk = ns;
 #endif
-                __builtin_prefetch(&hs->slot[h64(nk) & HTP_MASK], 1, 1);
+                __builtin_prefetch(&hs->slot[h64(nk) & hs->ht_mask], 1, 1);
                 cand[ncand].state = ns;
                 cand[ncand].key   = nk;
                 cand[ncand].pfr   = (int16_t)pfr;
@@ -1158,7 +1247,7 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
                     return -2;
                 }
                 HeapEntry64 ne;
-                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.used = e.used | (1u << cand[ci].dirbit);
                 ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
@@ -1170,6 +1259,10 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
                     return -3;
                 }
+            } else if (hs->overflow) {
+                /* Small table saturated: rerun this solve on the big one. */
+                use_big = 1;
+                goto retry;
             }
         }
     }
@@ -1197,6 +1290,227 @@ static int solve_push64(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) 
  * "outer shell" of states above the cutoff that the standard solver
  * would otherwise explore.
  * ======================================================================== */
+/* ========================================================================
+ * HOLE-CROSSING LOWER BOUND
+ *
+ * The A* term hdist[] is the player's walk distance to the exit over walls
+ * only; it ignores that an unfilled hole cannot be stepped on.  When the
+ * player cannot reach the exit at all while the unfilled holes stand (flood
+ * over walls + holes, blocks passable), every solution must first fill some
+ * hole H with some block b, which costs at least:
+ *     D(p, b) - 1        walk to a cell next to b        (D: walls-only distance)
+ *   + |b - H|_1          pushes moving b to H            (one move each)
+ *   + D(H, exit) - 1     from the cell next to H on to the exit
+ * These three move sets are disjoint in time, so the minimum over all
+ * (unfilled H, unconsumed b that can move toward H) is admissible; if no pair
+ * qualifies the state is dead.  D() is computed once per distinct wall set
+ * (siblings share it) and the bound is evaluated only when the direct walk
+ * check already failed.  MEASURED 2026-09-18: exact, but it prunes only 1-2%
+ * of pops and the per-wall-set D() table plus the per-pop flood cost ~25% on
+ * the replay corpus, so it is compiled OUT unless -DHOLEBOUND.
+ * ======================================================================== */
+static _Thread_local uint64_t g_hb_walls = ~0ULL;
+static _Thread_local int      g_hb_valid = 0;
+static _Thread_local int8_t   g_hb_D[MAX_NCELLS][MAX_NCELLS];
+
+static void hb_prepare(uint64_t walls) {
+    if (g_hb_valid && walls == g_hb_walls) return;
+    for (int c = 0; c < g_ncells; c++) {
+        if (walls >> c & 1) { memset(g_hb_D[c], -1, (size_t)g_ncells); continue; }
+        walk_dists_from(walls, c, g_all_cells, g_hb_D[c]);
+    }
+    g_hb_walls = walls; g_hb_valid = 1;
+}
+
+/* Can the player at start reach target over cells not in blocked? */
+static inline int hb_reaches(uint64_t blocked, int start, int target) {
+    if ((blocked >> start) & 1) return 0;
+    uint64_t free_mask = ~blocked & g_all_cells, reached = 1ULL << start, frontier = reached, tgt = 1ULL << target;
+    while (frontier) {
+        if (reached & tgt) return 1;
+        uint64_t nxt = (frontier >> g_cols) | (frontier << g_cols)
+                     | ((frontier & ~g_collast_mask) << 1) | ((frontier & ~g_col0_mask) >> 1);
+        frontier = nxt & free_mask & ~reached;
+        reached |= frontier;
+    }
+    return (reached & tgt) != 0;
+}
+
+#define HB_DEAD 1000
+/* Lower bound on remaining moves given the player must cross a hole. */
+static inline int hb_bound(const Puzzle *pz, int p, const int *bp, int nb, int hm, int exit_pos) {
+    int best = HB_DEAD;
+    for (int h = 0; h < pz->num_holes; h++) {
+        if (!(hm & (1 << h))) continue;
+        int hx = pz->hole_pos[h], dHE = g_hb_D[hx][exit_pos];
+        if (dHE < 0) continue;
+        int hr = hx / g_cols, hc = hx % g_cols;
+        for (int b = 0; b < nb; b++) {
+            int bc = bp[b]; if (bc >= g_ncells) continue;
+            int mb = pz->block_pushable[b] & 0xF;
+            int dr = hr - bc / g_cols, dc = hc - bc % g_cols;
+            if (dr < 0 && !(mb & 1)) continue;      /* needs U */
+            if (dr > 0 && !(mb & 4)) continue;      /* needs D */
+            if (dc > 0 && !(mb & 2)) continue;      /* needs R */
+            if (dc < 0 && !(mb & 8)) continue;      /* needs L */
+            int dPb = g_hb_D[p][bc]; if (dPb < 0) continue;
+            int v = (dPb > 0 ? dPb - 1 : 0) + (dr < 0 ? -dr : dr) + (dc < 0 ? -dc : dc) + (dHE > 0 ? dHE - 1 : 0);
+            if (v < best) best = v;
+        }
+    }
+    return best;
+}
+
+/* ========================================================================
+ * REFERENCE TABLE  (parent's settled labels reused by a child's check)
+ *
+ * When a generator state P (depth d) is accepted, its shortcut check has run
+ * to exhaustion: every forward state Y with f <= d-2 is settled at its optimal
+ * cost g_P(Y), and no solution of length <= d-2 passes through any of them,
+ * i.e. rest(Y) >= d - g_P(Y) (parity).  A child of P whose forward puzzle is
+ * IDENTICAL (same walls, blocks-as-a-set with the same masks, holes) and whose
+ * cutoff is d-1+k' ... in general, a child at chain offset k (cutoff d-2+k)
+ * can only use Y if g_child(Y) + rest(Y) <= d-2+k, i.e. g_child(Y) <= g_P(Y)
+ * + k - 2 ... so with k = 1 (an immediate push-back child) only states it
+ * reaches STRICTLY cheaper than P did can matter; everything P already
+ * covered is skipped.  Keys are Zobrist over (player, blocks+masks, holes)
+ * and independent of the walls, so a lookup is direct.
+ * ======================================================================== */
+#define REF_LG2 16
+static _Thread_local uint64_t *g_ref_keys;   /* REF_SIZE slots, 0 = empty */
+static _Thread_local int32_t  *g_ref_cost;
+static _Thread_local int       g_ref_n = 0;   /* live entries (0 = no reference) */
+static _Thread_local int       g_ref_k = 0;   /* chain offset k of the child being solved (cut = cut_P + k) */
+/* Puzzle delta between the table's owner and the state being solved: cells that
+ * are floor now but were walls for the owner.  A continuation that never uses a
+ * delta cell is an owner-puzzle path (bounded by the table); one that does must
+ * bring the player next to that cell and then to the exit. */
+static _Thread_local uint64_t g_ref_delta = 0;
+static _Thread_local int8_t   g_ref_dexit[MAX_NCELLS];   /* D(c, exit) for delta cells, walls-only in the current puzzle */
+static _Thread_local int      g_ref_cut = 0;             /* the child's cutoff */
+static _Thread_local uint32_t g_ref_mask = 0;            /* current table size - 1: sized to the entry count so lookups stay cache-resident */
+static _Thread_local int      g_ref_on = 0;              /* prune enabled (0 while a REF_CHECK re-run is in progress) */
+static _Thread_local uint64_t g_ref_xor = 0;             /* key translation child -> owner: the child's states that coincide with the owner's
+                                                          * differ by a constant (an extra block sitting consumed, an extra hole filled) */
+#define REF_SIZE (1u << REF_LG2)
+#define REF_MASK g_ref_mask
+
+long long g_refstat[8];   /* 0 lookups, 1 hits, 2 prunes, 3 delta-blocked, 4 builds, 5 build entries, 6 clears, 7 clear entries */
+/* The reference is an attached, caller-owned hash table (SokRefTable), built
+ * once when a state's table is exported and attached by pointer for every
+ * expansion that uses it -- no per-use copying. */
+static _Thread_local SokRefTable g_ref_own;   /* storage for sokoban_set_reference (copying API) */
+void sokoban_clear_reference(void) {
+    g_refstat[6]++; g_refstat[7] += g_ref_n;
+    g_ref_keys = NULL; g_ref_cost = NULL; g_ref_mask = 0;
+    g_ref_n = 0; g_ref_delta = 0; g_ref_on = 0; g_ref_xor = 0;
+}
+int sokoban_ref_build(const uint64_t *keys, const int32_t *costs, int n, SokRefTable *t) {
+    uint32_t sz = 256; while (sz < 2u * (uint32_t)n) sz <<= 1;
+    if (t->cap < sz) { free(t->hk); free(t->hc); t->hk = malloc(sz * sizeof(uint64_t)); t->hc = malloc(sz * sizeof(int32_t)); t->cap = sz; }
+    memset(t->hk, 0, sz * sizeof(uint64_t));
+    t->mask = sz - 1; t->n = 0;
+    g_refstat[4]++; g_refstat[5] += n;
+    for (int i = 0; i < n; i++) {
+        uint64_t key = keys[i] ? keys[i] : 1;
+        uint32_t h = (uint32_t)(h64(key) & t->mask);
+        while (t->hk[h] && t->hk[h] != key) h = (h + 1) & t->mask;
+        if (!t->hk[h]) { t->hk[h] = key; t->hc[h] = costs[i]; t->n++; }
+        else if (costs[i] < t->hc[h]) t->hc[h] = costs[i];
+    }
+    return t->n;
+}
+void sokoban_ref_attach(const SokRefTable *t) {
+    g_ref_keys = t->hk; g_ref_cost = t->hc; g_ref_mask = t->mask; g_ref_n = t->n;
+    g_ref_k = 0; g_ref_delta = 0; g_ref_xor = 0; g_ref_on = g_ref_n > 0;
+}
+void sokoban_ref_set_k(int k) { g_ref_k = k; g_ref_delta = 0; g_ref_xor = 0; }
+void sokoban_ref_set_xor(uint64_t x) { g_ref_xor = x; }
+void sokoban_ref_suspend(int suspend) { g_ref_on = suspend ? 0 : (g_ref_n > 0); }
+int  sokoban_ref_active(void) { return g_ref_on; }
+/* Declare the puzzle delta for the reference just installed (call after
+ * sokoban_set_reference).  walls: the child's walls; exit_pos: its exit. */
+void sokoban_set_reference_delta(uint64_t delta, uint64_t walls, int exit_pos) {
+    g_ref_delta = delta & ~walls;
+    if (!g_ref_delta) return;
+    hb_prepare(walls);
+    for (uint64_t t = g_ref_delta; t; t &= t - 1) { int c = __builtin_ctzll(t); g_ref_dexit[c] = g_hb_D[c][exit_pos]; }
+}
+void sokoban_ref_load(const uint64_t *keys, const int32_t *costs, int n) {
+    if (g_ref_n) sokoban_clear_reference();
+    if (n > (int)(REF_SIZE / 2)) return;                 /* too big: no reference */
+    sokoban_ref_build(keys, costs, n, &g_ref_own);
+    sokoban_ref_attach(&g_ref_own);
+}
+void sokoban_set_reference(const uint64_t *keys, const int32_t *costs, int n, int k) { sokoban_ref_load(keys, costs, n); g_ref_k = k; }
+static inline int ref_lookup(uint64_t key) {
+    key ^= g_ref_xor;
+    if (!key) key = 1;
+    uint32_t h = (uint32_t)(h64(key) & REF_MASK);
+    while (g_ref_keys[h]) { if (g_ref_keys[h] == key) return g_ref_cost[h]; h = (h + 1) & REF_MASK; }
+    return -1;
+}
+/* Prune test: child at chain offset k reaching Y (player landing at cell p)
+ * at cost nc.  Without a delta: nc + rest <= cut_P + k with rest >= cut_P + 2
+ * - g_P  =>  prune iff nc > g_P + k - 2.  With a delta the owner's bound only
+ * covers continuations avoiding the delta cells, so additionally every delta
+ * cell must be too far: nc + D(p, c) - 1 + D(c, exit) - 1 > cut for all c. */
+/* Same test with the lookup already done (gp = ref_lookup(key), or -1). */
+static inline int ref_prunes_gp(int gp, int nc, int p, int cut, int k) {
+    if (gp < 0 || nc <= gp + k - 2) return 0;
+    if (!g_ref_delta) { g_refstat[2]++; return 1; }
+    for (uint64_t t = g_ref_delta; t; t &= t - 1) {
+        int c = __builtin_ctzll(t);
+        int dpc = g_hb_D[p][c], dce = g_ref_dexit[c];
+        if (dpc < 0 || dce < 0) continue;
+        if (nc + (dpc > 0 ? dpc - 1 : 0) + (dce > 0 ? dce - 1 : 0) <= cut) { g_refstat[3]++; return 0; }
+    }
+    g_refstat[2]++;
+    return 1;
+}
+static inline int ref_prunes_at(uint64_t key, int nc, int p, int cut) {
+    if (!g_ref_on) return 0;
+    g_refstat[0]++;
+    int gp = ref_lookup(key);
+    if (gp >= 0) g_refstat[1]++;
+    if (gp < 0 || nc <= gp + g_ref_k - 2) return 0;
+    if (!g_ref_delta) { g_refstat[2]++; return 1; }
+    for (uint64_t t = g_ref_delta; t; t &= t - 1) {
+        int c = __builtin_ctzll(t);
+        int dpc = g_hb_D[p][c], dce = g_ref_dexit[c];
+        if (dpc < 0 || dce < 0) continue;                 /* cannot use this cell at all */
+        if (nc + (dpc > 0 ? dpc - 1 : 0) + (dce > 0 ? dce - 1 : 0) <= cut) { g_refstat[3]++; return 0; }
+    }
+    g_refstat[2]++;
+    return 1;
+}
+static inline int ref_prunes(uint64_t key, int nc) { return ref_prunes_at(key, nc, 0, 0); }   /* delta-free callers */
+
+/* Export the labels of the last exhaustive small-table solve as a table of
+ * upper bounds on the solved state's forward distances.  Every label in the
+ * hash is the cost of a real path, hence an upper bound.  If the solve used a
+ * reference (owner A at chain offset k), states pruned by it are missing from
+ * the hash; A reaches them at g_A and the solved state reaches A's start in k
+ * moves, so g_A + k is an upper bound for them: the union is a complete table
+ * (exact wherever it matters -- a pruned state's true distance IS g_A + k by
+ * parity) and the next child can use it with k = 1.  Duplicates are resolved
+ * to the minimum when the table is loaded. */
+int sokoban_export_settled(uint64_t *keys, int32_t *costs, int max) {
+    HashStatePush64 *hs = hsp64_get();
+    if (!hs->last_exhaustive || hs->slot != hs->slot_small) return -1;
+    int n = 0;
+    for (uint32_t i = 0; i < hs->ntouched && n < max; i++) {
+        HSlot64 *sl = &hs->slot_small[hs->touched[i]];
+        if (sl->gen != hs->ht_seq) continue;
+        keys[n] = sl->key; costs[n] = sl->cost; n++;
+    }
+    if (hs->last_ref_used) {
+        if (n + g_ref_n >= max) return -1;
+        for (uint32_t h = 0; h <= g_ref_mask; h++) if (g_ref_keys[h]) { keys[n] = g_ref_keys[h] ^ g_ref_xor; costs[n] = g_ref_cost[h] + g_ref_k; n++; }
+    }
+    return (n < max) ? n : -1;
+}
+
 static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     if (max_cost < 0) {
         if (prof) { prof->peak_heap_sz = 1; prof->states_popped = 0; bfs_tail_reset(prof, max_cost); }
@@ -1208,6 +1522,9 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
     uint64_t _ts = mach_absolute_time();
 #endif
     HashStatePush64 *hs = hsp64_get();
+    int use_big = 0;
+retry:
+    hsp64_select(hs, use_big);
     hsp64_clear(hs);
 #ifdef FWPROF
     { uint64_t _m0 = mach_absolute_time(); mand_setup(pz);
@@ -1228,13 +1545,34 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
     for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
     int ihm = (1 << nh) - 1;
 
+#ifndef NO_ASTAR
+    /* Admissible lower bound on remaining moves: grid distance from each
+     * cell to the exit treating only walls as obstacles (blocks and holes
+     * are passable in this relaxation, so it never over-estimates).  Walls
+     * are fixed for the whole solve, so this is computed once. */
+    int8_t hdist[MAX_NCELLS];
+    walk_dists_from(walls, exit_pos, g_all_cells, hdist);
+    if (hdist[pz->player_start] < 0 || hdist[pz->player_start] > max_cost) {
+        if (prof) { prof->peak_heap_sz = 1; prof->states_popped = 0; }
+        return -1;
+    }
+#ifdef HOLEBOUND
+    hb_prepare(walls);
+#endif
+#endif
+
     uint64_t init_st = pack5(pz->player_start, ib, nb, ihm);
     {
         HeapEntry64 e0;
-        e0.prio = 0; e0.player_pos = pz->player_start;
+        e0.g = 0; e0.player_pos = pz->player_start;
+#ifndef NO_ASTAR
+        e0.prio = g_decision_only ? hdist[pz->player_start] : 0;   /* f = g + h; h consistent (1 cell per unit cost) */
+#else
+        e0.prio = 0;
+#endif
         e0.used = 0; e0.state = init_st;
 #ifdef USE_ZOBRIST
-        e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh);
+        e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh, pz->hole_pos);
 #endif
         e0.slot = (uint32_t)hsp64_update(hs, HE64_KEY(e0), 0);
         bq64_push(hs, &e0);
@@ -1252,14 +1590,24 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
         if (bkt->len == 0) { pq_min++; continue; }
         HeapEntry64 e = bkt->items[--bkt->len];
         hs->pq_count--;
-        if (e.prio > max_cost) break;          /* CUTOFF */
-        if (e.prio >= best_win) break;
+        if (e.prio > max_cost) break;          /* CUTOFF (prio = g, or f >= g) */
+        if (e.prio >= best_win) break;         /* f is a lower bound through this state */
 
-        if (hs->slot[e.slot].cost < e.prio) continue;
+        if (hs->slot[e.slot].cost < e.g) continue;
         n_popped++;
         if (prof) {
-            int twi = e.prio - max_cost + (BFS_TAIL_W - 1);
+            int twi = e.g - max_cost + (BFS_TAIL_W - 1);
             if (twi >= 0 && twi < BFS_TAIL_W) prof->tail_width[twi]++;
+        }
+        const int slack = max_cost - e.g;      /* >= 0 here */
+        if (slack == 0) {
+            /* No push child can cost <= max_cost, and a walk-win needs
+             * wdist[exit] == 0, i.e. the player already stands on the exit. */
+            if (e.player_pos == exit_pos && e.g < best_win) {
+                best_win = e.g; best_used = e.used;
+                if (g_decision_only) goto done;
+            }
+            continue;
         }
         FWP_DECL();
 
@@ -1327,11 +1675,11 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
 #ifdef USE_ZOBRIST
                 uint64_t nk = e.key ^ z_player[e.player_pos] ^ z_player[bpos]
                             ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
-                if (ch >= 0) nk ^= z_hole[ch];
+                if (ch >= 0) nk ^= z_hole[pz->hole_pos[ch]];
 #else
                 uint64_t nk = ns;
 #endif
-                __builtin_prefetch(&hs->slot[h64(nk) & HTP_MASK], 1, 1);
+                __builtin_prefetch(&hs->slot[h64(nk) & hs->ht_mask], 1, 1);
                 cand[ncand].state = ns;
                 cand[ncand].key   = nk;
                 cand[ncand].pfr   = (int16_t)pfr;
@@ -1343,33 +1691,52 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
 
         FWP_LAP(FWP_PASS1);
         int8_t wdist[MAX_NCELLS];
-        walk_dists_from(walls | cur_holes | blk_occ, e.player_pos,
-                        nbr_mask(blk_occ) | (1ULL << exit_pos), wdist);
+        walk_dists_from_lim(walls | cur_holes | blk_occ, e.player_pos,
+                            nbr_mask(blk_occ) | (1ULL << exit_pos), wdist, slack);
         FWP_LAP(FWP_WALK);
 
         if (wdist[exit_pos] >= 0) {
-            int wc = e.prio + (int)wdist[exit_pos];
+            int wc = e.g + (int)wdist[exit_pos];
             if (wc <= max_cost && wc < best_win) {
                 best_win = wc; best_used = e.used;
+                if (g_decision_only) goto done;   /* any solution within the cutoff decides the check */
             }
         }
+#if !defined(NO_ASTAR) && defined(HOLEBOUND)
+        else if (hm && !hb_reaches(walls | cur_holes, e.player_pos, exit_pos)) {
+            /* No walk to the exit even through blocks: some hole must be filled first. */
+            if (e.g + hb_bound(pz, e.player_pos, bp, nb, hm, exit_pos) > max_cost) continue;
+        }
+#endif
 
         /* Pass 2: reachable push-from cells, costs within the cutoff. */
         for (int ci = 0; ci < ncand; ci++) {
             if (wdist[cand[ci].pfr] < 0) continue;
 
-            int nc = e.prio + (int)wdist[cand[ci].pfr] + 1;
+            int nc = e.g + (int)wdist[cand[ci].pfr] + 1;
             if (nc > max_cost) continue;       /* CUTOFF: don't enqueue */
+            int nprio = nc;
+#ifndef NO_ASTAR
+            {   /* A*: the player lands on the block's old cell; it still
+                 * needs at least hdist[] more moves to stand on the exit. */
+                int hd = hdist[cand[ci].bpos];
+                if (hd < 0 || nc + hd > max_cost) continue;
+                if (g_decision_only) nprio = nc + hd;
+            }
+#endif
 
             uint64_t nk = cand[ci].key;
             int slot = hsp64_update(hs, nk, nc);
             if (slot >= 0) {
+                /* New or improved label: an ancestor's table may still prove the state useless
+                 * at this cost (the label stays as an upper bound, the state is not enqueued). */
+                if (g_ref_on && ref_prunes_at(nk, nc, cand[ci].bpos, max_cost)) continue;
                 if (hs->pq_count >= HP64_SIZE) {
                     if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
                     return -2;
                 }
                 HeapEntry64 ne;
-                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.prio = nprio; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.used = e.used | (1u << cand[ci].dirbit);
                 ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
@@ -1381,18 +1748,330 @@ static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile 
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
                     return -3;
                 }
+            } else if (hs->overflow) {
+                /* Small table saturated: rerun this solve on the big one. */
+                use_big = 1;
+                goto retry;
             }
         }
         FWP_LAP(FWP_PASS2);
     }
 
+done:
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
     if (hs->probe_failed) return -3;
-    if (best_win == INT_MAX) return -1;
+    if (best_win == INT_MAX) { hs->last_exhaustive = 1; hs->last_ref_used = g_ref_on; hs->last_maxcost = max_cost; return -1; }
     if (used_dirs)
         for (int i = 0; i < nb; i++)
             used_dirs[i] = (uint8_t)((best_used >> (i * 4)) & 0xF);
     return best_win;
+}
+
+/* ========================================================================
+ * MULTI-START DECISION SOLVE
+ *
+ * Every walk-back descendant of a generator state that stays on already
+ * committed cells shares the same forward puzzle (walls, blocks, masks,
+ * holes) and differs only in the player's start cell.  In the push-macro
+ * formulation the start cell only affects the cost of reaching the FIRST
+ * push, so one Dijkstra can serve all of them: every forward state carries
+ * a vector of labels, one per start cell.  Per start i the question is "does
+ * a solution of length <= cut[i] exist"; the answer is exact and identical to
+ * running sokoban_solve_cutoff() from starts[i] with max_cost cut[i].
+ *
+ * Lockstep Dijkstra: an entry is pushed at prio = some start's label; when
+ * popped, exactly the starts whose label equals the prio and are not yet
+ * relaxed from this state are final (positive edge weights) and get relaxed.
+ * The EXPANSION of a state (unpack, walk BFS, push candidates) does not
+ * depend on the start or the cost, so it is done once and its successor list
+ * is cached in an arena; later pops of the same state at other labels only
+ * replay the list with the new offsets.
+ *
+ * pred[i] (optional) is a bitmask of starts adjacent to start i on a shortest
+ * path back to the parent cell.  A shortcut at such a predecessor implies one
+ * at i (walk one step, then the predecessor's shortcut), so starts behind a
+ * decided shortcut are decided without any search.
+ *
+ * The same relation prunes the search itself.  Let j be a chain ancestor of i
+ * at chain distance k (so cut[i] = cut[j] + k).  If i reaches forward state X
+ * at cost g_i and j at cost g_j with g_i - g_j >= k - 1, then i need not
+ * explore X: a solution S for i through X (|S| <= cut[i]) gives j the solution
+ * "j's prefix to X, then S's suffix" of length g_j + |S| - g_i <= cut[j] + 1,
+ * hence <= cut[j] by parity (all solutions from one start have one parity), so
+ * j has a shortcut and i is decided by propagation anyway.  Labels only
+ * decrease, so j's current label is a valid upper bound on g_j.  For the
+ * adjacent ancestor (k = 1) this means i only explores states it reaches
+ * STRICTLY cheaper than its predecessor.
+ * ======================================================================== */
+#define MS_MAX   24
+#define MS_INF   255
+#define MS_LG2   16
+#define MS_SIZE  (1u << MS_LG2)
+#define MS_MASK  (MS_SIZE - 1)
+#define MS_ARENA (1u << 20)                 /* cached successors per solve, 24 MB */
+typedef struct { uint64_t state, key; int32_t slot; int8_t bpos, w, hd, pad; } MSSucc;   /* 24 B; slot: table index once known, else -1 */
+typedef struct {
+    uint64_t key; uint32_t gen; uint32_t done;
+    uint8_t  lab[MS_MAX];
+    uint32_t soff; uint8_t scount; int8_t wexit; uint8_t cached; uint8_t hb;   /* hb: hole-crossing bound at this state (0 = not applicable) */
+} MSLab;                                    /* 48 B */
+
+static inline int ms_slot(HashStatePush64 *hs, MSLab *L, uint64_t k, int *is_new) {
+    uint64_t h = h64(k) & MS_MASK;
+    for (int i = 0; i < HT_PROBE_LIMIT; i++) {
+        uint32_t idx = (uint32_t)((h + i) & MS_MASK);
+        MSLab *sl = &L[idx];
+        if (sl->gen != hs->ht_seq) {
+            if (hs->ht_count >= MS_SIZE / 2) { hs->overflow = 1; return -1; }
+            hs->ht_count++; sl->gen = hs->ht_seq; sl->key = k; sl->done = 0; sl->cached = 0;
+            memset(sl->lab, MS_INF, MS_MAX); *is_new = 1;
+            return (int)idx;
+        }
+        if (sl->key == k) { *is_new = 0; return (int)idx; }
+    }
+    hs->probe_failed = 1;
+    return -1;
+}
+
+static _Thread_local MSSucc *ms_arena_tls;
+
+int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *cut, const uint32_t *pred,
+                        const uint8_t *refk, int n, uint8_t *out, BfsProfile *prof) {
+    const int nb = pz->num_blocks, nh = pz->num_holes;
+    if (n <= 0 || n > MS_MAX) return -2;
+    if (g_bits_per_cell * (1 + nb) + nh > 64) return -2;
+    HashStatePush64 *hs = hsp64_get();
+    if (!hs->ms_lab) hs->ms_lab = calloc(MS_SIZE, sizeof(MSLab));
+    if (!ms_arena_tls) ms_arena_tls = malloc((size_t)MS_ARENA * sizeof(MSSucc));
+    MSLab *L = (MSLab *)hs->ms_lab; MSSucc *AR = ms_arena_tls; uint32_t arena_n = 0;
+    hsp64_select(hs, 0);
+    hsp64_clear(hs);
+    if (hs->ht_seq == 1) memset(L, 0, MS_SIZE * sizeof(MSLab));
+    mand_setup(pz);
+
+    const int      exit_pos = pz->exit_pos;
+    const uint64_t walls    = pz->walls;
+    int ib[MAX_BLOCKS];
+    for (int i = 0; i < nb; i++) ib[i] = pz->block_pos[i];
+    const int ihm = (1 << nh) - 1;
+    int n_popped = 0, peak = 0, n_expanded = 0;   /* prof: states_popped = (state,label) pops, peak_heap_sz = distinct expansions */
+
+    int8_t hdist[MAX_NCELLS];
+    walk_dists_from(walls, exit_pos, g_all_cells, hdist);
+#ifdef HOLEBOUND
+    hb_prepare(walls);
+#endif
+
+    uint32_t alive = 0;
+    for (int i = 0; i < n; i++) {
+        out[i] = 0;
+        if (cut[i] < 0 || hdist[starts[i]] < 0 || hdist[starts[i]] > cut[i]) continue;
+        alive |= 1u << i;
+    }
+    /* Decide start i as "shortcut" and everything behind it. */
+#define MS_DECIDE_SHORT(i0) do { uint32_t _q = 1u << (i0); \
+        while (_q) { int _j = __builtin_ctz(_q); _q &= _q - 1; \
+            if (out[_j]) continue; out[_j] = 1; alive &= ~(1u << _j); \
+            if (pred) for (int _k = 0; _k < n; _k++) if ((alive >> _k & 1) && (pred[_k] >> _j & 1)) _q |= 1u << _k; } } while (0)
+    if (!alive) goto finish;
+    /* dom[i]: every start on a shortest chain between the parent cell and
+     * start i; kd[i][j]: its chain distance (levels of the pred closure). */
+    uint32_t dom[MS_MAX]; uint8_t kd[MS_MAX][MS_MAX];
+    for (int i = 0; i < n; i++) {
+        uint32_t d = 0, frontier = pred ? pred[i] : 0; int k = 1;
+        while (frontier) {
+            for (uint32_t t = frontier; t; t &= t - 1) kd[i][__builtin_ctz(t)] = (uint8_t)k;
+            d |= frontier;
+            uint32_t nxt = 0;
+            for (uint32_t t = frontier; t; t &= t - 1) nxt |= pred[__builtin_ctz(t)];
+            frontier = nxt & ~d; k++;
+        }
+        dom[i] = d;
+    }
+
+    uint64_t blk_occ0 = 0; for (int i = 0; i < nb; i++) blk_occ0 |= 1ULL << ib[i];
+    uint64_t holes0 = 0;   for (int h = 0; h < nh; h++) holes0 |= 1ULL << pz->hole_pos[h];
+    const uint64_t interesting0 = nbr_mask(blk_occ0) | (1ULL << exit_pos);
+    int8_t wd0[MS_MAX][MAX_NCELLS];
+    for (int i = 0; i < n; i++) {
+        if (!(alive >> i & 1)) continue;
+        walk_dists_from_lim(walls | holes0 | blk_occ0, starts[i], interesting0, wd0[i], cut[i]);
+        if (wd0[i][exit_pos] >= 0 && wd0[i][exit_pos] <= cut[i]) MS_DECIDE_SHORT(i);
+    }
+    if (!alive) goto finish;
+    int maxcut = 0;
+    for (int i = 0; i < n; i++) if ((alive >> i & 1) && cut[i] > maxcut) maxcut = cut[i];
+    if (maxcut >= MS_INF - 1) return -2;        /* labels are uint8: deeper searches fall back */
+
+    /* First pushes: labels = per-start cost; one queue entry per distinct cost. */
+    {
+    MandCtx mc0; mand_pop_ctx(pz, ib, nb, ihm, &mc0);
+    const uint64_t base_state = pack5(0, ib, nb, ihm) & ~g_cell_mask;
+#ifdef USE_ZOBRIST
+    const uint64_t base_key = zpack64(0, ib, pz->block_pushable, nb, ihm, nh, pz->hole_pos) ^ z_player[0];
+#endif
+    for (int bi = 0; bi < nb; bi++) {
+        const int bpos = ib[bi], mb = pz->block_pushable[bi] & 0xF;
+        for (int d = 0; d < 4; d++) {
+            if (!(mb & (1 << d))) continue;
+            int pfr = g_adj[bpos][d ^ 2]; if (pfr < 0) continue;
+            int lnd = g_adj[bpos][d];
+            if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ0 & (1ULL << lnd))) continue;
+            int new_bpos = lnd, nhm = ihm, ch = -1;
+            if (holes0 & (1ULL << lnd))
+                for (int h = 0; h < nh; h++) if (pz->hole_pos[h] == lnd) { new_bpos = g_consumed; nhm &= ~(1 << h); ch = h; break; }
+            if (mand_dead_ctx(pz, &mc0, ib, nb, bi, new_bpos, (uint32_t)nhm, ch)) continue;
+            int bsh = g_bits_per_cell * (bi + 1);
+            uint64_t ns = base_state | (uint64_t)bpos;
+            ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
+            if (ch >= 0) ns ^= (uint64_t)(ihm ^ nhm) << (g_bits_per_cell * (nb + 1));
+#ifdef USE_ZOBRIST
+            uint64_t nk = base_key ^ z_player[bpos] ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
+            if (ch >= 0) nk ^= z_hole[pz->hole_pos[ch]];
+#else
+            uint64_t nk = ns;
+#endif
+            int hd = hdist[bpos]; if (hd < 0) continue;
+            int is_new = 0, slot = -1; uint64_t seen = 0;
+            int gp = -1; if (g_ref_on && refk) { g_refstat[0]++; gp = ref_lookup(nk); if (gp >= 0) g_refstat[1]++; }
+            for (uint32_t t = alive; t; t &= t - 1) {
+                int i = __builtin_ctz(t);
+                if (wd0[i][pfr] < 0) continue;
+                int nc = wd0[i][pfr] + 1;
+                if (nc + hd > cut[i]) continue;
+                if (gp >= 0 && ref_prunes_gp(gp, nc, bpos, cut[i], refk[i])) continue;
+                if (slot < 0) { slot = ms_slot(hs, L, nk, &is_new); if (slot < 0) return -2; }
+#ifndef MS_NO_DOM
+                { int dominated = 0;   /* an ancestor j already here with g_i - g_j >= k - 1: i cannot need X */
+                  for (uint32_t u = dom[i]; u; u &= u - 1) { int j = __builtin_ctz(u); if (L[slot].lab[j] + kd[i][j] - 1 <= nc) { dominated = 1; break; } }
+                  if (dominated) continue; }
+#endif
+                if (nc < L[slot].lab[i]) L[slot].lab[i] = (uint8_t)nc;
+                if (nc < 64 && (seen >> nc & 1)) continue;
+                if (nc < 64) seen |= 1ULL << nc;
+                HeapEntry64 e; e.prio = nc; e.g = nc; e.player_pos = bpos; e.used = 0; e.slot = (uint32_t)slot; e.state = ns;
+#ifdef USE_ZOBRIST
+                e.key = nk;
+#endif
+                bq64_push(hs, &e);
+            }
+        }
+    }
+    }
+    if (hs->pq_count > peak) peak = hs->pq_count;
+
+    int pq_min = 0;
+    while (hs->pq_count > 0 && alive) {
+        Bucket64 *bkt = &hs->bq[pq_min & PQ64_BMASK];
+        if (bkt->len == 0) { pq_min++; continue; }
+        HeapEntry64 e = bkt->items[--bkt->len];
+        hs->pq_count--;
+        if (e.prio > maxcut) break;
+        MSLab *lb = &L[e.slot];
+        uint32_t R = 0;
+        for (uint32_t t = alive & ~lb->done; t; t &= t - 1) { int i = __builtin_ctz(t); if (lb->lab[i] == e.prio) R |= 1u << i; }
+        if (!R) continue;
+        lb->done |= R;
+        n_popped++;
+
+        if (!lb->cached) {
+            /* Expand once: everything here is independent of start and cost. */
+            int sh = g_bits_per_cell, bp[MAX_BLOCKS];
+            for (int i = 0; i < nb; i++) { bp[i] = (int)((e.state >> sh) & g_cell_mask); sh += g_bits_per_cell; }
+            int hm = (int)(e.state >> sh);
+            uint64_t blk_occ = 0;
+            for (int i = 0; i < nb; i++) if (bp[i] < g_ncells) blk_occ |= 1ULL << bp[i];
+            uint64_t cur_holes = 0;
+            for (int h = 0; h < nh; h++) if (hm & (1 << h)) cur_holes |= 1ULL << pz->hole_pos[h];
+            MandCtx mc; mand_pop_ctx(pz, bp, nb, hm, &mc);
+            int8_t wdist[MAX_NCELLS];
+            /* First pop of this state has its smallest label, so this slack is
+             * the largest any later pop can need. */
+            walk_dists_from_lim(walls | cur_holes | blk_occ, e.player_pos, nbr_mask(blk_occ) | (1ULL << exit_pos), wdist, maxcut - e.prio);
+            lb->wexit = wdist[exit_pos];
+            lb->hb = 0;
+#ifdef HOLEBOUND
+            if (wdist[exit_pos] < 0 && hm && !hb_reaches(walls | cur_holes, e.player_pos, exit_pos)) {
+                int v = hb_bound(pz, e.player_pos, bp, nb, hm, exit_pos); lb->hb = (uint8_t)(v > 254 ? 254 : v);
+            }
+#endif
+            lb->soff = arena_n; int cnt = 0;
+            for (int bi = 0; bi < nb; bi++) {
+                if (bp[bi] >= g_ncells) continue;
+                const int bpos = bp[bi], mb = pz->block_pushable[bi] & 0xF;
+                for (int d = 0; d < 4; d++) {
+                    if (!(mb & (1 << d))) continue;
+                    int pfr = g_adj[bpos][d ^ 2]; if (pfr < 0 || wdist[pfr] < 0) continue;
+                    int lnd = g_adj[bpos][d];
+                    if (lnd < 0 || (walls & (1ULL << lnd)) || (blk_occ & (1ULL << lnd))) continue;
+                    int hd = hdist[bpos]; if (hd < 0) continue;
+                    int new_bpos = lnd, nhm = hm, ch = -1;
+                    if (cur_holes & (1ULL << lnd))
+                        for (int h = 0; h < nh; h++) if (pz->hole_pos[h] == lnd && (hm & (1 << h))) { new_bpos = g_consumed; nhm &= ~(1 << h); ch = h; break; }
+                    if (mand_dead_ctx(pz, &mc, bp, nb, bi, new_bpos, (uint32_t)nhm, ch)) continue;
+                    int bsh = g_bits_per_cell * (bi + 1);
+                    uint64_t ns = (e.state & ~g_cell_mask) | (uint64_t)bpos;
+                    ns = (ns & ~(g_cell_mask << bsh)) | ((uint64_t)new_bpos << bsh);
+                    if (ch >= 0) ns ^= (uint64_t)(hm ^ nhm) << (g_bits_per_cell * (nb + 1));
+#ifdef USE_ZOBRIST
+                    uint64_t nk = e.key ^ z_player[e.player_pos] ^ z_player[bpos] ^ z_block[mb][bpos] ^ z_block[mb][new_bpos];
+                    if (ch >= 0) nk ^= z_hole[pz->hole_pos[ch]];
+#else
+                    uint64_t nk = ns;
+#endif
+                    if (arena_n >= MS_ARENA || cnt >= 255) return -2;
+                    MSSucc *sc = &AR[arena_n++]; cnt++;
+                    sc->state = ns; sc->key = nk; sc->slot = -1; sc->bpos = (int8_t)bpos; sc->w = (int8_t)(wdist[pfr] + 1); sc->hd = (int8_t)hd;
+                }
+            }
+            lb->scount = (uint8_t)cnt; lb->cached = 1; n_expanded++;
+        }
+
+        /* Replay the cached expansion for the starts in R at this cost. */
+        if (lb->hb) {   /* hole-crossing bound: drop starts whose cutoff this state can no longer meet */
+            for (uint32_t t = R; t; t &= t - 1) { int i = __builtin_ctz(t); if (e.prio + lb->hb > cut[i]) R &= ~(1u << i); }
+            if (!R) continue;
+        }
+        if (lb->wexit >= 0) {
+            int wc = e.prio + lb->wexit;
+            for (uint32_t t = R; t; t &= t - 1) { int i = __builtin_ctz(t); if (wc <= cut[i]) MS_DECIDE_SHORT(i); }
+            R &= alive;
+            if (!R) continue;
+        }
+        MSSucc *sl = &AR[lb->soff];
+        for (int k = 0; k < lb->scount; k++) {
+            MSSucc *sc = &sl[k];
+            int nc = e.prio + sc->w, fmin = nc + sc->hd;
+            int slot = sc->slot, is_new = 0, improved = 0;   /* slots never move within a solve: probe once, reuse on every replay */
+            int gp = -1; if (g_ref_on && refk) { g_refstat[0]++; gp = ref_lookup(sc->key); if (gp >= 0) g_refstat[1]++; }
+            for (uint32_t t = R; t; t &= t - 1) {
+                int i = __builtin_ctz(t);
+                if (fmin > cut[i]) continue;
+                if (gp >= 0 && ref_prunes_gp(gp, nc, sc->bpos, cut[i], refk[i])) continue;
+                if (slot < 0) { slot = ms_slot(hs, L, sc->key, &is_new); if (slot < 0) return -2; sc->slot = slot; }
+#ifndef MS_NO_DOM
+                { int dominated = 0;
+                  for (uint32_t u = dom[i]; u; u &= u - 1) { int j = __builtin_ctz(u); if (L[slot].lab[j] + kd[i][j] - 1 <= nc) { dominated = 1; break; } }
+                  if (dominated) continue; }
+#endif
+                if (nc < L[slot].lab[i]) { L[slot].lab[i] = (uint8_t)nc; improved = 1; }
+            }
+            if (slot < 0 || !improved) continue;
+            if (hs->pq_count >= HP64_SIZE || (g_heap_cap > 0 && hs->pq_count > g_heap_cap)) return -2;
+            HeapEntry64 ne; ne.prio = nc; ne.g = nc; ne.player_pos = sc->bpos; ne.used = 0; ne.slot = (uint32_t)slot; ne.state = sc->state;
+#ifdef USE_ZOBRIST
+            ne.key = sc->key;
+#endif
+            bq64_push(hs, &ne);
+            if (hs->pq_count > peak) peak = hs->pq_count;
+        }
+    }
+finish:
+    if (hs->probe_failed) return -2;
+    (void)peak;
+    if (prof) { prof->states_popped = n_popped; prof->peak_heap_sz = n_expanded; }
+    return 0;
+#undef MS_DECIDE_SHORT
 }
 
 /* ========================================================================
@@ -1588,6 +2267,7 @@ typedef struct {
     __uint128_t state;
     __uint128_t used;
     int         prio;
+    int         g;        /* == prio here (the 128-bit solvers use plain Dijkstra order) */
     int         player_pos;
     uint32_t    slot;     /* hash-table slot holding this state */
 } HeapEntry128;   /* ~48 bytes with alignment */
@@ -1687,7 +2367,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
     {
         HeapEntry128 e0;
         e0.state = init_st; e0.used = 0;
-        e0.prio = 0; e0.player_pos = pz->player_start;
+        e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
         e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
         bq128_push(hs, &e0);
     }
@@ -1794,7 +2474,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
                 HeapEntry128 ne;
                 ne.state = ns;
                 ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
-                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.slot = (uint32_t)slot;
                 bq128_push(hs, &ne);
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
@@ -1845,7 +2525,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
     {
         HeapEntry128 e0;
         e0.state = init_st; e0.used = 0;
-        e0.prio = 0; e0.player_pos = pz->player_start;
+        e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
         e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
         bq128_push(hs, &e0);
     }
@@ -1964,7 +2644,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
                 HeapEntry128 ne;
                 ne.state = ns;
                 ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
-                ne.prio = nc; ne.player_pos = cand[ci].bpos;
+                ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.slot = (uint32_t)slot;
                 bq128_push(hs, &ne);
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
@@ -1998,7 +2678,9 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
 
 int sokoban_solve_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     int nb = pz->num_blocks, nh = pz->num_holes;
-    if (g_bits_per_cell * (1 + nb) + nh > 64)
+    if (g_bits_per_cell * (1 + nb) + nh > 64) {
+        hsp64_get()->last_exhaustive = 0;      /* the 128-bit solver has no exportable table; never export the previous 64-bit one */
         return solve_push128_cutoff(pz, used_dirs, prof, max_cost);
+    }
     return solve_push64_cutoff(pz, used_dirs, prof, max_cost);
 }

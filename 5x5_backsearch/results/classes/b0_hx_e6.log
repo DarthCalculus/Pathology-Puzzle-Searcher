@@ -1,0 +1,30 @@
+14 (0.0s)
+  ##@..
+  .$##.
+  .###.
+  ...#.
+  ##...
+
+--- Exit 6 (exhausted) ---
+  elapsed:        0.004 s
+  states checked: 401 (shortcut 0, dedup 0)
+  accepted:       401  (walk-segment pruned before check: 146)
+  solver calls:   401
+  shallow / recent: 402 / 402  (evicts 0 / 0)
+  stack peak:     10
+  best depth:     14  (verify 14 OK)
+
+=== Backward search complete ===
+Total elapsed:     0.00 s (no time limit)
+Exits searched:    1 / 1
+States checked:    401
+  pruned shortcut: 0
+  pruned dedup:    0
+Solver calls:      401
+Best depth:        14  (exit 6)
+
+  ##@..
+  .$##.
+  .###.
+  ...#.
+  ##...

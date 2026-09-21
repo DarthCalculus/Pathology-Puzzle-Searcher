@@ -1,0 +1,13 @@
+<=2-hole campaign (5x5, real rules) finished 2026-09-17 02:00:27
+[results/camp_h2] jobs done 225878/225878  exhausted 225829  split 49  NOT exhausted 0  states 8,311,438,305  cpu 134h45m  best depth 149
+   exit 0: 18440/18440 jobs, best 124, cpu 6h38m
+   exit 1: 65676/65676 jobs, best 149, cpu 69h01m
+   exit 2: 40928/40928 jobs, best 112, cpu 14h15m
+   exit 6: 53814/53814 jobs, best 124, cpu 30h31m
+   exit 7: 38401/38401 jobs, best 103, cpu 12h59m
+   exit 12: 8619/8619 jobs, best 80, cpu 1h18m
+
+per-exit maxima / champion jobs:
+{"complete": true, "missing": 0, "bad": 0, "best": {"1": 149, "2": 112, "6": 124, "7": 103, "0": 124, "12": 80}, "bestjob": {"1": "R2,U1,U3,U1,L1,L1,D1,D1,R1,L2,L2", "2": "R2,U1,U3,U2,U1,L1,L1,D1", "7": "R2,U1,L1,L1,D1,U2,R1,R1,D1,D1,L1", "0": "U1,U1,U3,U1,L1,L1,D1,D1", "6": "U2,L1,D1,D1,R2,R2,U1,U1,U3,L1,D1", "12": "U2,R1,D1,D1,L2,L2,L1,U1"}, "states": {"1": 2656040212, "2": 984671662, "6": 2117978320, "7": 1666281906, "0": 530276455, "12": 356189750}, "cpu": {"1": 248503, "2": 51317, "6": 109903, "7": 46787, "0": 23938, "12": 4697}}
+
+proofs + submissions: see results/autofinish_h2.log
