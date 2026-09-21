@@ -8,7 +8,7 @@ processes (resumable: re-run the same command after an interruption), and
 prints a report block to paste into the tracker.  Requires a worker built from
 this checkout:  ./build_pgo.sh -o backsearch_worker_nt --no-torch
 """
-import argparse, hashlib, json, os, re, subprocess, sys, time, urllib.request
+import argparse, hashlib, json, os, re, shlex, subprocess, sys, time, urllib.request
 ap = argparse.ArgumentParser()
 ap.add_argument('--chunks', required=True, help='comma-separated chunk ids')
 ap.add_argument('--workers', type=int, default=2); ap.add_argument('--name', required=True)
@@ -16,7 +16,7 @@ ap.add_argument('--plan', default='https://pathology.georgespahn.com/api/chunks/
 ap.add_argument('--worker', default='./backsearch_worker_nt')
 a = ap.parse_args()
 HERE = os.path.dirname(os.path.abspath(__file__)); os.chdir(HERE)
-argv_line = 'python3 run_chunks.py ' + ' '.join(sys.argv[1:])
+argv_line = 'python3 run_chunks.py ' + shlex.join(sys.argv[1:])
 
 def die(m): print('error: ' + m, file=sys.stderr); sys.exit(1)
 if not os.access(a.worker, os.X_OK): die(f"{a.worker} not found; build it with: ./build_pgo.sh -o backsearch_worker_nt --no-torch")
@@ -56,8 +56,16 @@ def level_code(text):
         out.append(s)
     return '\n'.join(out)
 def last_level(best_file):
-    blocks = re.split(r'\n(?=\d+ \()', open(best_file).read().strip())
-    return level_code(blocks[-1])
+    """The grid printed right after the last 'N (time)' header (the worker's
+    final summary reprints the level, so take only that first block)."""
+    lines = open(best_file).read().split('\n')
+    heads = [i for i, l in enumerate(lines) if re.match(r'^\d+ \(', l)]
+    if not heads: return None
+    block = []
+    for l in lines[heads[-1] + 1:]:
+        if not l.strip(): break
+        block.append(l)
+    return level_code('\n'.join(block))
 
 # --- run each chunk as its own resumable campaign --------------------------
 t_start = time.time(); report_chunks = []
