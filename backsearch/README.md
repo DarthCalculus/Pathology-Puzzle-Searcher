@@ -24,7 +24,7 @@ The worker is the only piece that needs compilation. The wrapper script and Pyth
 **Recommended — profile-guided build** (the forward solver is ~90% of runtime and PGO is worth 10–20% on top of `-O3`; links libtorch automatically if `import torch` works, otherwise a no-op NN stub):
 
 ```bash
-cd 5x5_backsearch
+cd backsearch
 ./build_pgo.sh                      # -> ./backsearch_worker
 ./build_pgo.sh -o worker_test --no-torch
 ```
@@ -228,7 +228,7 @@ Three options, easiest to hardest:
 
 ```bash
 sudo apt install build-essential python3       # one-time setup
-cd 5x5_backsearch
+cd backsearch
 cc -O3 -o backsearch_worker backsearch.c sokoban_bfs.c -lz
 ./backsearch --grid 5x5 --time 60
 ```
@@ -239,7 +239,7 @@ The wrapper, Python filter, and FIFO-based merging all work transparently inside
 
 ```bash
 # In an MSYS2 shell (after installing mingw-w64-x86_64-gcc):
-cd 5x5_backsearch
+cd backsearch
 gcc -O3 -o backsearch_worker.exe backsearch.c sokoban_bfs.c -lz
 ./backsearch --grid 5x5 --time 60
 ```

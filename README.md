@@ -68,7 +68,7 @@ the site's Proofs page; the raw campaign records are in `backsearch/results/`.
 ## Running it
 
 ```bash
-cd 5x5_backsearch
+cd backsearch
 ./build_pgo.sh -o backsearch_worker_nt --no-torch          # profile-guided build
 
 # one exit, one class, run until the tree is exhausted
