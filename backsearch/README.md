@@ -33,11 +33,10 @@ cd backsearch
 ./build_pgo.sh -o worker_test --no-torch
 ```
 
-Plain build (needs the NN hooks from `nn_inference.o` or a stub — see `build_pgo.sh` for the stub source):
+Plain build, any C11 compiler (clang or gcc), no PGO:
 
 ```bash
-SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
-cc -O3 -DGIT_SHA_STR=\"$SHA\" -o backsearch_worker backsearch.c sokoban_bfs.c nn_stub.o -lz
+cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ```
 
 **Solver regression / benchmark:** `solvebench.c` replays every forward-solver call recorded in a `--harvest` file and checks each answer against the recorded one (exit status 3 on any mismatch). Build and usage are in its header comment. Use it before and after any change to `sokoban_bfs.c`.
