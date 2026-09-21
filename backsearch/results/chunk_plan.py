@@ -61,37 +61,44 @@ for rnd in range(a.max_split_rounds):
     heavy = [n for n in nodes if n['est_s'] > budget]
     if not heavy: break
     log(f"split round {rnd+1}: {len(heavy)} nodes over budget (heaviest {max(n['est_s'] for n in heavy)/3600:.1f} h)")
-    keep = [n for n in nodes if n['est_s'] <= budget]
-    for h in sorted(heavy, key=lambda n: -n['est_s']):
-        kids = estimate(h['exit'], h['path'], h['depth'] + a.split_depth, a.probes_per_node)
+    keep = []
+    for n in nodes:
+        if n['est_s'] <= budget: keep.append(n); continue
+        kids = estimate(n['exit'], n['path'], n['depth'] + a.split_depth, a.probes_per_node)   # sub-layer, DFS order
         ks = sum(k['est_s'] for k in kids)
-        log(f"  {h['path']} (exit {h['exit']}, est {h['est_s']/3600:.1f} h) -> {len(kids)} children, est {ks/3600:.1f} h")
-        if not kids: keep.append(h)   # nothing below (should not happen for a heavy node)
-        else: keep += kids
+        log(f"  {n['path']} (exit {n['exit']}, est {n['est_s']/3600:.1f} h) -> {len(kids)} children, est {ks/3600:.1f} h")
+        keep += kids if kids else [n]     # spliced in place: the sub-layer occupies exactly the node's slot in DFS order
     nodes = keep
     total = sum(n['est_s'] for n in nodes); budget = total / a.chunks
     log(f"  now {len(nodes)} nodes, total est {total/3600:.1f} h, budget {budget/3600:.2f} h")
 
-# 3. greedy packing, heaviest first, into the least loaded chunk of the SAME exit
-#    (chunks are per exit so one worker run has one exit); chunk count per exit
-#    proportional to its share, at least 1.
+# 3. contiguous cutting in DFS order.  The estimator lists a layer in the DFS
+#    visiting order and a heavy node's sub-layer lies exactly where the node was,
+#    so `nodes` (per exit) is the whole tree in visiting order.  Cut it into runs
+#    whose estimates add up to about one budget; a chunk is then the DFS-order
+#    range [first node, next chunk's first node) and its nodes are the cut points
+#    the runner uses to make parallel sub-jobs.
 by_exit = {}
 for n in nodes: by_exit.setdefault(n['exit'], []).append(n)
 plan = []
-for e, ns in sorted(by_exit.items()):
+for e in sorted(by_exit):
+    ns = by_exit[e]           # already in DFS order: layer order, with sub-layers spliced in place
     share = sum(n['est_s'] for n in ns) / total
-    k = max(1, round(a.chunks * share))
-    bins = [dict(exit=e, est_s=0.0, jobs=[]) for _ in range(k)]
-    for n in sorted(ns, key=lambda n: -n['est_s']):
-        b = min(bins, key=lambda b: b['est_s']); b['est_s'] += n['est_s']; b['jobs'].append(n)
-    plan += bins
-plan.sort(key=lambda b: (b['exit'], -b['est_s']))
+    k = max(1, round(a.chunks * share)); target = sum(n['est_s'] for n in ns) / k
+    cur = dict(exit=e, est_s=0.0, jobs=[])
+    for i, n in enumerate(ns):
+        if cur['jobs'] and cur['est_s'] + n['est_s'] > target * 1.15 and len(plan) - sum(1 for b in plan if b['exit'] != e) < k - 1:
+            plan.append(cur); cur = dict(exit=e, est_s=0.0, jobs=[])
+        cur['est_s'] += n['est_s']; cur['jobs'].append(n)
+    plan.append(cur)
 out = dict(created=time.strftime('%Y-%m-%d %H:%M'), grid=a.grid, extra=extra, layer=a.layer, chunks=[])
-for i, b in enumerate(plan, 1):
-    out['chunks'].append(dict(id=i, exit=b['exit'], est_hours=round(b['est_s']/3600, 2), n_jobs=len(b['jobs']),
+for i, b in enumerate(plan):
+    nxt = plan[i + 1] if i + 1 < len(plan) and plan[i + 1]['exit'] == b['exit'] else None
+    out['chunks'].append(dict(id=i + 1, exit=b['exit'], est_hours=round(b['est_s'] / 3600, 2), n_jobs=len(b['jobs']),
+                              range_from=b['jobs'][0]['path'], range_until=nxt['jobs'][0]['path'] if nxt else None,
                               jobs=[dict(path=j['path'], depth=j['depth'], est_s=round(j['est_s'], 1)) for j in b['jobs']]))
 json.dump(out, open(a.out, 'w'), indent=1)
 if os.path.exists(tmp): os.remove(tmp)
 log(f"wrote {a.out}: {len(plan)} chunks; est hours per chunk: min {min(b['est_s'] for b in plan)/3600:.2f} "
     f"median {sorted(b['est_s'] for b in plan)[len(plan)//2]/3600:.2f} max {max(b['est_s'] for b in plan)/3600:.2f}")
-for b in plan: print(f"  chunk exit {b['exit']}: est {b['est_s']/3600:6.2f} h, {len(b['jobs']):6d} jobs")
+for c in out['chunks']: print(f"  chunk {c['id']:3d} exit {c['exit']:2d}: est {c['est_hours']:6.2f} h, {c['n_jobs']:6d} cut points, from {c['range_from']}")

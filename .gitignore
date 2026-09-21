@@ -41,3 +41,5 @@ backsearch/results/est149_probe*.tsv
 *_bak*/
 .claude/
 *.exe
+backsearch/results/chunks/
+backsearch/backsearch_est

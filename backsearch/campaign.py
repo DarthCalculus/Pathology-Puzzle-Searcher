@@ -22,8 +22,15 @@ added (real Pathology rules) unless --no-transit is given.
 
 Concurrency can be changed live: echo N > DIR/workers (0 pauses after the
 current jobs finish).
+
+Range jobs and checkpoints (2026-09-21).  A job's path may also be a DFS-order
+range "FROM..UNTIL" (either side empty): the worker runs `--from FROM --until
+UNTIL`.  Ctrl-C (or --split-after seconds) interrupts the running workers,
+which print a CURSOR line; the driver records the job as `continued` and
+appends the continuation job "CURSOR..UNTIL" to jobs.tsv, so the next run
+picks up exactly where it stopped.  Nothing is ever recomputed.
 """
-import argparse, json, os, random, re, subprocess, sys, threading, time
+import argparse, json, os, random, re, signal, subprocess, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -44,6 +51,22 @@ def list_layer(worker, exits, K, grid, extra):
     return jobs
 
 RE_HDR   = re.compile(r"^--- Exit (\d+) \((.*?)\) ---", re.M)
+RE_CUR   = re.compile(r"^CURSOR\t(\d+)\t([^\t]*)\t(\d+)", re.M)
+STOP = {"flag": False}
+RUNNING = {}   # pid -> Popen of a worker in flight (to forward SIGINT)
+def on_sigint(sig, frame):
+    STOP["flag"] = True
+    for p in list(RUNNING.values()):
+        try: p.send_signal(signal.SIGINT)
+        except Exception: pass
+    print("\n  ** stop requested: waiting for the running workers to checkpoint (CURSOR) ...", flush=True)
+def job_args(path):
+    """--seed-path P, or --from/--until for a range job 'FROM..UNTIL'."""
+    if ".." not in path: return ["--seed-path", path]
+    fr, un = path.split("..", 1); out = []
+    if fr: out += ["--from", fr]
+    if un: out += ["--until", un]
+    return out
 RE_EL    = re.compile(r"elapsed:\s+([\d.]+) s")
 RE_ST    = re.compile(r"states checked: (\d+) \(shortcut (\d+), dedup (\d+)")
 RE_SC    = re.compile(r"solver calls:\s+(\d+)")
@@ -51,20 +74,25 @@ RE_EV    = re.compile(r"evicts (\d+) / (\d+)")
 RE_BD    = re.compile(r"best depth:\s+(\d+)(?:\s+\(verify (\d+) (\w+)\))?")
 
 def run_job(worker, grid, exit_pos, path, extra, timeout=None):
-    cmd = [worker, "--grid", grid, "--two-tables", "--exit", str(exit_pos),
-           "--seed-path", path, "--time", "0"] + extra
+    cmd = [worker, "--grid", grid, "--two-tables", "--exit", str(exit_pos)] + job_args(path) + ["--time", "0"] + extra
     t0 = time.time()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    RUNNING[p.pid] = p
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        wall = time.time() - t0
-        rec = dict(exit=exit_pos, path=path, status="split", states=0, shortcut=0, dedup=0, calls=0,
-                   ev_s=0, ev_r=0, best=0, verify="-", elapsed=0.0, wall=round(wall, 3))
-        return rec, "", f"timed out after {timeout}s -> split"
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.send_signal(signal.SIGINT)          # checkpoint instead of kill: the worker prints its CURSOR
+            out, err = p.communicate()
+    finally:
+        RUNNING.pop(p.pid, None)
     wall = time.time() - t0
-    out = r.stdout
+    class R: pass
+    r = R(); r.returncode = p.returncode
     m = RE_HDR.search(out)
     status = m.group(2) if m else f"rc={r.returncode}"
+    cm = RE_CUR.search(out)
+    if cm and status != "exhausted": status = "continued"   # the continuation job carries the CURSOR
     def g(rx, k=1, d=-1):
         mm = rx.search(out); return int(float(mm.group(k))) if mm and mm.group(k) else d
     rec = dict(exit=exit_pos, path=path, status=status,
@@ -73,7 +101,8 @@ def run_job(worker, grid, exit_pos, path, extra, timeout=None):
                best=g(RE_BD, 1, 0), verify=(RE_BD.search(out).group(3) if RE_BD.search(out) and RE_BD.search(out).group(3) else "-"),
                elapsed=round(float(RE_EL.search(out).group(1)), 3) if RE_EL.search(out) else round(wall, 3),
                wall=round(wall, 3))
-    return rec, out, r.stderr
+    rec["cursor"] = cm.group(2) if cm else None
+    return rec, out, err
 
 def list_children(worker, grid, exit_pos, path, extra, k):
     """The dedup'd depth+k layer under seed path `path`, as complete seed paths."""
@@ -106,8 +135,8 @@ def status(out, jobs):
     done = load_done(os.path.join(out, "done.tsv"))
     total = len(jobs) if jobs else len(done)
     ok = [r for r in done.values() if r["status"] == "exhausted"]
-    split = [r for r in done.values() if r["status"] == "split"]
-    bad = [r for r in done.values() if r["status"] not in ("exhausted", "split")]
+    split = [r for r in done.values() if r["status"] in ("split", "continued")]
+    bad = [r for r in done.values() if r["status"] not in ("exhausted", "split", "continued")]
     states = sum(int(r["states"]) for r in done.values())
     el = sum(float(r["elapsed"]) for r in done.values())
     best = max((int(r["best"]) for r in done.values()), default=0)
@@ -115,7 +144,7 @@ def status(out, jobs):
     for r in done.values():
         d = by_exit.setdefault(int(r["exit"]), dict(n=0, best=0, el=0.0))
         d["n"] += 1; d["best"] = max(d["best"], int(r["best"])); d["el"] += float(r["elapsed"])
-    print(f"[{out}] jobs done {len(done)}/{total}  exhausted {len(ok)}  split {len(split)}  NOT exhausted {len(bad)}  "
+    print(f"[{out}] jobs done {len(done)}/{total}  exhausted {len(ok)}  split/continued {len(split)}  NOT exhausted {len(bad)}  "
           f"states {states:,}  cpu {fmt_dur(el)}  best depth {best}")
     for e in sorted(by_exit):
         d = by_exit[e]
@@ -137,7 +166,7 @@ def main():
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--shuffle", action="store_true", help="random job order (better ETA by count)")
     ap.add_argument("--save-depth", type=int, default=100, help="keep full worker output for jobs reaching this depth")
-    ap.add_argument("--split-after", type=float, default=0, help="seconds; a job still running after this is killed and replaced by its depth+split-k children (default 0 = never split: jobs run to completion)")
+    ap.add_argument("--split-after", type=float, default=0, help="seconds; a job still running after this is checkpointed (SIGINT -> CURSOR) and continued as a range job from the cursor (default 0 = never)")
     ap.add_argument("--split-k", type=int, default=3)
     ap.add_argument("--no-transit", action="store_true", help="omit --allow-exit-transit (NOT the Pathology rule set; restricted class only)")
     a = ap.parse_args()
@@ -206,23 +235,28 @@ def main():
         rec, out, err = run_job(a.worker, a.grid, ex, path, extra,
                                 timeout=(a.split_after if a.split_after > 0 else None))
         nonlocal best_seen
-        if rec["status"] == "split":
-            kids = list_children(a.worker, a.grid, ex, path, extra, a.split_k)
+        if rec["status"] == "continued":
+            # checkpointed: the rest of this job is the range [cursor, until)
+            until = path.split("..", 1)[1] if ".." in path else ""
+            cont = (ex, f"{rec['cursor']}..{until}", j[2], j[3], j[4])
             with lock:
-                with open(jobs_file, "a") as f:
-                    for k in kids: f.write("\t".join(map(str, k)) + "\n")
-                jobs.extend(kids)
-                for k in reversed(kids): jq.appendleft(k)   # run the children next, not last
+                with open(jobs_file, "a") as f: f.write("\t".join(map(str, cont)) + "\n")
+                jobs.append(cont)
+                if not STOP["flag"]: jq.appendleft(cont)   # keep going now, or leave it for the next run
                 done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()
-                n_done[0] += 1
-                print(f"  >> split exit {ex} {path} after {rec['wall']}s into {len(kids)} depth+{a.split_k} jobs "
-                      f"(total jobs now {len(jobs)})", flush=True)
+                n_done[0] += 1; cpu[0] += rec["elapsed"]
+                if rec["best"] > best_seen: best_seen = rec["best"]
+                if rec["best"] >= a.save_depth:
+                    tag = f"best{rec['best']:03d}_e{ex}_{path.replace(',', '').replace('..', '__')[:80]}"
+                    with open(os.path.join(a.out, tag + ".txt"), "w") as f: f.write(" ".join([a.worker] + extra) + "\n" + out)
+                print(f"  >> checkpointed exit {ex} {path} after {rec['wall']}s (best {rec['best']}, {rec['states']:,} states); "
+                      f"continues as {cont[1][:60]}{'...' if len(cont[1]) > 60 else ''}", flush=True)
             return
         with lock:
             done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()
             n_done[0] += 1; cpu[0] += rec["elapsed"]
             if rec["best"] >= a.save_depth or rec["best"] > best_seen:
-                tag = f"best{rec['best']:03d}_e{ex}_{path.replace(',', '')}"
+                tag = f"best{rec['best']:03d}_e{ex}_{path.replace(',', '').replace('..', '__')[:80]}"
                 with open(os.path.join(a.out, tag + ".txt"), "w") as f: f.write(" ".join([a.worker] + extra) + "\n" + out)
             if rec["best"] > best_seen:
                 best_seen = rec["best"]
@@ -253,7 +287,8 @@ def main():
             # every freed slot, while the sleepers never got one (starvation).
             j = None
             with lock:
-                if jq and active[0] < desired():
+                if STOP["flag"] and active[0] == 0: return
+                if jq and active[0] < desired() and not STOP["flag"]:
                     j = jq.popleft(); active[0] += 1
                 elif not jq and active[0] == 0:
                     return
@@ -263,10 +298,12 @@ def main():
             try: work(j)
             finally:
                 with lock: active[0] -= 1
+    signal.signal(signal.SIGINT, on_sigint); signal.signal(signal.SIGTERM, on_sigint)
     threads = [threading.Thread(target=runner, daemon=True) for _ in range(8)]
     for t in threads: t.start()
     for t in threads: t.join()
     done_f.close()
+    if STOP["flag"]: print("  ** stopped; re-run the same command to continue from the checkpoints", flush=True)
     status(a.out, jobs)
 
 if __name__ == "__main__":

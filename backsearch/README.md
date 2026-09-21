@@ -50,9 +50,9 @@ cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ./backsearch_worker --grid 5x5 --two-tables --exit 0 --num-holes 1 --num-blocks 3 --time 55
 # no-transit exit 7, ~9 s:            accepted 2877948,  best depth 43
 ./backsearch_worker --grid 5x5 --two-tables --exit 7 --time 55
-# REAL RULES (transit), ~40 s:         accepted 2292598,  best depth 58
+# REAL RULES (transit), ~40 s:         accepted 2292601,  best depth 58   (2292598 before 2026-09-21: the root's push-off-exit children are now ordinary counted children)
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 7 --num-blocks 3 --time 55
-# REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 5279938, best depth 58
+# REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 5279939, best depth 58   (was 5279938, same reason)
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 12 --num-blocks 4 --time 0
 ```
 
@@ -144,6 +144,42 @@ walk is admissible).  Exact, but it prunes only 1-2% of pops on 5x5 and costs
 ~25% per solve; kept behind `-DHOLEBOUND`.
 
 Exact pruning/solver changes so far (2026-09-14): small L2 solver table with big-table fallback; A* walk-distance bound; slack-0 pop skip and depth-limited walk BFS; shortest-walk-segment prune before the solver call (generalises the anti-wiggle rule; ~3% of solver calls on deep configs); decision mode (`sokoban_set_decision_only`: return on the first solution within the cutoff, queue ordered by g + h; ~16% fewer solver states; off automatically when `--harvest`/`--trace-csv`/`--bf-dump` need exact lengths — `solvebench --decision` replays it).
+
+## DFS-order ranges, checkpoints and chunks (2026-09-21)
+
+`expand()` pushes a node's children in a fixed order (bulk walk-backs first,
+then single steps by direction and variant) and the stack pops them in reverse,
+so the DFS visits the tree in one fixed order and every node's path (its
+`--seed-path` string; a bulk walk-back child carries its whole walk) is its
+position in that order.  Hence:
+
+* **Checkpoint.** Ctrl-C (SIGINT/SIGTERM) or the `--time` cap finish the current
+  expansion and print `CURSOR <exit> <path> <depth>`: everything before that
+  node is done.  `--from <path>` resumes there (the node's subtree included);
+  only the ancestors along the path are re-expanded.
+* **Ranges.** `--from P --until Q` searches exactly the nodes visited between P
+  (inclusive) and Q (exclusive); Q and everything after it belong to another
+  run.  Cut points can be at any depth, and `--list-layer` / `--estimate-dump`
+  emit layer nodes in this visiting order, so consecutive layer nodes are
+  consecutive ranges.  Verified by visit traces (`BS_TRACE_VISITS=file`): a
+  full run's node sequence equals the concatenation of its ranges, and an
+  interrupted run plus its resume, up to the re-expanded ancestors.
+* **Driver.** `campaign.py` accepts range jobs (`FROM..UNTIL`, either side
+  empty); Ctrl-C or `--split-after S` checkpoints the running workers, records
+  the job as `continued` and appends the continuation `CURSOR..UNTIL` to
+  jobs.tsv, so re-running the same command continues from the checkpoints.
+* **Chunks (collective proofs).** `results/chunk_plan.py` estimates the layer
+  (re-estimating heavy prefixes at a deeper layer, spliced in place) and cuts
+  the DFS order into contiguous chunks of roughly equal estimated work; each
+  chunk is a range `[range_from, range_until)` whose interior cut points are its
+  parallel sub-ranges.  `run_chunks.py` runs chunks from the tracker at
+  pathology.georgespahn.com and prints the report block it accepts.
+
+The explicit push-off-exit seeds were removed the same day: the root's own
+new-block push-back children are the same states, and a node must have one
+path.  The transit equivalence counts rose by the number of those root children
+(exit 7 <= 3 blocks: 2292598 -> 2292601; exit 12 <= 4 blocks: 5279938 -> 5279939);
+best depths and everything else are unchanged.
 
 ## Exhaustive campaigns (proving a grid's record)
 

@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <limits.h>
 #include <zlib.h>
+#include <signal.h>
 
 #define DEFAULT_CAP_S    0.0    /* 0 = no time limit (run until queue is empty) */
 
@@ -223,6 +224,7 @@ static long long g_export_entries = 0;
  *   3  un-consume  (introduces a new block AND a new hole simultaneously,
  *                   reversing a forward block-into-hole consumption)
  */
+#define PATH_TOK_MAX 250
 typedef struct { int8_t direction; int8_t variant; } SeedStep;
 static SeedStep g_seed_path[1024];
 static int      g_seed_path_n = 0;
@@ -446,7 +448,47 @@ typedef struct {
     int16_t  ptab_k;                     /* depth(this) - depth(A): the table prunes a check of a depth+j descendant at nc > g_A + k + j - 2 */
     uint64_t ptab_delta;                 /* cells floor here but wall in A's puzzle (A's table still bounds continuations avoiding them) */
     uint64_t ptab_xor;                   /* key translation this -> A (see sokoban_ref_set_xor); 0 for an identical puzzle */
+    uint8_t  plen;                       /* tree path from the exit root: one byte per backward step, (variant << 2) | direction;
+                                          * a bulk walk-back child carries the whole walk (BFS-parent chain).  Fixes the DFS
+                                          * position of every node, so a run can be checkpointed by one path (CURSOR) and
+                                          * restricted to a DFS-order range (--from / --until). */
+    uint8_t  path[PATH_TOK_MAX];
 } BState;
+static inline int path_push(BState *s, int D, int V) {
+    if (s->plen >= PATH_TOK_MAX) return 0;
+    if (V == 3) V = 2;   /* push-existing and new-block are mutually exclusive at a state and share the text digit 2: one byte value */
+    s->path[s->plen++] = (uint8_t)((V << 2) | (D & 3));
+    return 1;
+}
+/* Text form = --seed-path syntax: U/R/D/L + user digit (1 walk, 2 push, 3 un-consume). */
+static void path_text(const uint8_t *p, int n, char *buf, size_t cap) {
+    size_t o = 0; buf[0] = 0;
+    for (int i = 0; i < n && o + 4 < cap; i++) {
+        int D = p[i] & 3, V = p[i] >> 2, digit = (V == 4) ? 3 : (V == 3) ? 2 : V;
+        o += (size_t)snprintf(buf + o, cap - o, "%s%c%d", i ? "," : "", "URDL"[D], digit);
+    }
+}
+/* Parse the text form into token bytes (digit 2 is stored as variant 2; the
+ * push-existing / new-block distinction is resolved when the path is walked). */
+static int path_parse(const char *t, uint8_t *out, int *n) {
+    *n = 0;
+    while (*t) {
+        while (*t == ' ' || *t == ',' || *t == '\t') t++;
+        if (!*t) break;
+        int D; switch (*t++) { case 'U': case 'u': D = 0; break; case 'R': case 'r': D = 1; break;
+                               case 'D': case 'd': D = 2; break; case 'L': case 'l': D = 3; break; default: return 0; }
+        if (*t < '1' || *t > '3') return 0;
+        int V = (*t == '3') ? 4 : (*t - '0'); t++;
+        if (*n >= PATH_TOK_MAX) return 0;
+        out[(*n)++] = (uint8_t)((V << 2) | D);
+    }
+    return 1;
+}
+/* --from / --until: a DFS-order range of the tree, both ends given as paths. */
+static uint8_t g_from_path[PATH_TOK_MAX], g_until_path[PATH_TOK_MAX];
+static int     g_from_n = 0, g_until_n = 0;
+static volatile sig_atomic_t g_stop_requested = 0;   /* SIGINT/SIGTERM: finish the current expansion, print CURSOR, stop */
+static void on_stop_signal(int sig) { (void)sig; g_stop_requested = 1; }
 
 /* Parent-table pool: the settled labels of an accepted state's exhaustive
  * shortcut check, kept until the state is expanded so that children with an
@@ -1789,6 +1831,7 @@ static int parse_seed_path(const char *s) {
  * *s.  Mirrors the expand() logic exactly but for a single (D, V) choice
  * with no branching.  Returns 1 on success, 0 if the requested step is
  * invalid at this state.  Modifies *s in place on success. */
+static inline uint8_t wh_after_walk(uint8_t h, int w);
 static int apply_seed_step(BState *s, int D, int variant) {
     int P = s->player_pos;
     int C = g_adj[P][D ^ 2];
@@ -1817,6 +1860,9 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->committed_empty = new_E;
         s->depth          += 1;
         s->seg_len        += 1;
+        s->wh              = wh_after_walk(s->wh, D ^ 2);
+        s->bulk_walk       = 0;
+        path_push(s, D, 1);
         return 1;
     }
 
@@ -1842,6 +1888,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
             s->committed_empty = new_E;
             s->depth          += 1;
             s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
+            s->wh = 0; s->bulk_walk = 0; path_push(s, D, 2);
             return 1;
         }
         /* Variant 3: introduce a new block.  B must be uncommitted, no
@@ -1859,6 +1906,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->committed_empty = new_E | (1ULL << B);
         s->depth          += 1;
         s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
+        s->wh = 0; s->bulk_walk = 0; path_push(s, D, 3);
         return 1;
     }
 
@@ -1883,6 +1931,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->committed_empty = new_E | (1ULL << B);
         s->depth          += 1;
         s->seg_anchor1 = (int8_t)(C + 1); s->seg_len = 0;
+        s->wh = 0; s->bulk_walk = 0; path_push(s, D, 4);
         return 1;
     }
     return 0;
@@ -1902,16 +1951,27 @@ static int build_seed_path_seed(BState *out) {
         .seg_anchor1     = (int8_t)(g_exit_pos + 1),
         .seg_len         = 0,
     };
+    /* A run of walk tokens over already-committed cells is ONE tree edge (a bulk
+     * walk-back child, see bulk_generate): the replayed state must look like the
+     * generated one -- walk history cleared, bulk_walk set -- or its expansion
+     * would differ from the tree the DFS builds. */
+    int run = 0;
     for (int i = 0; i < g_seed_path_n; i++) {
         int D = g_seed_path[i].direction;
         int V = g_seed_path[i].variant;
         int user_digit = (V == 4) ? 3 : V;   /* invert the parse-time remap for messages */
+        int C = g_adj[seed.player_pos][D ^ 2];
+        int committed_walk = V == 1 && C >= 0 && (seed.committed_empty >> C & 1) && g_bulk_walk_active
+                             && (run || (seed.depth >= g_bulk_min_depth && !seed.bulk_walk));
+        if (!committed_walk && run) { seed.wh = 0; seed.bulk_walk = 1; run = 0; }
         if (!apply_seed_step(&seed, D, V)) {
             fprintf(stderr, "error: --seed-path step %d (%c%d) is invalid at depth %d (player=%d)\n",
                     i, "URDL"[D], user_digit, seed.depth, seed.player_pos);
             return 0;
         }
+        if (committed_walk) run = 1;
     }
+    if (run) { seed.wh = 0; seed.bulk_walk = 1; }
     *out = seed;
     return 1;
 }
@@ -2061,6 +2121,7 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
     harvest_emit(s, sid, 'A', -1);
     BState ns = *s;
     ns.branch_factor = g_last_peak_heap;
+    if (g_emit_D >= 0) path_push(&ns, g_emit_D, g_emit_V);   /* single-step edge; bulk children (g_emit_D < 0) carry their walk already */
     if (g_ptab_active) {
         int exported = 0;
         if (!have_x) {
@@ -2137,9 +2198,10 @@ static int bulk_generate(const BState *s) {
     /* BFS over the component; cells in order of distance from P. */
     int8_t dist[MAX_NCELLS]; memset(dist, -1, sizeof dist);
     int q[MAX_NCELLS], qh = 0, qt = 0; q[qt++] = P; dist[P] = 0;
+    int8_t par[MAX_NCELLS], pd[MAX_NCELLS];   /* BFS tree: the walk that names each child in its path */
     while (qh < qt) {
         int c = q[qh++];
-        for (int d = 0; d < 4; d++) { int nn = g_adj[c][d]; if (nn >= 0 && (passable >> nn & 1) && dist[nn] < 0) { dist[nn] = (int8_t)(dist[c] + 1); q[qt++] = nn; } }
+        for (int d = 0; d < 4; d++) { int nn = g_adj[c][d]; if (nn >= 0 && (passable >> nn & 1) && dist[nn] < 0) { dist[nn] = (int8_t)(dist[c] + 1); par[nn] = (int8_t)c; pd[nn] = (int8_t)d; q[qt++] = nn; } }
     }
     if (qt <= 1) return 1;
     /* Shortest-walk-segment prune, applied to the whole component at once: a
@@ -2176,6 +2238,12 @@ static int bulk_generate(const BState *s) {
         ns.wh         = 0;
         if (s->seg_anchor1 > 0) { int sl = s->seg_len + dist[c]; ns.seg_len = (int8_t)(sl > 127 ? 127 : sl); }
         ns.bulk_walk  = 1;
+        {   /* path: the BFS-parent chain P -> c as walk tokens (moving the player from a to
+             * g_adj[a][d] is the backward walk whose token direction is d ^ 2, see expand()) */
+            int chain[MAX_NCELLS], cn = 0;
+            for (int x = c; x != P; x = par[x]) chain[cn++] = pd[x];
+            for (int k = cn - 1; k >= 0; k--) path_push(&ns, chain[k] ^ 2, 1);
+        }
         if (ns.depth <= g_dupe_threshold) {
             uint64_t key = canonical_state_key(&ns);
             int dup = g_two_tables ? dedup_two_tables(key, ns.depth) : dedup_check_and_insert(key, ns.depth);
@@ -2221,7 +2289,7 @@ static int bulk_generate(const BState *s) {
             /* Did not fit: decide these candidates one by one (they are already
              * dedup-inserted, so the caller must not regenerate them). */
             g_bulk_fallbacks++;
-            for (int i = 0; i < n; i++) {
+            for (int i = n - 1; i >= 0; i--) {   /* same push order as the bulk path: the DFS order must not depend on the fallback */
                 g_emit_D = -1; g_emit_V = 1; g_emit_walk_committed = 1;
                 if (have_ref) {   /* same table, this candidate's own chain offset */
                     sokoban_ref_set_k(cand[base + i].ptab_k); sokoban_ref_set_xor(cand[base + i].ptab_xor); sokoban_ref_suspend(0);
@@ -3853,7 +3921,8 @@ static int           g_task_seed_count = 0;
 /* -------------------------------------------------------------------------
  * --estimate: Knuth random-probe tree-size estimation (see globals above).
  * ------------------------------------------------------------------------- */
-typedef struct { BState st; char path[128]; } LayerNode;
+typedef struct { BState st; char path[4 * PATH_TOK_MAX + 8]; uint8_t key[64]; } LayerNode;   /* key: DFS-order sort key (per level, 63 - generation rank) */
+static int layer_cmp(const void *a, const void *b) { return memcmp(((const LayerNode *)a)->key, ((const LayerNode *)b)->key, 64); }
 
 static void path_append(char *path, size_t cap, int D, int V) {
     size_t n = strlen(path);
@@ -3884,19 +3953,18 @@ static void run_estimate(void) {
     if (g_have_seed_path) {
         BState seed;
         if (!build_seed_path_seed(&seed)) { free(layer); return; }
-        layer[ln].st = seed; layer[ln].path[0] = 0;
-        for (int i = 0; i < g_seed_path_n; i++)   /* prefix = the seed path itself, so LAYER lines are complete --seed-path strings */
-            path_append(layer[ln].path, 128, g_seed_path[i].direction, g_seed_path[i].variant);
+        layer[ln].st = seed; memset(layer[ln].key, 0, 64);
+        path_text(seed.path, seed.plen, layer[ln].path, sizeof layer[ln].path);   /* prefix = the seed path itself */
         ln++;
     } else if (g_task_seeds && g_task_seed_count > 0) {
         for (int i = 0; i < g_task_seed_count; i++) {
             if (ln == lcap) { lcap *= 2; layer = realloc(layer, lcap * sizeof *layer); }
-            layer[ln].st = g_task_seeds[i]; snprintf(layer[ln].path, 128, "task%d.%d", g_only_task, i); ln++;
+            layer[ln].st = g_task_seeds[i]; memset(layer[ln].key, 0, 64); snprintf(layer[ln].path, sizeof layer[ln].path, "task%d.%d", g_only_task, i); ln++;
         }
     } else {
         BState init = { .player_pos = (int8_t)g_exit_pos, .committed_empty = 1ULL << g_exit_pos, .depth = 0,
                         .seg_anchor1 = (int8_t)(g_exit_pos + 1), .seg_len = 0 };
-        layer[ln].st = init; layer[ln].path[0] = 0; ln++;
+        layer[ln].st = init; layer[ln].path[0] = 0; memset(layer[ln].key, 0, 64); ln++;
     }
     int root_depth = layer[0].st.depth;
     int K = root_depth + g_estimate_layer;
@@ -3913,8 +3981,9 @@ static void run_estimate(void) {
             for (int c = 0; c < g_probe_n; c++) {
                 if (nn == ncap) { ncap *= 2; next = realloc(next, ncap * sizeof *next); }
                 next[nn].st = g_probe_buf[c];
-                memcpy(next[nn].path, layer[i].path, 128);
-                path_append(next[nn].path, 128, g_probe_tagD[c], g_probe_tagV[c]);
+                path_text(next[nn].st.path, next[nn].st.plen, next[nn].path, sizeof next[nn].path);
+                memcpy(next[nn].key, layer[i].key, 64);
+                if (d - root_depth < 64) next[nn].key[d - root_depth] = (uint8_t)(63 - c);   /* later-generated = visited earlier */
                 nn++;
             }
         }
@@ -3929,6 +3998,7 @@ static void run_estimate(void) {
            g_exit_pos, K, ln, layer_nodes_seen, layer_checked, t_layer);
     fflush(stdout);
     if (ln == 0) { g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall; free(layer); free(next); return; }
+    qsort(layer, ln, sizeof *layer, layer_cmp);   /* DFS visiting order, so LAYER / dump lines can be cut into --from/--until ranges */
     if (g_list_layer) {
         /* One job per line: seed path, depth, blocks, holes.  Together with the
          * ancestors (all depth < K, none can be a record) these subtrees cover
@@ -4030,6 +4100,79 @@ static void run_estimate(void) {
     g_best_depth = saved_best; g_overall_best_depth = saved_overall;
 }
 
+/* ------------------------------------------------------------------------
+ * DFS-order ranges and checkpoints.
+ *
+ * expand() pushes a node's children in a fixed order (bulk walk-backs first,
+ * then single steps by direction and variant) and the stack pops them in
+ * reverse, so the DFS visits the tree in one fixed order and every node's
+ * path (BState.path) is its position.  Hence:
+ *   CURSOR   the path of the node being expanded when a run stops is a
+ *            complete checkpoint: everything before it is done;
+ *   --from P skip everything visited before P (P's subtree is processed);
+ *   --until Q stop at Q (Q and everything after it belongs to another run).
+ * Implemented at each ancestor of P / Q by dropping the children that lie
+ * on the wrong side of the child leading to P / Q (index in the pushed
+ * segment = generation order; a larger index is visited EARLIER).  If that
+ * child was pruned in this run (dedup), its slot is placed by edge order
+ * instead, keeping all bulk children when the edge is a bulk walk (safe:
+ * more work, never less).  Dedup tables only ever remove a duplicate of
+ * something visited or pending, so restarted runs are exact.
+ * ---------------------------------------------------------------------- */
+static long long g_range_unmatched = 0;
+static FILE *g_trace_visits = NULL;   /* BS_TRACE_VISITS=file: one line per expanded node (its path), in DFS order -- for checking ranges */
+static int edge_key(uint8_t tok) { int D = tok & 3, V = tok >> 2; return D * 4 + (V == 1 ? 0 : V == 4 ? 2 : 1); }
+static int edge_is_bulk(const BState *s, uint8_t tok) {
+    if ((tok >> 2) != 1) return 0;
+    int C = g_adj[s->player_pos][(tok & 3) ^ 2];
+    return C >= 0 && (s->committed_empty >> C & 1) && g_bulk_walk_active && s->depth >= g_bulk_min_depth && !s->bulk_walk;
+}
+static void range_filter(const BState *s, long long t0) {
+    int anc_from  = g_from_n  && s->plen < g_from_n  && !memcmp(s->path, g_from_path,  s->plen);
+    int anc_until = g_until_n && s->plen < g_until_n && !memcmp(s->path, g_until_path, s->plen);
+    if (!anc_from && !anc_until) return;
+    long long n = g_q_tail - t0; if (n <= 0) return;
+    BState *ch = g_queue + t0;
+    long long nbulk = 0; while (nbulk < n && ch[nbulk].bulk_walk) nbulk++;   /* bulk children are pushed first */
+    long long lo = 0, hi = n;   /* keep children [lo, hi) */
+    if (anc_from) {
+        long long m = -1;
+        for (long long i = 0; i < n; i++) if (ch[i].plen <= g_from_n && !memcmp(ch[i].path, g_from_path, ch[i].plen)) { m = i; break; }
+        if (m >= 0) hi = m + 1;
+        else {
+            g_range_unmatched++;
+            if (getenv("BS_DEBUG_RANGE")) {
+                char pb[1100]; path_text(s->path, s->plen, pb, sizeof pb);
+                fprintf(stderr, "[range] --from child not found under '%s' (depth %d, bulk_walk %d): want tok %c%d; %lld children (%lld bulk):", pb, s->depth, s->bulk_walk,
+                        "URDL"[g_from_path[s->plen] & 3], g_from_path[s->plen] >> 2, n, nbulk);
+                for (long long i = 0; i < n; i++) fprintf(stderr, " %c%d/%d", "URDL"[ch[i].path[ch[i].plen - 1] & 3], ch[i].path[ch[i].plen - 1] >> 2, ch[i].plen - s->plen);
+                fprintf(stderr, "\n");
+            }
+            uint8_t tok = g_from_path[s->plen];
+            if (edge_is_bulk(s, tok)) hi = nbulk;   /* every single step was generated after the bulk edge */
+            else { hi = n; for (long long i = nbulk; i < n; i++) if (edge_key(ch[i].path[ch[i].plen - 1]) > edge_key(tok)) { hi = i; break; } }
+        }
+    }
+    if (anc_until) {
+        long long m = -1;
+        for (long long i = 0; i < n; i++) if (ch[i].plen <= g_until_n && !memcmp(ch[i].path, g_until_path, ch[i].plen)) { m = i; break; }
+        if (m >= 0) lo = (ch[m].plen == g_until_n) ? m + 1 : m;   /* Q itself is excluded; an ancestor of Q stays */
+        else {
+            g_range_unmatched++;
+            uint8_t tok = g_until_path[s->plen];
+            if (!edge_is_bulk(s, tok)) { lo = n; for (long long i = nbulk; i < n; i++) if (edge_key(ch[i].path[ch[i].plen - 1]) >= edge_key(tok)) { lo = i; break; } }
+            /* bulk edge with unknown rank: keep everything (overlap, never a gap) */
+        }
+    }
+    if (hi < lo) hi = lo;
+    if (lo > 0 && hi > lo) memmove(ch, ch + lo, (size_t)(hi - lo) * sizeof(BState));
+    g_q_tail = t0 + (hi - lo);
+}
+static void print_cursor(const BState *s) {
+    char buf[4 * PATH_TOK_MAX + 8]; path_text(s->path, s->plen, buf, sizeof buf);
+    printf("CURSOR\t%d\t%s\t%d\n", g_exit_pos, buf, s->depth); fflush(stdout);
+}
+
 static double run_exit_search(double remaining_s, int *out_exhausted, int *out_dedup_full) {
     refresh_canonical_for_exit(g_exit_pos);
     /* Reset per-exit state. */
@@ -4066,6 +4209,8 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0;
     g_ptab_active = g_beam_width == 0 && g_rollout_steps == 0 && !g_no_ptab;
     g_ptab_saved = g_ptab_used = g_ptab_inherited = g_ptab_delta_refs = 0;
+    g_emit_D = -1; g_emit_V = -1;   /* the root gets no edge token */
+    g_range_unmatched = 0;
 
     if (g_have_seed_path) {
         /* Seed-path mode: start from the standard root and replay the
@@ -4140,7 +4285,14 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
          * puzzles whose transit block's mask points into a wall in the
          * final layout.  Each seed carries one block, so it's only valid
          * when --num-blocks allows at least one. */
-        if (g_allow_exit_transit && g_max_blocks >= 1) {
+        /* 2026-09-21: these seeds are exact duplicates of the root's own
+         * new-block push-back children (variant 3 from the root puts the block
+         * on the exit with the same mask, player, committed cells and segment
+         * anchor), and the dedup pruned one copy.  They are no longer pushed:
+         * every node must have ONE path from the root (CURSOR / --from /
+         * --until), and the estimator's layers only ever knew the root's
+         * children.  Equivalence counts are unchanged. */
+        if (0 && g_allow_exit_transit && g_max_blocks >= 1) {
             for (int D = 0; D < 4; D++) {
                 if (!(g_canonical_dir_mask & (1 << D))) continue;
                 int X = g_adj[g_exit_pos][D];
@@ -4310,14 +4462,18 @@ beam_done:
             BState s;
             if (!q_pop(&s)) break;
             if (g_trace_csv || HARVEST_ACTIVE) g_current_parent_id = s.state_id;
+            long long qt0 = g_q_tail;
+            if (g_trace_visits) { char pb[4 * PATH_TOK_MAX + 8]; path_text(s.path, s.plen, pb, sizeof pb); fprintf(g_trace_visits, "%s\n", pb); }
             expand(&s);
+            if (g_from_n || g_until_n) range_filter(&s, qt0);
             /* DFS mode: flush after every expand() — no level boundary to
              * batch larger.  Smaller batches but correct ordering. */
             if (g_nn_surrogate_loaded) flush_surrogate_pending();
             if (g_dedup_full) { exhausted = 0; break; }
+            if (g_stop_requested) { print_cursor(&s); exhausted = 0; break; }   /* checkpoint: resume with --from */
             if (!unlimited && (++iter & 1023) == 0) {
                 clock_gettime(CLOCK_MONOTONIC, &t_now);
-                if (elapsed_s(t0, t_now) >= remaining_s) { exhausted = 0; break; }
+                if (elapsed_s(t0, t_now) >= remaining_s) { print_cursor(&s); exhausted = 0; break; }
             }
         }
     }
@@ -4481,6 +4637,10 @@ static void print_usage(const char *prog) {
         "                          heaviest layer nodes as --seed-path strings for splitting.\n"
         "                          Honours --exit/--task-id/--seed-path and every search cap.\n"
         "  --estimate-depth K    layer depth for --estimate (default 6).\n"
+        "  --from PATH           skip everything the DFS visits before the node with this path\n"
+        "                          (a CURSOR line, or a layer path); PATH's own subtree is searched.\n"
+        "  --until PATH          stop at that node: it and everything after it belong to another run.\n"
+        "                          Ctrl-C / --time print a CURSOR line to resume from with --from.\n"
         "  --estimate-dump FILE  append one TSV line per layer node (exit, seed path, depth, blocks,\n"
         "                          holes, est. accepted nodes, est. seconds, SE) for chunk planning.\n"
         "  --list-layer K        print the dedup'd depth-K layer, one LAYER line per node\n"
@@ -4528,6 +4688,8 @@ static int parse_grid(const char *s) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGINT, on_stop_signal); signal(SIGTERM, on_stop_signal);
+    if (getenv("BS_TRACE_VISITS")) g_trace_visits = fopen(getenv("BS_TRACE_VISITS"), "w");
     /* Seed rand() so --stochastic produces a different sequence per run.
      * Mixes wall-clock and PID so multi-worker ensembles diverge. */
     srand((unsigned)(time(NULL) ^ (long)getpid()));
@@ -4937,6 +5099,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--list-layer") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --list-layer requires K\n"); return 1; }
             g_estimate_layer = atoi(argv[i]); g_list_layer = 1; g_estimate_probes = 1;
+        } else if (strcmp(argv[i], "--from") == 0 || strcmp(argv[i], "--until") == 0) {
+            int is_from = strcmp(argv[i], "--from") == 0;
+            if (++i >= argc) { fprintf(stderr, "%s needs a path\n", argv[i - 1]); return 2; }
+            if (!path_parse(argv[i], is_from ? g_from_path : g_until_path, is_from ? &g_from_n : &g_until_n)) {
+                fprintf(stderr, "error: %s must be a path like U2,R1,L3 (max %d tokens)\n", argv[i - 1], PATH_TOK_MAX); return 2;
+            }
         } else if (strcmp(argv[i], "--estimate-dump") == 0) {
             if (++i >= argc) { fprintf(stderr, "--estimate-dump needs a file\n"); return 2; }
             g_estimate_dump = argv[i];
@@ -5426,7 +5594,9 @@ int main(int argc, char **argv) {
 
         printf("--- Exit %d (%s) ---\n", g_exit_pos,
                dedup_full ? "dedup table full"
-                          : (exhausted ? "exhausted" : "time cap"));
+                          : (exhausted ? "exhausted" : g_stop_requested ? "interrupted" : "time cap"));
+        if (g_from_n || g_until_n) printf("  range:          %s%s (%lld cut points not found in this run, placed by edge order)\n",
+                                          g_from_n ? "from given" : "from start", g_until_n ? ", until given" : ", to end", g_range_unmatched);
         printf("  elapsed:        %.3f s\n", exit_elapsed);
         printf("  states checked: %lld (shortcut %lld, dedup %lld",
                g_states_checked, g_pruned_short, g_pruned_dedup);

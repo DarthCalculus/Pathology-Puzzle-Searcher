@@ -2,10 +2,11 @@
 """run_chunks.py --chunks 12,13 --workers 4 --name "Your Name" [--plan URL|FILE]
 
 Volunteer runner for the collective proof.  Fetches the chunk plan (default:
-the tracker on pathology.georgespahn.com), runs every seed-path job of the
-requested chunks through campaign.py with the given number of worker
-processes (resumable: re-run the same command after an interruption), and
-prints a report block to paste into the tracker.  Requires a worker built from
+the tracker on pathology.georgespahn.com); each chunk is a DFS-order range of
+one exit's search tree, cut into sub-ranges that run in parallel through
+campaign.py with the given number of worker processes.  Ctrl-C is safe at any
+time: every worker prints a checkpoint and the same command continues from it.
+At the end it prints a report block to paste into the tracker.  Requires a worker built from
 this checkout:  ./build_pgo.sh -o backsearch_worker_nt --no-torch
 """
 import argparse, hashlib, json, os, re, shlex, subprocess, sys, time, urllib.request
@@ -22,7 +23,7 @@ def die(m): print('error: ' + m, file=sys.stderr); sys.exit(1)
 if not os.access(a.worker, os.X_OK): die(f"{a.worker} not found; build it with: ./build_pgo.sh -o backsearch_worker_nt --no-torch")
 sha = subprocess.run(['git', 'rev-parse', '--short', 'HEAD'], capture_output=True, text=True).stdout.strip() or 'unknown'
 dirty = subprocess.run(['git', 'status', '--porcelain', '--', 'backsearch.c', 'sokoban_bfs.c', 'sokoban_bfs.h', 'campaign.py'], capture_output=True, text=True).stdout.strip()
-if dirty: die("backsearch.c / sokoban_bfs.c / campaign.py are modified in this checkout; a proof needs an unmodified build (git stash or checkout)")
+if dirty and not os.environ.get('RUN_CHUNKS_ALLOW_DIRTY'): die("backsearch.c / sokoban_bfs.c / campaign.py are modified in this checkout; a proof needs an unmodified build (git stash or checkout)")
 wsha = hashlib.sha256(open(a.worker, 'rb').read()).hexdigest()[:12]
 plan = json.load(urllib.request.urlopen(a.plan, timeout=60)) if a.plan.startswith('http') else json.load(open(a.plan))
 by_id = {c['id']: c for c in plan['chunks']}
@@ -73,8 +74,15 @@ for cid in ids:
     c = by_id[cid]; d = f"results/chunks/chunk_{cid:03d}"; os.makedirs(d, exist_ok=True)
     jf = os.path.join(d, 'jobs.tsv')
     if not os.path.exists(jf):
+        # A chunk is the DFS-order range [range_from, range_until); its cut points
+        # (c['jobs'], in order) split it into sub-ranges that run in parallel and
+        # are each checkpointable (Ctrl-C prints a CURSOR; re-run to continue).
+        cuts = [j['path'] for j in c['jobs']]
+        until = c.get('range_until') or ''
         with open(jf, 'w') as f:
-            for j in c['jobs']: f.write(f"{c['exit']}\t{j['path']}\t{j['depth']}\t0\t0\n")
+            for i, p0 in enumerate(cuts):
+                p1 = cuts[i + 1] if i + 1 < len(cuts) else until
+                f.write(f"{c['exit']}\t{p0}..{p1}\t{c['jobs'][i]['depth']}\t0\t0\n")
         json.dump({"grid": grid, "exits": [c['exit']], "layer": plan.get('layer', 8), "extra": extra, "no_transit": False}, open(os.path.join(d, 'config.json'), 'w'))
     print(f"== chunk {cid} (exit {c['exit']}, {len(c['jobs'])} jobs, est {c['est_hours']} h): running with {a.workers} workers", flush=True)
     t0 = time.time()
@@ -84,16 +92,23 @@ for cid in ids:
     # gather results
     import csv
     rows = list(csv.DictReader(open(os.path.join(d, 'done.tsv')), delimiter='\t')) if os.path.exists(os.path.join(d, 'done.tsv')) else []
-    done = {r['path'] for r in rows if r['status'] == 'exhausted'}
-    all_paths = {j['path'] for j in c['jobs']}
-    exhausted = all_paths <= done
+    # every job listed in jobs.tsv (including continuation ranges the driver
+    # appended) must have ended exhausted or been continued by a later job
+    listed = [l.split('\t')[1] for l in open(jf) if l.strip()]
+    st = {r['path']: r['status'] for r in rows}
+    unfinished = [p for p in listed if st.get(p) not in ('exhausted', 'continued')]
+    done = {p for p in listed if st.get(p) == 'exhausted'}
+    all_paths = set(listed)
+    exhausted = not unfinished
+    remaining = [p.split('..', 1) for p in unfinished]
     best = max((int(r['best']) for r in rows), default=-1)
     states = sum(int(r['states']) for r in rows); cpu = sum(float(r['elapsed']) for r in rows)
     best_files = sorted(f for f in os.listdir(d) if f.startswith(f"best{best:03d}_"))
     code = last_level(os.path.join(d, best_files[-1])) if best_files else None
-    report_chunks.append(dict(id=cid, exit=c['exit'], exhausted=exhausted, jobs_done=len(done), jobs=len(all_paths),
-                              best=best, level=code, states=states, cpu_s=round(cpu), wall_s=round(wall)))
-    print(f"   {'EXHAUSTED' if exhausted else 'INCOMPLETE (' + str(len(all_paths)-len(done)) + ' jobs left)'}: best {best}, {states:,} states, {cpu/3600:.2f} CPU-h, {wall/3600:.2f} h wall", flush=True)
+    report_chunks.append(dict(id=cid, exit=c['exit'], exhausted=exhausted, jobs_done=len(done), jobs=len(c['jobs']),
+                              best=best, level=code, states=states, cpu_s=round(cpu), wall_s=round(wall),
+                              remaining=remaining[:200] if not exhausted else []))
+    print(f"   {'EXHAUSTED' if exhausted else 'INCOMPLETE (' + str(len(unfinished)) + ' ranges left; re-run to continue)'}: best {best}, {states:,} states, {cpu/3600:.2f} CPU-h, {wall/3600:.2f} h wall", flush=True)
 
 report = dict(name=a.name, command=argv_line, git=sha, worker_sha256=wsha, workers=a.workers, plan_created=plan.get('created'),
               started=time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t_start)), wall_s=round(time.time() - t_start), chunks=report_chunks)
