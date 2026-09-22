@@ -545,6 +545,40 @@ static int walk_dist_bits(uint64_t passable, int from, int to) {
     return 127;
 }
 static long long g_pruned_walkseg = 0;
+static long long g_pruned_exitstuck = 0;   /* block-on-exit states whose exit block can never be pulled off (see exit_block_stuck) */
+static long long g_accepted_valid = 0;     /* accepted states with no block on the exit: the levels the search actually produces */
+static int g_exit_block_prune = 1;         /* --no-exit-block-prune */
+
+/* A state with a block on the exit is not a level; it only leads to levels
+ * through a later backward push-back of that block off the exit (block exit ->
+ * P, player lands on C beyond P).  Going backward, blocks and holes are never
+ * removed and fixed walls / the grid edge never change, so a block whose every
+ * pull needs a cell that is off-grid, a fixed wall, a hole, or a block that is
+ * itself stuck can never move again.  Mutual locks (e.g. blocks on 6, 8, 16, 18
+ * of a 5x5) are caught by starting from "all blocks stuck" and un-sticking any
+ * block with a pull whose two cells are not permanently obstructed, to a
+ * fixpoint.  Uncommitted cells may still become floor, so they count as free.
+ * Returns 1 if the exit block is stuck: the whole subtree contains no level. */
+static int exit_block_stuck(const BState *s) {
+    uint64_t blk = 0, hol = 0; int on_exit = 0;
+    for (int i = 0; i < s->nblocks; i++) { blk |= 1ULL << s->block_pos[i]; if (s->block_pos[i] == g_exit_pos) on_exit = 1; }
+    if (!on_exit) return 0;
+    for (int i = 0; i < s->nholes; i++) hol |= 1ULL << s->hole_pos[i];
+    const uint64_t perm = hol | (g_active_mask & ~g_walkable_mask);   /* permanently unusable cells */
+    uint64_t stuck = blk;
+    for (int changed = 1; changed; ) {
+        changed = 0;
+        for (uint64_t t = stuck; t; t &= t - 1) {
+            int x = __builtin_ctzll(t);
+            for (int d = 0; d < 4; d++) {
+                int P = g_adj[x][d]; if (P < 0 || !(g_walkable_mask >> P & 1) || (perm >> P & 1) || (stuck >> P & 1)) continue;
+                int C = g_adj[P][d]; if (C < 0 || !(g_walkable_mask >> C & 1) || (perm >> C & 1) || (stuck >> C & 1)) continue;
+                stuck &= ~(1ULL << x); changed = 1; break;
+            }
+        }
+    }
+    return (int)(stuck >> g_exit_pos & 1);
+}
 
 static BState g_probe_buf[64];   /* --estimate: children of the node being probed */
 
@@ -2004,6 +2038,12 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         harvest_emit(s, sid, 'X', -99);
         return;
     }
+    /* A block sits on the exit and can never be pulled off: no level below here. */
+    if (g_exit_block_prune && !g_allow_block_on_exit && exit_block_stuck(s)) {
+        g_pruned_short++; g_pruned_exitstuck++;
+        harvest_emit(s, sid, 'X', -99);
+        return;
+    }
     /* --place-holes: enforce each hole-placement constraint.  Holes are
      * non-decreasing with depth in the backward search, so a state at depth
      * >= D still short of its quota never places them in time — prune it. */
@@ -2119,6 +2159,7 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         }
     }
     harvest_emit(s, sid, 'A', -1);
+    { int bx = 0; for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) { bx = 1; break; } if (!bx) g_accepted_valid++; }
     BState ns = *s;
     ns.branch_factor = g_last_peak_heap;
     if (g_emit_D >= 0) path_push(&ns, g_emit_D, g_emit_V);   /* single-step edge; bulk children (g_emit_D < 0) carry their walk already */
@@ -4199,7 +4240,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         memset(g_visited, 0, HASH_CAP * sizeof *g_visited);
     }
     g_visited_count  = 0;
-    g_pruned_walkseg = 0;
+    g_pruned_walkseg = 0; g_pruned_exitstuck = 0; g_accepted_valid = 0;
     g_q_tail         = 0;
     g_q_peak         = 0;
     g_best_depth     = 0;
@@ -5116,6 +5157,8 @@ int main(int argc, char **argv) {
             if (!path_parse(argv[i], is_from ? g_from_path : g_until_path, is_from ? &g_from_n : &g_until_n)) {
                 fprintf(stderr, "error: %s must be a path like U2,R1,L3 (max %d tokens)\n", argv[i - 1], PATH_TOK_MAX); return 2;
             }
+        } else if (strcmp(argv[i], "--no-exit-block-prune") == 0) {
+            g_exit_block_prune = 0;
         } else if (strcmp(argv[i], "--estimate-dump") == 0) {
             if (++i >= argc) { fprintf(stderr, "--estimate-dump needs a file\n"); return 2; }
             g_estimate_dump = argv[i];
@@ -5631,6 +5674,7 @@ int main(int argc, char **argv) {
 #endif
         printf("  accepted:       %lld  (walk-segment pruned before check: %lld)\n",
                g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_cap - g_pruned_axis, g_pruned_walkseg);
+        printf("  valid levels:   %lld  (block-on-exit states pruned as permanently stuck: %lld)\n", g_accepted_valid, g_pruned_exitstuck);
         if (g_ptab_active) printf("  parent tables:  %lld saved, %lld used as reference (%lld with a puzzle delta), %lld states inherited an ancestor's; peak %lld live tables, %.1f MB\n", g_ptab_saved, g_ptab_used, g_ptab_delta_refs, g_ptab_inherited, g_ptab_live_peak, g_ptab_live_slots_peak * 12.0 / 1048576);
 #ifdef REF_CHECK
         printf("  REF_CHECK:      %lld referenced checks re-run, %lld decision mismatches\n", g_refchk_n, g_refchk_bad);

@@ -50,7 +50,7 @@ cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ./backsearch_worker --grid 5x5 --two-tables --exit 0 --num-holes 1 --num-blocks 3 --time 55
 # no-transit exit 7, ~9 s:            accepted 2877948,  best depth 43
 ./backsearch_worker --grid 5x5 --two-tables --exit 7 --time 55
-# REAL RULES (transit), ~40 s:         accepted 2292601,  best depth 58   (2292598 before 2026-09-21: the root's push-off-exit children are now ordinary counted children)
+# REAL RULES (transit), ~40 s:         accepted 2286977 (2292601 with --no-exit-block-prune), valid levels 473037, best depth 58
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 7 --num-blocks 3 --time 55
 # REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 5279939, best depth 58   (was 5279938, same reason)
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 12 --num-blocks 4 --time 0
@@ -144,6 +144,21 @@ walk is admissible).  Exact, but it prunes only 1-2% of pops on 5x5 and costs
 ~25% per solve; kept behind `-DHOLEBOUND`.
 
 Exact pruning/solver changes so far (2026-09-14): small L2 solver table with big-table fallback; A* walk-distance bound; slack-0 pop skip and depth-limited walk BFS; shortest-walk-segment prune before the solver call (generalises the anti-wiggle rule; ~3% of solver calls on deep configs); decision mode (`sokoban_set_decision_only`: return on the first solution within the cutoff, queue ordered by g + h; ~16% fewer solver states; off automatically when `--harvest`/`--trace-csv`/`--bf-dump` need exact lengths — `solvebench --decision` replays it).
+
+**Permanently stuck exit block (2026-09-22; `--no-exit-block-prune` to disable).**
+A state with a block on the exit is not a level; it leads to levels only through a
+later backward push-back of that block off the exit, which needs the cell it moves
+to and the cell the player lands on to be free.  Going backward, blocks and holes
+are never removed and the grid edge / fixed walls never change, so a block whose
+every pull needs an off-grid, fixed-wall, hole, or itself-stuck cell can never
+move (mutual locks such as blocks on 6, 8, 16, 18 of a 5x5 are found by
+un-sticking from "all stuck" to a fixpoint; uncommitted cells count as free).
+Such states are pruned before the solver call.  The summary now prints
+`valid levels` (accepted states with no block on the exit), which is the
+invariant to compare across this prune: unchanged on every config, best depths
+unchanged; accepted drops 0.25% (exit 7 <= 3 blocks) to 2.3% (the depth-36
+seed of the 149).  Note the proportions: on that seed only 4,789 of 185,569
+accepted states are levels; the rest carry a block on the exit.
 
 ## DFS-order ranges, checkpoints and chunks (2026-09-21)
 
