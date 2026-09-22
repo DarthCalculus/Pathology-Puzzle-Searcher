@@ -52,11 +52,12 @@ def list_layer(worker, exits, K, grid, extra):
 
 RE_HDR   = re.compile(r"^--- Exit (\d+) \((.*?)\) ---", re.M)
 RE_CUR   = re.compile(r"^CURSOR\t(\d+)\t([^\t]*)\t(\d+)", re.M)
+RE_FRONT = re.compile(r"^FRONTIER\t([^\t\n]*)$", re.M)
 STOP = {"flag": False}
-RUNNING = {}   # pid -> Popen of a worker in flight (to forward SIGINT)
+RUNNING = {}   # pid -> (Popen, start time, job) of a worker in flight (to forward SIGINT / split when cores idle)
 def on_sigint(sig, frame):
     STOP["flag"] = True
-    for p in list(RUNNING.values()):
+    for p, _, _ in list(RUNNING.values()):
         try: p.send_signal(signal.SIGINT)
         except Exception: pass
     print("\n  ** stop requested: waiting for the running workers to checkpoint (CURSOR) ...", flush=True)
@@ -77,7 +78,7 @@ def run_job(worker, grid, exit_pos, path, extra, timeout=None):
     cmd = [worker, "--grid", grid, "--two-tables", "--exit", str(exit_pos)] + job_args(path) + ["--time", "0"] + extra
     t0 = time.time()
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    RUNNING[p.pid] = p
+    RUNNING[p.pid] = (p, t0, path)
     try:
         try:
             out, err = p.communicate(timeout=timeout)
@@ -102,6 +103,7 @@ def run_job(worker, grid, exit_pos, path, extra, timeout=None):
                elapsed=round(float(RE_EL.search(out).group(1)), 3) if RE_EL.search(out) else round(wall, 3),
                wall=round(wall, 3))
     rec["cursor"] = cm.group(2) if cm else None
+    rec["frontier"] = RE_FRONT.findall(out) if cm else []
     return rec, out, err
 
 def list_children(worker, grid, exit_pos, path, extra, k):
@@ -168,6 +170,8 @@ def main():
     ap.add_argument("--save-depth", type=int, default=100, help="keep full worker output for jobs reaching this depth")
     ap.add_argument("--split-after", type=float, default=0, help="seconds; a job still running after this is checkpointed (SIGINT -> CURSOR) and continued as a range job from the cursor (default 0 = never)")
     ap.add_argument("--split-k", type=int, default=3)
+    ap.add_argument("--split-idle", action="store_true", help="when cores are idle and the queue is empty, checkpoint the longest-running job and split its remainder (from its pending stack) into parallel ranges")
+    ap.add_argument("--split-min-age", type=float, default=60, help="seconds a job must have run before --split-idle may checkpoint it")
     ap.add_argument("--no-transit", action="store_true", help="omit --allow-exit-transit (NOT the Pathology rule set; restricted class only)")
     a = ap.parse_args()
     extra = a.extra.split()
@@ -236,21 +240,30 @@ def main():
                                 timeout=(a.split_after if a.split_after > 0 else None))
         nonlocal best_seen
         if rec["status"] == "continued":
-            # checkpointed: the rest of this job is the range [cursor, until)
+            # checkpointed: the rest of this job is the range [cursor, until).  The
+            # worker's pending stack (FRONTIER, in DFS order) gives cut points, so
+            # when cores are idle the remainder is split into parallel ranges.
             until = path.split("..", 1)[1] if ".." in path else ""
-            cont = (ex, f"{rec['cursor']}..{until}", j[2], j[3], j[4])
             with lock:
-                with open(jobs_file, "a") as f: f.write("\t".join(map(str, cont)) + "\n")
-                jobs.append(cont)
-                if not STOP["flag"]: jq.appendleft(cont)   # keep going now, or leave it for the next run
+                want = max(1, desired() - active[0] + 1) if a.split_idle else 1
+                front = rec.get("frontier") or []
+                cuts = [front[int(k * len(front) / want)] for k in range(1, want)] if want > 1 and front else []
+                cuts = [c for c in cuts if c and c != rec["cursor"] and c != until]
+                bounds = [rec["cursor"]] + cuts + [until]
+                conts = [(ex, f"{bounds[k]}..{bounds[k + 1]}", j[2], j[3], j[4]) for k in range(len(bounds) - 1)]
+                with open(jobs_file, "a") as f:
+                    for c in conts: f.write("\t".join(map(str, c)) + "\n")
+                jobs.extend(conts)
+                if not STOP["flag"]:
+                    for c in reversed(conts): jq.appendleft(c)   # run the pieces next, in DFS order
                 done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()
                 n_done[0] += 1; cpu[0] += rec["elapsed"]
                 if rec["best"] > best_seen: best_seen = rec["best"]
                 if rec["best"] >= a.save_depth:
                     tag = f"best{rec['best']:03d}_e{ex}_{path.replace(',', '').replace('..', '__')[:80]}"
                     with open(os.path.join(a.out, tag + ".txt"), "w") as f: f.write(" ".join([a.worker] + extra) + "\n" + out)
-                print(f"  >> checkpointed exit {ex} {path} after {rec['wall']}s (best {rec['best']}, {rec['states']:,} states); "
-                      f"continues as {cont[1][:60]}{'...' if len(cont[1]) > 60 else ''}", flush=True)
+                print(f"  >> checkpointed exit {ex} {path[:50]}{'...' if len(path) > 50 else ''} after {rec['wall']}s (best {rec['best']}, {rec['states']:,} states); "
+                      f"continues as {len(conts)} range{'s' if len(conts) != 1 else ''}", flush=True)
             return
         with lock:
             done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()
@@ -299,7 +312,22 @@ def main():
             finally:
                 with lock: active[0] -= 1
     signal.signal(signal.SIGINT, on_sigint); signal.signal(signal.SIGTERM, on_sigint)
-    threads = [threading.Thread(target=runner, daemon=True) for _ in range(8)]
+    def splitter():
+        """--split-idle: with idle cores and nothing queued, checkpoint the oldest running job so its remainder is split."""
+        poked = set()
+        while True:
+            time.sleep(3)
+            with lock:
+                if STOP["flag"]: return
+                if jq or active[0] == 0 or active[0] >= desired(): continue
+                cands = [(t0, pid, p) for pid, (p, t0, _) in RUNNING.items() if pid not in poked and time.time() - t0 >= a.split_min_age]
+            if not cands: continue
+            t0, pid, p = min(cands)
+            poked.add(pid)
+            try: p.send_signal(signal.SIGINT)
+            except Exception: pass
+    if a.split_idle: threading.Thread(target=splitter, daemon=True).start()
+    threads = [threading.Thread(target=runner, daemon=True) for _ in range(64)]   # concurrency is desired() (the workers file), threads are cheap
     for t in threads: t.start()
     for t in threads: t.join()
     done_f.close()

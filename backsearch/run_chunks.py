@@ -99,7 +99,7 @@ for cid in ids:
     print(f"== chunk {cid} (exit {c['exit']}, {len(c['jobs'])} jobs, est {c['est_hours']} h): running with {a.workers} workers", flush=True)
     t0 = time.time()
     child = subprocess.Popen([sys.executable, 'campaign.py', '--out', d, '--exits', str(c['exit']), '--extra', ' '.join(extra),
-                              '--workers', str(a.workers), '--worker', a.worker, '--shuffle'],
+                              '--workers', str(a.workers), '--worker', a.worker, '--shuffle', '--split-idle'],
                              stdout=open(os.path.join(d, 'driver.out'), 'a'), stderr=subprocess.STDOUT)
     STOP["child"] = child
     while child.poll() is None:

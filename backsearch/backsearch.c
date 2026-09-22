@@ -4168,9 +4168,20 @@ static void range_filter(const BState *s, long long t0) {
     if (lo > 0 && hi > lo) memmove(ch, ch + lo, (size_t)(hi - lo) * sizeof(BState));
     g_q_tail = t0 + (hi - lo);
 }
+/* Checkpoint: the node being expanded, then the pending stack from the top
+ * down -- that is the remaining work in DFS order (this node's subtree, then
+ * each pending node's subtree), so any of those paths is a valid cut point
+ * for splitting the remainder into parallel ranges.  At most ~4000 FRONTIER
+ * lines (evenly sampled) to keep the output small. */
 static void print_cursor(const BState *s) {
     char buf[4 * PATH_TOK_MAX + 8]; path_text(s->path, s->plen, buf, sizeof buf);
-    printf("CURSOR\t%d\t%s\t%d\n", g_exit_pos, buf, s->depth); fflush(stdout);
+    printf("CURSOR\t%d\t%s\t%d\n", g_exit_pos, buf, s->depth);
+    long long n = g_q_tail, step = n > 4000 ? (n + 3999) / 4000 : 1;
+    for (long long i = n - 1; i >= 0; i -= step) {
+        path_text(g_queue[i].path, g_queue[i].plen, buf, sizeof buf);
+        printf("FRONTIER\t%s\n", buf);
+    }
+    fflush(stdout);
 }
 
 static double run_exit_search(double remaining_s, int *out_exhausted, int *out_dedup_full) {

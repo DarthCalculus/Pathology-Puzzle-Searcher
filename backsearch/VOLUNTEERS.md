@@ -65,6 +65,22 @@ rough: some will finish in minutes, a few may run for days.
   `backsearch.c`, `sokoban_bfs.c` or `campaign.py`, and `git pull` before a
   new sign-up is a good habit (rebuild after pulling).
 
+## Keeping up to date
+
+The tools improve while the search runs. Before signing up for new chunks,
+and whenever the tracker asks for it, update and rebuild:
+
+```bash
+git pull
+./build_pgo.sh -o backsearch_worker_nt --no-torch
+```
+
+A running command can be Ctrl-C'd, the checkout updated, and the same
+command re-run; the checkpoints carry over. (Since 2026-09-22 the runner
+splits a long job across idle cores automatically; that needs the rebuilt
+worker, so a run that uses only one core near the end means the worker is
+out of date.)
+
 ## 4. Report
 
 When the command finishes it prints a block between
