@@ -258,10 +258,13 @@ def main():
                     for c in reversed(conts): jq.appendleft(c)   # run the pieces next, in DFS order
                 done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()
                 n_done[0] += 1; cpu[0] += rec["elapsed"]
-                if rec["best"] > best_seen: best_seen = rec["best"]
-                if rec["best"] >= a.save_depth:
+                # keep the worker output whenever it holds a new campaign best (same rule as a
+                # finished job): the level found before a checkpoint is not found again by the
+                # continuation, so this is its only record
+                if rec["best"] >= a.save_depth or rec["best"] > best_seen:
                     tag = f"best{rec['best']:03d}_e{ex}_{path.replace(',', '').replace('..', '__')[:80]}"
                     with open(os.path.join(a.out, tag + ".txt"), "w") as f: f.write(" ".join([a.worker] + extra) + "\n" + out)
+                if rec["best"] > best_seen: best_seen = rec["best"]
                 print(f"  >> checkpointed exit {ex} {path[:50]}{'...' if len(path) > 50 else ''} after {rec['wall']}s (best {rec['best']}, {rec['states']:,} states); "
                       f"continues as {len(conts)} range{'s' if len(conts) != 1 else ''}", flush=True)
             return

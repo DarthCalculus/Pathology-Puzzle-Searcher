@@ -85,12 +85,12 @@ for cid in ids:
     if STOP["flag"]: break
     c = by_id[cid]; d = f"results/chunks/chunk_{cid:03d}"; os.makedirs(d, exist_ok=True)
     jf = os.path.join(d, 'jobs.tsv')
+    # A chunk is the DFS-order range [range_from, range_until); its cut points
+    # (c['jobs'], in order) split it into sub-ranges that run in parallel and
+    # are each checkpointable (Ctrl-C prints a CURSOR; re-run to continue).
+    cuts = [j['path'] for j in c['jobs']]
+    until = c.get('range_until') or ''
     if not os.path.exists(jf):
-        # A chunk is the DFS-order range [range_from, range_until); its cut points
-        # (c['jobs'], in order) split it into sub-ranges that run in parallel and
-        # are each checkpointable (Ctrl-C prints a CURSOR; re-run to continue).
-        cuts = [j['path'] for j in c['jobs']]
-        until = c.get('range_until') or ''
         with open(jf, 'w') as f:
             for i, p0 in enumerate(cuts):
                 p1 = cuts[i + 1] if i + 1 < len(cuts) else until
@@ -123,7 +123,9 @@ for cid in ids:
     states = sum(int(r['states']) for r in rows); cpu = sum(float(r['elapsed']) for r in rows)
     best_files = sorted(f for f in os.listdir(d) if f.startswith(f"best{best:03d}_"))
     code = last_level(os.path.join(d, best_files[-1])) if best_files else None
-    report_chunks.append(dict(id=cid, exit=c['exit'], exhausted=exhausted, jobs_done=len(done), jobs=len(c['jobs']),
+    orig = {j['path'] for j in c['jobs']}
+    orig_done = sum(1 for p in orig if st.get(f"{p}..{cuts[cuts.index(p) + 1] if cuts.index(p) + 1 < len(cuts) else until}") in ('exhausted', 'continued')) if not exhausted else len(orig)
+    report_chunks.append(dict(id=cid, exit=c['exit'], exhausted=exhausted, jobs_done=orig_done, jobs=len(c['jobs']),
                               best=best, level=code, states=states, cpu_s=round(cpu), wall_s=round(wall),
                               remaining=remaining[:200] if not exhausted else []))
     print(f"   {'EXHAUSTED' if exhausted else 'INCOMPLETE (' + str(len(unfinished)) + ' ranges left; re-run to continue)'}: best {best}, {states:,} states, {cpu/3600:.2f} CPU-h, {wall/3600:.2f} h wall", flush=True)
