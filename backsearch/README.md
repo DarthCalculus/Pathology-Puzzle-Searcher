@@ -1,5 +1,7 @@
 # backsearch
 
+**Collective search (2026-09):** volunteers run `python3 v2/volunteer.py --name "You" --workers N`; see [v2/README.md](v2/README.md).
+
 Backward-DFS Sokoban puzzle generator with task-partitioned parallelism.
 
 ## What's here

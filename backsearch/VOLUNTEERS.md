@@ -1,3 +1,9 @@
+> **September 2026: the chunk tracker described below is retired.** The search
+> restarted with a new client: one command fetches jobs from the server, hands
+> unfinished work back exactly when you stop, and reports automatically. See
+> [v2/README.md](v2/README.md) and https://pathology.georgespahn.com/collective.html.
+> `run_chunks.py` no longer works with the server.
+
 # Helping with the collective proof
 
 The tracker at https://pathology.georgespahn.com (Proofs tab) splits one
