@@ -36,6 +36,9 @@ while [ $# -gt 0 ]; do
 done
 
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "")
+# Source hash for the v2 job protocol (v2/DESIGN.md): sha256 of the search sources,
+# independent of compiler/PGO so every honest build of the same code agrees.
+SRC_HASH=$(cat backsearch.c sokoban_bfs.c sokoban_bfs.h | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-64)
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -71,7 +74,7 @@ EOF
   NN_OBJ="$TMP/nn_stub.o"
 fi
 
-CFLAGS="-O3 -DGIT_SHA_STR=\"$SHA\""
+CFLAGS="-O3 -DGIT_SHA_STR=\"$SHA\" -DSRC_HASH_STR=\"$SRC_HASH\""
 LIBS="-lz -lm"
 
 # --- compiler family: clang (macOS, or clang on Linux) vs GCC ------------------

@@ -214,7 +214,10 @@ def main():
 
     done = status(a.out, jobs)
     if a.status: return
-    todo = [j for j in jobs if (j[0], j[1]) not in done]
+    # A row whose status is neither exhausted nor split/continued (e.g. "rc=-2":
+    # the worker was killed before it could checkpoint) is NOT done: rerun it.
+    TERMINAL = ("exhausted", "split", "continued")
+    todo = [j for j in jobs if (j[0], j[1]) not in done or done[(j[0], j[1])]["status"] not in TERMINAL]
     if a.shuffle: random.Random(1).shuffle(todo)
     # Children of split jobs (deeper seeds than the layer) go FIRST, so the
     # heavy subtrees a split exposes are finished promptly instead of piling
@@ -243,9 +246,16 @@ def main():
             # checkpointed: the rest of this job is the range [cursor, until).  The
             # worker's pending stack (FRONTIER, in DFS order) gives cut points, so
             # when cores are idle the remainder is split into parallel ranges.
-            until = path.split("..", 1)[1] if ".." in path else ""
+            frm, until = path.split("..", 1) if ".." in path else ("", "")
+            cur = rec["cursor"]
+            # Interrupted during the descent to FROM (the cursor is an ancestor of
+            # FROM, i.e. a proper token-prefix): nothing of the range was done, so
+            # the continuation is the original range, unsplit.
+            ct, ft = ([t for t in cur.split(",") if t], [t for t in frm.split(",") if t])
+            in_descent = frm and len(ct) < len(ft) and ft[:len(ct)] == ct
+            if in_descent: rec["cursor"] = frm
             with lock:
-                want = max(1, desired() - active[0] + 1) if a.split_idle else 1
+                want = 1 if in_descent else (max(1, desired() - active[0] + 1) if a.split_idle else 1)
                 front = rec.get("frontier") or []
                 cuts = [front[int(k * len(front) / want)] for k in range(1, want)] if want > 1 and front else []
                 cuts = [c for c in cuts if c and c != rec["cursor"] and c != until]
@@ -267,6 +277,13 @@ def main():
                 if rec["best"] > best_seen: best_seen = rec["best"]
                 print(f"  >> checkpointed exit {ex} {path[:50]}{'...' if len(path) > 50 else ''} after {rec['wall']}s (best {rec['best']}, {rec['states']:,} states); "
                       f"continues as {len(conts)} range{'s' if len(conts) != 1 else ''}", flush=True)
+            return
+        if rec["status"] != "exhausted":
+            # killed before its checkpoint (or crashed): nothing to record; put the
+            # job back so the range is searched, unless we are stopping anyway
+            with lock:
+                if not STOP["flag"]: jq.appendleft(j)
+                print(f"  !! worker for exit {ex} {path[:60]} ended with '{rec['status']}' and no checkpoint -> re-queued", flush=True)
             return
         with lock:
             done_f.write("\t".join(str(rec[c]) for c in COLS) + "\n"); done_f.flush()

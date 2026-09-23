@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pathology volunteer</title>
+<style>
+  /* palette and tile rules copied from PathologyRecords/server/public/style.css */
+  :root {
+    --bg: rgb(38, 38, 38);
+    --panel: rgb(50, 50, 50);
+    --panel2: rgb(64, 64, 64);
+    --text: #ffffff;
+    --muted: rgb(180, 180, 180);
+    --accent: rgb(90, 160, 255);
+    --good: rgb(0, 200, 0);
+    --bad: rgb(255, 50, 50);
+    --warn: rgb(240, 180, 40);
+    --level-block: rgb(0, 0, 0);
+    --level-block-border: rgb(183, 119, 57);
+    --level-end: rgb(229, 229, 229);
+    --level-grid: rgb(14, 168, 117);
+    --level-grid-used: rgb(4, 110, 80);
+    --level-grid-text: rgb(0, 0, 0);
+    --level-hole: rgb(65, 65, 65);
+    --level-hole-border: rgb(106, 106, 106);
+    --level-player: rgb(244, 114, 182);
+    --level-wall: rgb(38, 38, 38);
+    --level-unknown: rgb(120, 120, 120);
+  }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { padding: 16px 20px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 14px; font-size: 13px; }
+  .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
+  .panel { background: var(--panel); border-radius: 10px; padding: 14px 18px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  label { color: var(--muted); font-size: 13px; }
+  input[type=text] { background: var(--panel2); color: var(--muted); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 4px 8px; width: 180px; }
+  input[type=number] { width: 60px; background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 3px 6px; }
+  button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
+  button.secondary { background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); font-weight: 500; }
+  button.danger { background: var(--bad); color: #fff; }
+  button:disabled { opacity: .4; cursor: default; }
+  .hint { color: var(--muted); font-size: 12.5px; max-width: 420px; }
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 22px; }
+  .tot .k { color: var(--muted); font-size: 12px; }
+  .tot .v { font-size: 20px; font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background: var(--muted); vertical-align: middle; }
+  .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
+  .workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 12px; margin-top: 14px; }
+  .worker { background: var(--panel); border-radius: 10px; padding: 12px 16px; }
+  .worker h3 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; }
+  .worker h3 .st { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .worker .seed { color: var(--muted); font-family: Consolas, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .boards { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
+  .board .cap { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+  .board .cap b { color: var(--text); }
+  .bests { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
+  .lvlgrid { display: grid; gap: 2px; background: var(--bg); padding: 8px; border-radius: 4px; width: max-content; font-weight: 400; }
+  .tile { position: relative; background: var(--level-grid); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; user-select: none; }
+  .tile.visited { background: var(--level-grid-used); }
+  .tile.wall { background: var(--level-wall); }
+  .tile.exit { background: var(--level-end); }
+  .tile.hole { background: var(--level-hole); border-style: solid; border-color: var(--level-hole-border); }
+  .tile.unknown { background: var(--level-unknown); }
+  .tile .block { position: absolute; inset: 0; background: var(--level-block); border-color: var(--level-block-border); }
+  .tile .player { position: absolute; inset: 0; background: var(--level-player); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; z-index: 2; }
+  .empty { color: var(--muted); padding: 20px 4px; }
+  pre.log { background: var(--panel2); border-radius: 6px; padding: 8px 10px; font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0; }
+  .banner { background: var(--panel2); border-left: 4px solid var(--warn); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
+  .banner.bad { border-left-color: var(--bad); }
+  .placeholder { width: 100px; height: 100px; background: var(--panel2); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Pathology volunteer</h1>
+<p class="sub">Local control panel for <code id="serverUrl"></code>. This page only talks to the client on this machine.</p>
+<div id="banner" hidden></div>
+
+<div class="row">
+  <div class="panel">
+    <div class="controls">
+      <div><label>Name<br><input type="text" id="name" readonly title="fixed after registration"></label></div>
+      <div><label>Workers<br><input type="number" id="workers" min="1" max="64"> <button class="secondary" id="applyWorkers">Apply</button></label></div>
+      <div><button id="pauseBtn">Pause</button> <button id="resumeBtn" class="secondary">Resume</button> <button id="stopBtn" class="danger">Stop</button></div>
+    </div>
+    <p class="hint"><b>Pause</b> freezes the worker processes (SIGSTOP). They keep their memory (up to several GB per worker), so pause when you need the CPU, stop when you need the RAM. <b>Stop</b> lets each worker print its remaining subtrees, reports them, and exits the client; nothing is lost. Reducing the worker count lets surplus workers finish their current job first.</p>
+  </div>
+  <div class="panel totals">
+    <div class="tot"><div class="k">Server</div><div class="v" id="conn"><span class="dot"></span>…</div></div>
+    <div class="tot"><div class="k">Jobs done</div><div class="v" id="jobsDone">0</div></div>
+    <div class="tot"><div class="k">CPU hours</div><div class="v" id="cpuHours">0</div></div>
+    <div class="tot"><div class="k">Outbox</div><div class="v" id="outbox">0</div></div>
+    <div class="tot"><div class="k">Leased ahead</div><div class="v" id="queued">0</div></div>
+    <div class="tot"><div class="k">Worker hash</div><div class="v" id="hash" style="font-size:12px;font-family:monospace"></div></div>
+  </div>
+</div>
+
+<div class="panel" style="margin-top:14px">
+  <div class="k" style="color:var(--muted);font-size:12px">Best valid level per exit (this session)</div>
+  <div class="bests" id="bests"><div class="empty">Nothing accepted yet.</div></div>
+</div>
+
+<div class="workers" id="workers"></div>
+
+<div class="panel" style="margin-top:14px">
+  <div style="color:var(--muted);font-size:12px">Client log</div>
+  <pre class="log" id="log"></pre>
+</div>
+
+<script>
+'use strict';
+/* Tile renderer copied from PathologyRecords/server/public/collective.js, with one
+   addition: '?' cells (uncommitted in the search cursor) render grey as "unknown". */
+const CHAR_TO_MASK = { '2': 15, '6': 8, '7': 1, '8': 2, '9': 4, 'A': 9, 'B': 3, 'C': 6, 'D': 12, 'E': 7, 'F': 14, 'G': 13, 'H': 11, 'I': 10, 'J': 5 };
+function renderLevel(code, moves, scale = 30) {
+  const grid = String(code).trim().split('\n'); const rows = grid.length, cols = grid[0].length;
+  const div = document.createElement('div'); div.className = 'lvlgrid';
+  div.style.gridTemplateColumns = `repeat(${cols}, ${scale}px)`;
+  const bw = Math.round(scale / 4.5);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const ch = grid[r][c], t = document.createElement('div'); t.className = 'tile';
+    t.style.width = t.style.height = scale + 'px';
+    if (ch === '1') t.classList.add('wall');
+    else if (ch === '5') { t.classList.add('hole'); t.style.borderWidth = bw + 'px'; }
+    else if (ch === '3') { t.classList.add('exit'); if (moves != null) { t.textContent = moves; t.style.fontSize = Math.round(scale / 2) + 'px'; } }
+    else if (ch === '?') { t.classList.add('unknown'); t.title = 'unknown (not yet committed)'; }
+    if (CHAR_TO_MASK[ch] !== undefined) {
+      const b = document.createElement('div'); b.className = 'block'; const mask = CHAR_TO_MASK[ch];
+      b.style.borderStyle = 'solid';
+      b.style.borderBottomWidth = (mask & 1 ? bw : 0) + 'px'; b.style.borderLeftWidth = (mask & 2 ? bw : 0) + 'px';
+      b.style.borderTopWidth = (mask & 4 ? bw : 0) + 'px'; b.style.borderRightWidth = (mask & 8 ? bw : 0) + 'px';
+      t.appendChild(b);
+    }
+    if (ch === '4') { const p = document.createElement('div'); p.className = 'player'; p.textContent = '0'; p.style.fontSize = Math.round(scale / 2) + 'px'; t.appendChild(p); }
+    div.appendChild(t);
+  }
+  return div;
+}
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+/* boards arrive as rows joined by '/'; only level characters are allowed through */
+function boardText(code) {
+  const s = String(code || '');
+  if (!/^[0-9A-Z?]+(\/[0-9A-Z?]+)*$/.test(s)) return null;
+  return s.split('/').join('\n');
+}
+function boardEl(caption, b, scale) {
+  const wrap = document.createElement('div'); wrap.className = 'board';
+  const cap = document.createElement('div'); cap.className = 'cap';
+  const depth = b && b.depth != null ? `depth <b>${esc(b.depth)}</b>` : 'no data';
+  cap.innerHTML = `${esc(caption)} · ${depth}`;
+  wrap.appendChild(cap);
+  const txt = b && boardText(b.code);
+  if (txt) wrap.appendChild(renderLevel(txt, null, scale));
+  else { const ph = document.createElement('div'); ph.className = 'placeholder'; ph.textContent = b && b.depth != null ? 'depth only' : '—'; wrap.appendChild(ph); }
+  return wrap;
+}
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Volunteer': '1' }, body: JSON.stringify(body || {}) });
+    return await r.json();
+  } catch (e) { return { error: String(e) }; }
+}
+
+let nameSet = false, workersEdited = false, lastSlots = '';
+$('workers').addEventListener('input', () => { workersEdited = true; });
+$('applyWorkers').onclick = async () => { const n = Number($('workers').value); if (n >= 1) { await post('/workers', { workers: n }); } workersEdited = false; };
+$('pauseBtn').onclick = () => post('/pause');
+$('resumeBtn').onclick = () => post('/resume');
+$('stopBtn').onclick = () => { if (confirm('Stop the client? Workers will print their remaining subtrees and the client exits.')) post('/stop'); };
+
+function render(st) {
+  $('serverUrl').textContent = st.server.url;
+  if (!nameSet && st.name) { $('name').value = st.name; nameSet = true; }
+  if (!workersEdited && document.activeElement !== $('workers')) $('workers').value = st.workers;
+  $('pauseBtn').disabled = st.paused || st.stopping;
+  $('resumeBtn').disabled = !st.paused || st.stopping;
+  $('stopBtn').disabled = st.stopping;
+
+  const banner = $('banner');
+  if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + ' — waiting for workers to print their SUMMARY, then the client exits.'; }
+  else if (st.paused) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Paused. Workers are frozen and still hold their memory.'; }
+  else banner.hidden = true;
+
+  const age = st.server.last_ok ? st.time - st.server.last_ok : Infinity;
+  const cls = st.server.connected ? (age < 120 ? 'ok' : 'warn') : 'bad';
+  $('conn').innerHTML = `<span class="dot ${cls}"></span>${st.server.connected ? 'connected' : 'unreachable'}` +
+    (st.server.last_error ? `<div class="hint" style="font-size:11px">${esc(st.server.last_error)}</div>` : '');
+  $('jobsDone').textContent = `${st.stats.jobs_done}`;
+  $('jobsDone').title = `${st.stats.exhausted} exhausted, ${st.stats.split} split, ${st.stats.runs_without_summary} run(s) without SUMMARY, ${st.stats.reports_failed} rejected`;
+  $('cpuHours').textContent = st.stats.cpu_hours.toFixed(2);
+  $('outbox').textContent = st.outbox;
+  $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
+  $('queued').textContent = st.queued;
+  $('hash').textContent = (st.src_hash || '').slice(0, 16) + (st.src_hash && st.src_hash.length > 16 ? '…' : '');
+
+  const bests = $('bests'); bests.innerHTML = '';
+  const exits = Object.keys(st.best_per_exit || {}).sort((a, b) => Number(a) - Number(b));
+  if (!exits.length) bests.innerHTML = '<div class="empty">Nothing accepted yet.</div>';
+  for (const ex of exits) bests.appendChild(boardEl(`exit ${ex}`, st.best_per_exit[ex], 22));
+
+  const box = $('workers');
+  const want = st.slots.map(s => s.idx).join(',');
+  if (want !== lastSlots) { box.innerHTML = ''; lastSlots = want; for (const s of st.slots) { const d = document.createElement('div'); d.className = 'worker'; d.id = 'w' + s.idx; box.appendChild(d); } }
+  for (const s of st.slots) {
+    const d = $('w' + s.idx); if (!d) continue;
+    const head = `<h3>Worker ${s.idx + 1} <span class="st">${esc(s.state)}${s.pid ? ' · pid ' + esc(s.pid) : ''}${s.job_id != null ? ` · job #${esc(s.job_id)} exit ${esc(s.exit)} · ${esc(s.elapsed)} s` : ''}</span></h3>` +
+      `<div class="seed">${s.seed ? esc(s.seed) : (s.state === 'idle' ? 'waiting for a job' : '')}</div>`;
+    d.innerHTML = head;
+    const boards = document.createElement('div'); boards.className = 'boards';
+    boards.appendChild(boardEl('current node', s.cur, 22));
+    boards.appendChild(boardEl('best this job', s.best, 22));
+    boards.appendChild(boardEl('best in the last second', s.win, 22));
+    d.appendChild(boards);
+  }
+  $('log').textContent = (st.log || []).join('\n');
+}
+
+let failures = 0;
+async function poll() {
+  try {
+    const r = await fetch('/state', { cache: 'no-store' });
+    render(await r.json()); failures = 0;
+  } catch (e) {
+    if (++failures === 8) { const b = $('banner'); b.hidden = false; b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). Close this tab.'; }
+  }
+}
+setInterval(poll, 250); poll();
+/* Window close = Stop (DESIGN 4). The client waits 3 s for a new /state poll
+   (a reload) before actually stopping. */
+window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': '1' }, body: '{}' }); } catch (e) {} });
+</script>
+</body>
+</html>
