@@ -93,6 +93,7 @@
     <div class="tot"><div class="k">CPU hours</div><div class="v" id="cpuHours">0</div></div>
     <div class="tot"><div class="k">Outbox</div><div class="v" id="outbox">0</div></div>
     <div class="tot"><div class="k">Leased ahead</div><div class="v" id="queued">0</div></div>
+    <div class="tot"><div class="k">Reports pending</div><div class="v" id="pending">0</div></div>
     <div class="tot"><div class="k">Worker hash</div><div class="v" id="hash" style="font-size:12px;font-family:monospace"></div></div>
   </div>
 </div>
@@ -191,11 +192,13 @@ function render(st) {
   $('conn').innerHTML = `<span class="dot ${cls}"></span>${st.server.connected ? 'connected' : 'unreachable'}` +
     (st.server.last_error ? `<div class="hint" style="font-size:11px">${esc(st.server.last_error)}</div>` : '');
   $('jobsDone').textContent = `${st.stats.jobs_done}`;
-  $('jobsDone').title = `${st.stats.exhausted} exhausted, ${st.stats.split} split, ${st.stats.runs_without_summary} run(s) without SUMMARY, ${st.stats.reports_failed} rejected`;
+  $('jobsDone').title = `${st.stats.done} exhausted, ${st.stats.split} split; ${st.stats.nodes_done} tree nodes finished locally, ${st.stats.nodes_open} handed back open; ${st.stats.runs_without_summary} run(s) without SUMMARY, ${st.stats.reports_failed} rejected`;
   $('cpuHours').textContent = st.stats.cpu_hours.toFixed(2);
   $('outbox').textContent = st.outbox;
   $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
   $('queued').textContent = st.queued;
+  $('pending').textContent = st.pending;
+  $('pending').title = `${st.stats.batches_sent} batch(es) sent, ${st.stats.reports_sent} report(s) delivered; next batch at most ${st.campaign.batch_interval_s || 10} s away`;
   $('hash').textContent = (st.src_hash || '').slice(0, 16) + (st.src_hash && st.src_hash.length > 16 ? '…' : '');
 
   const bests = $('bests'); bests.innerHTML = '';
@@ -208,8 +211,10 @@ function render(st) {
   if (want !== lastSlots) { box.innerHTML = ''; lastSlots = want; for (const s of st.slots) { const d = document.createElement('div'); d.className = 'worker'; d.id = 'w' + s.idx; box.appendChild(d); } }
   for (const s of st.slots) {
     const d = $('w' + s.idx); if (!d) continue;
-    const head = `<h3>Worker ${s.idx + 1} <span class="st">${esc(s.state)}${s.pid ? ' · pid ' + esc(s.pid) : ''}${s.job_id != null ? ` · job #${esc(s.job_id)} exit ${esc(s.exit)} · ${esc(s.elapsed)} s` : ''}</span></h3>` +
-      `<div class="seed">${s.seed ? esc(s.seed) : (s.state === 'idle' ? 'waiting for a job' : '')}</div>`;
+    const win = s.job_id != null ? ` · ${esc(s.phase || 'window')} ${esc(s.window_left)} s left · stack ${esc(s.stack_size)} · ${esc(s.nodes_done)} node${s.nodes_done === 1 ? '' : 's'} done` : '';
+    const head = `<h3>Worker ${s.idx + 1} <span class="st">${esc(s.state)}${s.pid ? ' · pid ' + esc(s.pid) : ''}${s.job_id != null ? ` · job #${esc(s.job_id)} exit ${esc(s.exit)} · ${esc(s.elapsed)} s${win}` : ''}</span></h3>` +
+      `<div class="seed">${s.job_id != null ? 'job ' + esc(s.seed) : (s.state === 'idle' ? 'waiting for a job' : '')}</div>` +
+      (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed">now ${esc(s.cur_seed)}</div>` : '');
     d.innerHTML = head;
     const boards = document.createElement('div'); boards.className = 'boards';
     boards.appendChild(boardEl('current node', s.cur, 22));

@@ -22,7 +22,8 @@ trap cleanup EXIT
 # 1. campaign + roots
 cat > "$T/plan.json" <<EOF
 {"title":"chaos","grid":"5x5","extra":["--allow-exit-transit","--num-blocks","3"],"exits":[7],"layer":2,
- "hashes":["$HASH"],"max_clients":5,"workers_max":4,"job_target_s":1,"split_after_s":1,"lease_s":5,"paused_max_s":20,"dup_fraction":0.05}
+ "hashes":["$HASH"],"max_clients":5,"workers_max":4,"job_target_s":1,"split_after_s":1,"ramp_split_after_s":1,"lease_s":30,"paused_max_s":20,"dup_fraction":0.05,
+ "absorb_probe_s":1,"absorb_total_s":5,"batch_interval_s":2,"lease_ahead_s":10}
 EOF
 "$WORKER" "${CFG[@]}" --two-tables --time 0 --list-layer 2 2>/dev/null | grep '^LAYER' > "$T/layer.tsv"
 node "$SERVER_DIR/tools/v2_seed.js" --campaign-file "$T/plan.json" --layer-file "$T/layer.tsv" | tail -2
@@ -49,12 +50,13 @@ sleep 4;  kill -9 "$A" 2>/dev/null; pkill -9 -f "volunteer.py --name A" 2>/dev/n
 sleep 3;  A=$(client A 2)
 sleep 4;  kill -INT "$B" 2>/dev/null                                                  # graceful stop B (hands back splits)
 sleep 3;  B=$(client B 1)
-for i in $(seq 1 150); do
+for i in $(seq 1 120); do
   [ "$(audit_clean)" = 1 ] && break
   sleep 2
 done
 kill -INT "$A" "$B" 2>/dev/null; sleep 3
 curl -s "$URL/api/v2/status" | python3 -c 'import json,sys; s=json.load(sys.stdin); t=s["totals"]; print("status:", {k:t[k] for k in ("jobs","open","leased","done","split","dups","best")}); sys.exit(0 if t["split"] > 0 else 3)' || { echo "FAIL: no job was split -- the test did not exercise the split path"; exit 3; }
+SB=$(curl -s "$URL/api/v2/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["best"])'); [ "$SB" = "$FULL_BEST" ] || { echo "FAIL: server best $SB != monolithic best $FULL_BEST (a champion level was lost on the way to the server)"; exit 4; }
 echo "audit clean: $(audit_clean)"
 
 # 4. invariant: canonical valid-level sets

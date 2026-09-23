@@ -8,7 +8,9 @@ REMAINING, which is what the client tests need.
   python3 fake_server.py --port 8899 --roots 8 --lease-s 6 --split-after-s 3 \
       --hashes fa4e000...
 
-Routes: /api/v2/register, /heartbeat, /lease, /report, /status, /audit (GET).
+Routes: /api/v2/register, /heartbeat, /lease, /report (one-node or tree, 7.5),
+/reports (batch, per-report outcomes in order, 7.6), /status, /audit (GET; carries
+`stats` with lease/report/batch counters used by test_client.sh).
 """
 import argparse
 import json
@@ -35,7 +37,16 @@ class Store:
             "max_clients": opts.max_clients, "workers_max": 32,
             "job_target_s": opts.split_after_s, "split_after_s": opts.split_after_s,
             "lease_s": opts.lease_s, "paused_max_s": opts.paused_max_s,
+            # section 7 load rules
+            "ramp_split_after_s": opts.ramp_split_after_s, "batch_interval_s": opts.batch_interval_s,
+            "lease_ahead_s": opts.lease_ahead_s, "absorb_total_s": opts.absorb_total_s,
+            "absorb_probe_s": opts.absorb_probe_s, "lease_cap": opts.lease_cap, "heartbeat_s": opts.heartbeat_s,
         }
+        self.stats = {"lease_requests": 0, "lease_grants": 0, "report_posts": 0, "batch_posts": 0,
+                      "report_bodies": 0, "tree_reports": 0, "one_node_reports": 0, "max_nodes": 0,
+                      "absorbed_done": 0, "grants_of_absorbed": 0, "max_batch": 0,
+                      "split_nodes_with_level": 0, "open_nodes_with_level": 0, "split_nodes": 0}
+        self.inserted_done = set()   # ids of nodes that arrived already done inside a tree report
         self.clients = {}
         for spec in (opts.preregister or []):   # NAME:TOKEN, survives a restart in tests
             name, _, token = spec.partition(":")
@@ -51,12 +62,12 @@ class Store:
             seed = ",".join(rng.choice(TOKENS) for _ in range(opts.layer))
             self.add_job(ex, seed, None)
 
-    def add_job(self, exit_, seed, parent_id):
+    def add_job(self, exit_, seed, parent_id, status="open"):
         jid = self.next_id
         self.next_id += 1
         self.jobs[jid] = {
             "id": jid, "exit": exit_, "seed": seed, "parent_id": parent_id,
-            "depth": len(seed.split(",")) if seed else 0, "status": "open",
+            "depth": len(seed.split(",")) if seed else 0, "status": status,
             "client_token": None, "lease_until": None, "leased_at": None,
             "done_at": None, "src_hash": None, "states": None, "best": None,
             "level": None, "elapsed_s": None, "children": [],
@@ -121,9 +132,10 @@ class Store:
             return 403, {"error": "revoked"}
         c["last_seen"] = time.time()
         self.sweep()
-        n = max(0, min(64, int(body.get("n", 1))))
+        n = max(0, min(self.campaign["lease_cap"], int(body.get("n", 1))))
         held = sum(1 for j in self.jobs.values() if j["status"] == "leased" and j["client_token"] == c["token"])
-        n = min(n, 3 * max(1, c["workers"]) - held)
+        n = min(n, 3 * max(1, c["workers"]) + 200 - held)
+        self.stats["lease_requests"] += 1
         granted = []
         if n > 0:
             open_by_exit = {}
@@ -140,16 +152,28 @@ class Store:
                     j["leased_at"] = time.time()
                     j["lease_until"] = time.time() + self.campaign["lease_s"]
                     granted.append({"id": j["id"], "exit": j["exit"], "seed": j["seed"]})
+                    if j["id"] in self.inserted_done:
+                        self.stats["grants_of_absorbed"] += 1
                 if len(granted) >= n:
                     break
-        self.log("lease %s n=%d -> %s" % (c["name"], n, [g["id"] for g in granted]))
-        return 200, {"jobs": granted}
+        self.stats["lease_grants"] += len(granted)
+        # 7.4: the server sets the window
+        open_jobs = sum(1 for j in self.jobs.values() if j["status"] == "open")
+        active_workers = sum(cl["workers"] for cl in self.clients.values()
+                             if time.time() - cl["last_seen"] < 180 and not cl["revoked"])
+        sa = self.campaign["ramp_split_after_s"] if open_jobs < 3 * active_workers else self.campaign["split_after_s"]
+        self.log("lease %s n=%d -> %s (split_after_s %g)" % (c["name"], n, [g["id"] for g in granted], sa))
+        return 200, {"jobs": granted, "split_after_s": sa}
 
-    def report(self, body):
-        c = self.clients.get(body.get("token"))
+    def _free(self, j):
+        j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
+
+    def report(self, body, token=None):
+        c = self.clients.get(token or body.get("token"))
         if not c:
             return 401, {"error": "unknown_token"}
         c["last_seen"] = time.time()
+        self.stats["report_bodies"] += 1
         try:
             jid = int(body.get("job_id"))
         except Exception:
@@ -158,52 +182,130 @@ class Store:
         if not j:
             return 404, {"error": "no_such_job"}
         src_hash = str(body.get("src_hash", ""))
-        summary = body.get("summary")
-        if not isinstance(summary, dict):
-            return 400, {"error": "summary"}
+        nodes = body.get("nodes")
+        if nodes is None:
+            # old one-node shape: summary + remaining
+            summary = body.get("summary")
+            if not isinstance(summary, dict):
+                return 400, {"error": "summary"}
+            st = {"exhausted": "done", "split": "split"}.get(summary.get("status"))
+            if st is None:
+                return 400, {"error": "summary_status"}
+            nodes = [{"seed": j["seed"], "parent": None, "status": st, "summary": summary, "level": body.get("level")}]
+            for r in body.get("remaining") or []:
+                nodes.append({"seed": r, "parent": j["seed"], "status": "open"})
+        if not isinstance(nodes, list) or not nodes or len(nodes) > 5000:
+            return 400, {"error": "nodes"}
         self.reports.append({"job_id": jid, "token": c["token"], "src_hash": src_hash,
-                             "summary": summary, "received_at": time.time()})
+                             "nodes": len(nodes), "received_at": time.time()})
         if j["status"] in ("done", "split"):
             self.log("dup report for job %d" % jid)
             return 200, {"dup": True}
         foreign = j["client_token"] != c["token"]
         if src_hash not in self.campaign["hashes"]:
-            j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
+            self._free(j)
             self.log("unknown hash %s on job %d" % (src_hash[:12], jid))
             return 409, {"error": "unknown_hash"}
-        st = summary.get("status")
-        if st == "exhausted":
-            j["status"] = "done"
-        elif st == "split":
-            rem = body.get("remaining")
-            if not isinstance(rem, list) or not rem:
-                j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
-                return 400, {"error": "remaining_empty"}
-            seed_toks = j["seed"].split(",") if j["seed"] else []
-            for r in rem:
-                if not isinstance(r, str) or not SEED_RE.match(r):
-                    j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
-                    return 400, {"error": "remaining_parse", "path": str(r)[:100]}
-                rt = r.split(",")
-                if len(rt) <= len(seed_toks) or rt[:len(seed_toks)] != seed_toks:
-                    j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
-                    return 400, {"error": "remaining_not_extension", "path": r}
-            j["status"] = "split"
-            for r in rem:
-                self.add_job(j["exit"], r, jid)
-        else:
-            return 400, {"error": "summary_status"}
-        j["done_at"] = time.time()
-        j["src_hash"] = src_hash
-        j["states"] = summary.get("states")
-        j["best"] = summary.get("best")
-        j["elapsed_s"] = summary.get("elapsed")
-        j["level"] = body.get("level")
+        # validate the tree (7.5)
+        seed_toks = j["seed"].split(",") if j["seed"] else []
+        seen = {}
+        children_of = {}
+        for k, n in enumerate(nodes):
+            if not isinstance(n, dict) or not isinstance(n.get("seed"), str) or not SEED_RE.match(n["seed"]):
+                self._free(j); return 400, {"error": "node_seed", "index": k}
+            toks = n["seed"].split(",")
+            if toks[:len(seed_toks)] != seed_toks or (k > 0 and len(toks) <= len(seed_toks)):
+                self._free(j); return 400, {"error": "node_not_extension", "index": k}
+            if k == 0 and n["seed"] != j["seed"]:
+                self._free(j); return 400, {"error": "first_node_not_job"}
+            if n["seed"] in seen:
+                self._free(j); return 400, {"error": "node_duplicate", "index": k}
+            if k > 0 and (n.get("parent") not in seen):
+                self._free(j); return 400, {"error": "node_parent", "index": k}
+            st = n.get("status")
+            if st not in ("done", "split", "open"):
+                self._free(j); return 400, {"error": "node_status", "index": k}
+            if st == "done" and not (isinstance(n.get("summary"), dict) and n["summary"].get("status") == "exhausted"):
+                self._free(j); return 400, {"error": "done_without_summary", "index": k}
+            if st == "open" and n.get("summary") is not None:
+                self._free(j); return 400, {"error": "open_with_summary", "index": k}
+            lv = n.get("level")
+            if lv is not None and not (isinstance(lv, dict) and isinstance(lv.get("depth"), int)
+                                       and isinstance(lv.get("code"), str) and 0 < len(lv["code"]) <= 2000):
+                self._free(j); return 400, {"error": "node_level", "index": k}
+            seen[n["seed"]] = k
+            if k > 0:
+                children_of.setdefault(n["parent"], []).append(k)
+        for k, n in enumerate(nodes):
+            if n["status"] == "split" and not children_of.get(n["seed"]):
+                self._free(j); return 400, {"error": "split_without_children", "index": k}
+        # insert in one go
+        ids = {j["seed"]: jid}
+        root = nodes[0]
+        j["status"] = root["status"] if root["status"] != "open" else "open"
+        if root["status"] == "open":
+            self._free(j)
+            return 400, {"error": "job_node_open"}
+        self._fill(j, root, src_hash)
+        for n in nodes[1:]:
+            nid = self.add_job(j["exit"], n["seed"], ids[n["parent"]], status=n["status"])
+            ids[n["seed"]] = nid
+            if n["status"] != "open":
+                self._fill(self.jobs[nid], n, src_hash)
+            elif n.get("level"):          # an open probe node that found a level: keep it, depth as best
+                self.jobs[nid]["level"] = n["level"]
+                self.jobs[nid]["best"] = n["level"]["depth"]
+                self.stats["open_nodes_with_level"] += 1
+            if n["status"] == "done":
+                self.inserted_done.add(nid)
+                self.stats["absorbed_done"] += 1
         j["client_token"] = None
         j["lease_until"] = None
-        self.log("report job %d %s by %s%s%s" % (jid, st, c["name"], " (foreign)" if foreign else "",
-                                                 " children=%d" % len(j["children"]) if st == "split" else ""))
-        return 200, {"ok": True}
+        for n in nodes:
+            if n["status"] == "split":
+                self.stats["split_nodes"] += 1
+                if n.get("level"):
+                    self.stats["split_nodes_with_level"] += 1
+        self.stats["max_nodes"] = max(self.stats["max_nodes"], len(nodes))
+        if len(nodes) > 1:
+            self.stats["tree_reports"] += 1
+        else:
+            self.stats["one_node_reports"] += 1
+        cnt = {}
+        for n in nodes:
+            cnt[n["status"]] = cnt.get(n["status"], 0) + 1
+        self.log("report job %d %s by %s%s: %d node(s) %s" % (jid, root["status"], c["name"],
+                                                            " (foreign)" if foreign else "", len(nodes), cnt))
+        return 200, {"ok": True, "nodes": len(nodes)}
+
+    def _fill(self, j, n, src_hash):
+        sm = n.get("summary") or {}
+        j["done_at"] = time.time()
+        j["src_hash"] = src_hash
+        j["states"] = sm.get("states")
+        j["best"] = sm.get("best")
+        j["elapsed_s"] = sm.get("elapsed")
+        j["level"] = n.get("level")
+
+    def report_batch(self, body):
+        c = self.clients.get(body.get("token"))
+        if not c:
+            return 401, {"error": "unknown_token"}
+        lst = body.get("reports")
+        if not isinstance(lst, list) or len(lst) > 1000:
+            return 400, {"error": "reports"}
+        self.stats["batch_posts"] += 1
+        self.stats["max_batch"] = max(self.stats["max_batch"], len(lst))
+        results = []
+        for r in lst:
+            if not isinstance(r, dict):
+                results.append({"error": "bad_report", "status": 400}); continue
+            code, obj = self.report(r, token=c["token"])
+            if code == 200:
+                results.append(obj)
+            else:
+                results.append({"error": obj.get("error", "error"), "status": code, "detail": obj})
+        return 200, {"results": results}
 
     def status(self):
         self.sweep()
@@ -215,7 +317,7 @@ class Store:
         return 200, {"per_exit": per_exit, "cpu_hours": cpu / 3600.0,
                      "clients": [{"name": c["name"], "workers": c["workers"], "paused": c["paused"],
                                   "boards": c["boards"], "last_seen": c["last_seen"]} for c in self.clients.values()],
-                     "hashes": self.campaign["hashes"], "jobs": len(self.jobs)}
+                     "hashes": self.campaign["hashes"], "jobs": len(self.jobs), "stats": self.stats}
 
     def covered(self, jid):
         j = self.jobs[jid]
@@ -234,7 +336,7 @@ class Store:
             counts[j["status"]] += 1
         return 200, {"roots": len(roots), "uncovered_roots": uncovered, "counts": counts,
                      "unknown_hash_jobs": [r["job_id"] for r in self.reports if r["src_hash"] not in self.campaign["hashes"]],
-                     "mismatches": [], "reports": len(self.reports)}
+                     "mismatches": [], "reports": len(self.reports), "stats": self.stats}
 
 
 def make_handler(store):
@@ -283,7 +385,10 @@ def make_handler(store):
                 elif path == "/api/v2/lease":
                     code, obj = store.lease(body)
                 elif path == "/api/v2/report":
+                    store.stats["report_posts"] += 1
                     code, obj = store.report(body)
+                elif path == "/api/v2/reports":
+                    code, obj = store.report_batch(body)
                 else:
                     code, obj = 404, {"error": "not_found"}
             self._send(code, obj)
@@ -299,6 +404,13 @@ def main():
     ap.add_argument("--lease-s", type=float, default=6)
     ap.add_argument("--split-after-s", type=float, default=3)
     ap.add_argument("--paused-max-s", type=float, default=60)
+    ap.add_argument("--ramp-split-after-s", type=float, default=None, help="default: same as --split-after-s")
+    ap.add_argument("--batch-interval-s", type=float, default=10)
+    ap.add_argument("--lease-ahead-s", type=float, default=300)
+    ap.add_argument("--absorb-total-s", type=float, default=120)
+    ap.add_argument("--absorb-probe-s", type=float, default=10)
+    ap.add_argument("--lease-cap", type=int, default=200)
+    ap.add_argument("--heartbeat-s", type=float, default=30)
     ap.add_argument("--grid", default="5x5")
     ap.add_argument("--extra", default="--allow-exit-transit --num-holes 3")
     ap.add_argument("--exits", default="0,1,2")
@@ -307,6 +419,8 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--preregister", action="append", help="NAME:TOKEN client that exists at startup")
     opts = ap.parse_args()
+    if opts.ramp_split_after_s is None:
+        opts.ramp_split_after_s = opts.split_after_s
     store = Store(opts)
     srv = ThreadingHTTPServer(("127.0.0.1", opts.port), make_handler(store))
     srv.daemon_threads = True

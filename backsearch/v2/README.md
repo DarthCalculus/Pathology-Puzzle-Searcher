@@ -51,8 +51,8 @@ node tools/v2_finish.js [--publish]           # refuses any exit whose audit is 
 ```
 
 `roots.tsv` is the worker's `--list-layer K` output; for the 5x5 ≤3-hole
-campaign the six exits' depth-8 layers are in `roots_h3/` (297,943 roots;
-`cat roots_h3/*.tsv > roots.tsv`). `plan.json` fields are listed at the top of
+campaign the six exits' depth-4 layers are in `roots_h3/` (2,761 roots, see DESIGN §7.1;
+`roots_h3/layer4_all.tsv`). `plan.json` fields are listed at the top of
 `v2_seed.js`; the campaign parameters chosen in DESIGN.md §6 are the defaults.
 
 Audit anytime: `GET /api/v2/audit?exit=E` lists uncovered roots, jobs done

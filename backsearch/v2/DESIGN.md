@@ -213,3 +213,73 @@ the server should also re-check leases on every heartbeat, not only on wake.
 grid 5x5; extra `--allow-exit-transit --num-holes 3`; exits 0,1,2,6,7,12;
 layer 8; max_clients 40; workers_max 32; job_target 20 min; split_after 1800 s;
 lease 3600 s; paused_max 12 h; dup_fraction 0.02.
+
+## 7. Load rules (added 2026-09-23 after the load analysis; these override §3/§4 where they differ)
+
+Server load must depend on wall-clock only, never on how many tree nodes a
+job turns out to have. Job durations range from 1 ms to hours; a worker on
+trivial jobs completes ~20/s (process spawn), so "one job = one server event"
+is not acceptable.
+
+1. **Shallow roots.** Campaigns are seeded at layer 3 or 4 (hundreds to a few
+   thousand roots per exit), never at a layer where most roots are trivial.
+2. **One report per worker per window.** A worker leases a job J and works a
+   LOCAL stack for a window of `split_after_s` seconds: run J; if it splits,
+   push its REMAINING seeds locally (LIFO) and keep popping, each run capped
+   at the time left in the window. Trivial children finish locally and never
+   reach the server. At the window's end the worker reports J once with the
+   whole local tree (§7.5). A window therefore contains at most ~2 splits and
+   a report at most a few hundred nodes.
+3. **Absorb trivial children before hand-back.** Before reporting, spend up to
+   `absorb_total_s` (120) probing each still-open local seed for
+   `absorb_probe_s` (10) seconds; probes that exhaust are reported done, the
+   rest open (a probe that splits is reported open, its partial work dropped).
+   The open pool thus holds only jobs that cost ≥ 10 s or were never examined.
+   (Was 2 s / 60 s; raised after the first load test measured ~1 ms of server
+   time per row: the worst-case job rate is now 1,280 / 10 s = 128 jobs/s.)
+4. **The server sets the window.** The lease response carries `split_after_s`:
+   `ramp_split_after_s` (120) while open jobs < 3 × (sum of workers of active
+   clients), else the campaign's `split_after_s` (1800).
+5. **Tree reports.** `POST /api/v2/report` body:
+   `{token, job_id, src_hash, nodes:[{seed, parent, status, summary?, level?}]}`
+   where every `seed` extends the job's seed (token prefix, may equal it only
+   for the job itself), `parent` is the job's seed or the seed of an earlier
+   node in the list, `status` ∈ done|split|open; `done` requires a `summary`
+   with `status:"exhausted"` and the fingerprint fields; `split` requires at
+   least one node in the list whose parent it is; `open` has no summary but
+   MAY carry a `level` (with its `depth`): a probe that ran out of time or a
+   run that split still found real levels, and the deepest one belongs to the
+   explored part, which no child will revisit — dropping it would lose a
+   champion (found by the chaos test: status best 53 vs true 58). The
+   job itself is the first node. All inserted in one transaction; the job's
+   status becomes done or split accordingly. ≤ 5,000 nodes per report. The
+   old `summary`+`remaining` shape stays accepted as the one-node case.
+6. **Client-level batching.** A client sends at most one lease request and one
+   `POST /api/v2/reports {token, reports:[…]}` (array of §7.5 bodies) per
+   `batch_interval_s` (10), plus one heartbeat per 30 s. Lease requests ask
+   for enough jobs to keep every worker busy for `lease_ahead_s` (300) at the
+   recent mean job duration, floor 1 per idle worker, ceiling 200 per request;
+   the server caps at `lease_cap` (200) per request and 3 × workers +
+   200 held. Failed batches go to the outbox as one file.
+7. **No throttling between friends.** No per-token rate limit. The per-IP
+   limit is a sanity cap honest clients cannot reach (600/min).
+8. **Nothing scales with rows on the request path.** `status` cached 2 s;
+   `audit` cached per exit for 60 s and recomputed at most once a minute;
+   level re-verification only for a new per-exit best.
+
+Worst-case rates under these rules (40 clients, 1,280 workers): 9.3 req/s;
+rows/s ≤ 128 one-node reports + 0.7 splits × 300 children ≈ 340 rows/s;
+≤ 100 KB per report; ≤ 2M rows for a 5,000 CPU-hour campaign.
+Realistic deployment (owner, 2026-09-23): 10 clients × 16 workers = 160
+workers; the 40 × 32 cap is a configuration ceiling, not a load target.
+Acceptance by `v2/test_load.sh` before launch: at 10 × 16 with 10-s jobs,
+report p95 latency < 1 s and server CPU < 30 %; at 30 × 16 with 2-s jobs
+(3× stress) zero errors or timeouts; 40 × 32 is measured for information.
+First measurement (2026-09-23, before optimisation, 2-s jobs): ~1,000 rows/s
+saturated one core, report p95 25 s, socket timeouts. Not acceptable; see
+`synchronous=NORMAL` + one transaction per batch below.
+9. **Server write path.** `PRAGMA synchronous = NORMAL` (WAL; a power loss can
+   drop the last committed reports, which only returns those jobs to the pool
+   when their leases expire, so it is safe), one transaction per report batch
+   (validate every element first, apply all valid ones together), prepared
+   statements only, no per-node JSON re-parsing on the hot path.
