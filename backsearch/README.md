@@ -50,9 +50,9 @@ cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ./backsearch_worker --grid 5x5 --two-tables --exit 0 --num-holes 1 --num-blocks 3 --time 55
 # no-transit exit 7, ~9 s:            accepted 2877948,  best depth 43
 ./backsearch_worker --grid 5x5 --two-tables --exit 7 --time 55
-# REAL RULES (transit), ~40 s:         accepted 2286977 (2292601 with --no-exit-block-prune), valid levels 473037, best depth 58
+# REAL RULES (transit), ~40 s:         accepted 2189699 (2292601 with --no-exit-block-prune), valid levels 473037, best depth 58
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 7 --num-blocks 3 --time 55
-# REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 5279939, best depth 58   (was 5279938, same reason)
+# REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 4583712 (5279939 with --no-exit-block-prune), valid levels 584050, best depth 58
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 12 --num-blocks 4 --time 0
 ```
 
@@ -153,11 +153,21 @@ are never removed and the grid edge / fixed walls never change, so a block whose
 every pull needs an off-grid, fixed-wall, hole, or itself-stuck cell can never
 move (mutual locks such as blocks on 6, 8, 16, 18 of a 5x5 are found by
 un-sticking from "all stuck" to a fixpoint; uncommitted cells count as free).
+A second rule (the user's refinement) refutes a pull-off direction d even when it is
+possible: the pull-off adds the push direction to the exit block's mask, so if at any
+already-fixed suffix moment (an ancestor state at depth >= 2, since the block last
+landed on the exit) the player stood on the pull-off side cell adj[exit][d] while the
+far cell adj[exit][d^2] was committed and block-free, the final level would be won in
+one move there (a push carries the player onto the exit), and the solver prunes every
+such pull-off anyway.  Each state carries `adjflags`, the 4-bit record of sides that
+have had such a moment, inherited from the parent and extended by its own position;
+a block-on-exit state is dead when every direction is stuck or refuted.
 Such states are pruned before the solver call.  The summary now prints
 `valid levels` (accepted states with no block on the exit), which is the
 invariant to compare across this prune: unchanged on every config, best depths
-unchanged; accepted drops 0.25% (exit 7 <= 3 blocks) to 2.3% (the depth-36
-seed of the 149).  Note the proportions: on that seed only 4,789 of 185,569
+unchanged; with both rules accepted drops 4.5% (exit 7 <= 3 blocks), 3.7% and
+-22% time (the depth-36 seed of the 149), 13% (exit 12 <= 4 blocks, zero-eviction
+tables: 5279939 -> 4583712 accepted, 584050 valid levels either way).  Note the proportions: on that seed only 4,789 of 185,569
 accepted states are levels; the rest carry a block on the exit.
 
 ## DFS-order ranges, checkpoints and chunks (2026-09-21)

@@ -448,6 +448,9 @@ typedef struct {
     int16_t  ptab_k;                     /* depth(this) - depth(A): the table prunes a check of a depth+j descendant at nc > g_A + k + j - 2 */
     uint64_t ptab_delta;                 /* cells floor here but wall in A's puzzle (A's table still bounds continuations avoiding them) */
     uint64_t ptab_xor;                   /* key translation this -> A (see sokoban_ref_set_xor); 0 for an identical puzzle */
+    uint8_t  adjflags;                   /* bit d: at some suffix moment (depth >= 2) since the exit block last landed on the exit, the player
+                                          * stood on adj[exit][d] with the far cell adj[exit][d^2] committed and block-free -- a pull-off in
+                                          * direction d would give that moment a one-move win (see exit_block_dead) */
     uint8_t  plen;                       /* tree path from the exit root: one byte per backward step, (variant << 2) | direction;
                                           * a bulk walk-back child carries the whole walk (BFS-parent chain).  Fixes the DFS
                                           * position of every node, so a run can be checkpointed by one path (CURSOR) and
@@ -546,6 +549,7 @@ static int walk_dist_bits(uint64_t passable, int from, int to) {
 }
 static long long g_pruned_walkseg = 0;
 static long long g_pruned_exitstuck = 0;   /* block-on-exit states whose exit block can never be pulled off (see exit_block_stuck) */
+static long long g_pruned_exitadj = 0;     /* ... or whose every possible pull-off is refuted by a suffix shortcut moment (adjflags) */
 static long long g_accepted_valid = 0;     /* accepted states with no block on the exit: the levels the search actually produces */
 static int g_exit_block_prune = 1;         /* --no-exit-block-prune */
 
@@ -559,7 +563,23 @@ static int g_exit_block_prune = 1;         /* --no-exit-block-prune */
  * block with a pull whose two cells are not permanently obstructed, to a
  * fixpoint.  Uncommitted cells may still become floor, so they count as free.
  * Returns 1 if the exit block is stuck: the whole subtree contains no level. */
-static int exit_block_stuck(const BState *s) {
+static uint8_t exit_adj_bits(const BState *s) {
+    /* the shortcut moments this state itself provides (only meaningful with a block on the exit) */
+    if (s->depth < 2) return 0;
+    uint64_t blk = 0; for (int i = 0; i < s->nblocks; i++) blk |= 1ULL << s->block_pos[i];
+    uint8_t bits = 0;
+    for (int d = 0; d < 4; d++) {
+        int P = g_adj[g_exit_pos][d], Q = g_adj[g_exit_pos][d ^ 2];
+        if (P < 0 || Q < 0 || s->player_pos != P) continue;
+        if (!(g_walkable_mask >> Q & 1) || !(s->committed_empty >> Q & 1) || (blk >> Q & 1)) continue;
+        bits |= (uint8_t)(1 << d);
+    }
+    return bits;
+}
+/* adjflags: bit d set means a pull-off in direction d (block to adj[exit][d],
+ * mask gains the push direction d^2) makes the final level solvable in one move
+ * at a suffix moment, so the solver prunes every such pull-off. */
+static int exit_block_stuck(const BState *s, uint8_t adjflags) {
     uint64_t blk = 0, hol = 0; int on_exit = 0;
     for (int i = 0; i < s->nblocks; i++) { blk |= 1ULL << s->block_pos[i]; if (s->block_pos[i] == g_exit_pos) on_exit = 1; }
     if (!on_exit) return 0;
@@ -577,7 +597,15 @@ static int exit_block_stuck(const BState *s) {
             }
         }
     }
-    return (int)(stuck >> g_exit_pos & 1);
+    if (stuck >> g_exit_pos & 1) return 1;
+    /* not stuck: every possible pull direction must be ruled out by a shortcut moment */
+    const int x = g_exit_pos;
+    for (int d = 0; d < 4; d++) {
+        int P = g_adj[x][d]; if (P < 0 || !(g_walkable_mask >> P & 1) || (perm >> P & 1) || (stuck >> P & 1)) continue;
+        int C = g_adj[P][d]; if (C < 0 || !(g_walkable_mask >> C & 1) || (perm >> C & 1) || (stuck >> C & 1)) continue;
+        if (!(adjflags >> d & 1)) return 0;   /* this pull-off may still lead to a level */
+    }
+    return 2;
 }
 
 static BState g_probe_buf[64];   /* --estimate: children of the node being probed */
@@ -2038,11 +2066,17 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         harvest_emit(s, sid, 'X', -99);
         return;
     }
-    /* A block sits on the exit and can never be pulled off: no level below here. */
-    if (g_exit_block_prune && !g_allow_block_on_exit && exit_block_stuck(s)) {
-        g_pruned_short++; g_pruned_exitstuck++;
-        harvest_emit(s, sid, 'X', -99);
-        return;
+    /* A block sits on the exit and no pull-off can lead to a level: stuck for
+     * good, or every possible pull-off hands the solver a one-move win. */
+    uint8_t adjflags = 0;
+    if (g_exit_block_prune && !g_allow_block_on_exit) {
+        adjflags = (uint8_t)(s->adjflags | exit_adj_bits(s));
+        int dead = exit_block_stuck(s, adjflags);
+        if (dead) {
+            g_pruned_short++; if (dead == 1) g_pruned_exitstuck++; else g_pruned_exitadj++;
+            harvest_emit(s, sid, 'X', -99);
+            return;
+        }
     }
     /* --place-holes: enforce each hole-placement constraint.  Holes are
      * non-decreasing with depth in the backward search, so a state at depth
@@ -2162,6 +2196,7 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
     { int bx = 0; for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) { bx = 1; break; } if (!bx) g_accepted_valid++; }
     BState ns = *s;
     ns.branch_factor = g_last_peak_heap;
+    ns.adjflags = adjflags;   /* the record of shortcut moments, extended by this state's own */
     if (g_emit_D >= 0) path_push(&ns, g_emit_D, g_emit_V);   /* single-step edge; bulk children (g_emit_D < 0) carry their walk already */
     if (g_ptab_active) {
         int exported = 0;
@@ -2469,6 +2504,7 @@ static void expand(const BState *s) {
                      * Mask of that block gets bit D OR'd in. */
                     int idx = blk_idx_at[B];
                     BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
+                    if (P == g_exit_pos) ns.adjflags = 0;   /* a different block now sits on the exit: its own moments only */
                     /* Identical forward puzzle iff the origin cell was already committed and the
                      * block already had this push direction: then the parent's table applies. */
                     d_ref[d_n] = (s->block_mask[idx] >> D) & 1;   /* mask unchanged: same puzzle up to cell C */
@@ -4240,7 +4276,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         memset(g_visited, 0, HASH_CAP * sizeof *g_visited);
     }
     g_visited_count  = 0;
-    g_pruned_walkseg = 0; g_pruned_exitstuck = 0; g_accepted_valid = 0;
+    g_pruned_walkseg = 0; g_pruned_exitstuck = 0; g_pruned_exitadj = 0; g_accepted_valid = 0;
     g_q_tail         = 0;
     g_q_peak         = 0;
     g_best_depth     = 0;
@@ -4278,6 +4314,12 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         fprintf(stderr, "[seed-path] seed built: depth=%d player=%d nblocks=%d nholes=%d committed_pop=%d\n",
                 seed.depth, seed.player_pos, seed.nblocks, seed.nholes,
                 __builtin_popcountll(seed.committed_empty & g_active_mask));
+        if (getenv("BS_DUMP_SEED")) {   /* print the seed state as a puzzle and stop (uncommitted cells drawn as walls) */
+            printf("seed state for --seed-path (depth %d, player %d, wh %d, bulk_walk %d, committed 0x%llx):\n",
+                   seed.depth, seed.player_pos, seed.wh, seed.bulk_walk, (unsigned long long)seed.committed_empty);
+            print_puzzle_for_exit(&seed, g_exit_pos); fflush(stdout);
+            if (out_exhausted) *out_exhausted = 1; if (out_dedup_full) *out_dedup_full = 0; return 0.0;
+        }
         g_best_state = seed;
         try_successor(&seed);
     } else if (g_task_seeds && g_task_seed_count > 0) {
@@ -5674,7 +5716,7 @@ int main(int argc, char **argv) {
 #endif
         printf("  accepted:       %lld  (walk-segment pruned before check: %lld)\n",
                g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_cap - g_pruned_axis, g_pruned_walkseg);
-        printf("  valid levels:   %lld  (block-on-exit states pruned as permanently stuck: %lld)\n", g_accepted_valid, g_pruned_exitstuck);
+        printf("  valid levels:   %lld  (block-on-exit states pruned: %lld permanently stuck, %lld every pull-off refuted by a suffix shortcut)\n", g_accepted_valid, g_pruned_exitstuck, g_pruned_exitadj);
         if (g_ptab_active) printf("  parent tables:  %lld saved, %lld used as reference (%lld with a puzzle delta), %lld states inherited an ancestor's; peak %lld live tables, %.1f MB\n", g_ptab_saved, g_ptab_used, g_ptab_delta_refs, g_ptab_inherited, g_ptab_live_peak, g_ptab_live_slots_peak * 12.0 / 1048576);
 #ifdef REF_CHECK
         printf("  REF_CHECK:      %lld referenced checks re-run, %lld decision mismatches\n", g_refchk_n, g_refchk_bad);
