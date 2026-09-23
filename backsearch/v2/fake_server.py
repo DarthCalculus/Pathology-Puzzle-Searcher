@@ -119,7 +119,8 @@ class Store:
             c["boards"] = boards[:max(1, c["workers"])]
         self.sweep()
         leases = [j["id"] for j in self.jobs.values() if j["status"] == "leased" and j["client_token"] == c["token"]]
-        res = {"ok": True, "leases": leases, "campaign": self.campaign}
+        res = {"ok": True, "leases": leases, "campaign": self.campaign,
+               "me": self.me_for(c["name"]), "exits": self.exits_summary()}
         if c["revoked"]:
             res["revoked"] = True
         return 200, res
@@ -137,12 +138,20 @@ class Store:
         n = min(n, 3 * max(1, c["workers"]) + 200 - held)
         self.stats["lease_requests"] += 1
         granted = []
+        pref = body.get("exit")
+        pref = int(pref) if isinstance(pref, int) or (isinstance(pref, str) and pref.isdigit()) else None
+        fallback = False
         if n > 0:
             open_by_exit = {}
             for j in self.jobs.values():
                 if j["status"] == "open":
                     open_by_exit.setdefault(j["exit"], []).append(j)
             order = sorted(open_by_exit.items(), key=lambda kv: -len(kv[1]))
+            if pref is not None:
+                if pref in open_by_exit:
+                    order = [(pref, open_by_exit[pref])]   # 8: the preferred exit first and only
+                else:
+                    fallback = bool(open_by_exit)
             for _, lst in order:
                 for j in sorted(lst, key=lambda j: j["id"]):
                     if len(granted) >= n:
@@ -162,8 +171,12 @@ class Store:
         active_workers = sum(cl["workers"] for cl in self.clients.values()
                              if time.time() - cl["last_seen"] < 180 and not cl["revoked"])
         sa = self.campaign["ramp_split_after_s"] if open_jobs < 3 * active_workers else self.campaign["split_after_s"]
-        self.log("lease %s n=%d -> %s (split_after_s %g)" % (c["name"], n, [g["id"] for g in granted], sa))
-        return 200, {"jobs": granted, "split_after_s": sa}
+        self.log("lease %s n=%d exit=%s -> %s (split_after_s %g%s)" % (c["name"], n, pref, [g["id"] for g in granted], sa,
+                                                                        ", fallback" if fallback else ""))
+        res = {"jobs": granted, "split_after_s": sa}
+        if fallback:
+            res["exit_fallback"] = True
+        return 200, res
 
     def _free(self, j):
         j["status"] = "open"; j["client_token"] = None; j["lease_until"] = None
@@ -246,12 +259,12 @@ class Store:
         if root["status"] == "open":
             self._free(j)
             return 400, {"error": "job_node_open"}
-        self._fill(j, root, src_hash)
+        self._fill(j, root, src_hash, c["name"])
         for n in nodes[1:]:
             nid = self.add_job(j["exit"], n["seed"], ids[n["parent"]], status=n["status"])
             ids[n["seed"]] = nid
             if n["status"] != "open":
-                self._fill(self.jobs[nid], n, src_hash)
+                self._fill(self.jobs[nid], n, src_hash, c["name"])
             elif n.get("level"):          # an open probe node that found a level: keep it, depth as best
                 self.jobs[nid]["level"] = n["level"]
                 self.jobs[nid]["best"] = n["level"]["depth"]
@@ -278,8 +291,11 @@ class Store:
                                                             " (foreign)" if foreign else "", len(nodes), cnt))
         return 200, {"ok": True, "nodes": len(nodes)}
 
-    def _fill(self, j, n, src_hash):
+    def _fill(self, j, n, src_hash, reporter=None):
         sm = n.get("summary") or {}
+        j["reporter"] = reporter
+        j["solver_calls"] = sm.get("solver_calls")
+        j["states"] = sm.get("states")
         j["done_at"] = time.time()
         j["src_hash"] = src_hash
         j["states"] = sm.get("states")
@@ -314,10 +330,50 @@ class Store:
             d = per_exit.setdefault(j["exit"], {"open": 0, "leased": 0, "done": 0, "split": 0})
             d[j["status"]] += 1
         cpu = sum((j["elapsed_s"] or 0) for j in self.jobs.values() if j["status"] in ("done", "split"))
-        return 200, {"per_exit": per_exit, "cpu_hours": cpu / 3600.0,
+        return 200, {"per_exit": per_exit, "cpu_hours": cpu / 3600.0, "exits": self.exits_summary(),
+                     "active_clients": sum(1 for c in self.clients.values() if time.time() - c["last_seen"] < 180),
                      "clients": [{"name": c["name"], "workers": c["workers"], "paused": c["paused"],
                                   "boards": c["boards"], "last_seen": c["last_seen"]} for c in self.clients.values()],
                      "hashes": self.campaign["hashes"], "jobs": len(self.jobs), "stats": self.stats}
+
+    def me_for(self, name):
+        """Section 8 `me`: totals for every client with this name."""
+        mine = [j for j in self.jobs.values() if j.get("reporter") == name and j["status"] in ("done", "split")]
+        contrib = {}
+        for j in self.jobs.values():
+            if j.get("reporter") and j["status"] in ("done", "split"):
+                contrib[j["reporter"]] = contrib.get(j["reporter"], 0) + (j["elapsed_s"] or 0)
+        ranked = sorted(contrib.items(), key=lambda kv: -kv[1])
+        rank = next((i + 1 for i, (nm, _) in enumerate(ranked) if nm == name), None)
+        best = None
+        for j in mine:
+            lv = j.get("level")
+            if lv and (best is None or lv["depth"] > best["moves"]):
+                best = {"moves": lv["depth"], "code": lv["code"], "exit": j["exit"], "at": j["done_at"]}
+        first = [cl["created_at"] for cl in self.clients.values() if cl["name"] == name]
+        return {"jobs_done": len(mine), "splits": sum(1 for j in mine if j["status"] == "split"),
+                "nodes_done": sum(1 for j in mine if j["status"] == "done"),
+                "cpu_s": sum((j["elapsed_s"] or 0) for j in mine),
+                "states": sum((j.get("states") or 0) for j in mine),
+                "solver_calls": sum((j.get("solver_calls") or 0) for j in mine),
+                "best": best, "rank": rank, "contributors": len(contrib),
+                "first_seen": min(first) if first else None}
+
+    def exits_summary(self):
+        out = {}
+        for ex in self.campaign["exits"]:
+            js = [j for j in self.jobs.values() if j["exit"] == ex]
+            roots = [j for j in js if j["parent_id"] is None]
+            d = {"roots": len(roots), "roots_covered": sum(1 for j in roots if self.covered(j["id"])),
+                 "open": 0, "leased": 0, "done": 0, "split": 0,
+                 "cpu_s": sum((j["elapsed_s"] or 0) for j in js if j["status"] in ("done", "split")), "best": None}
+            for j in js:
+                d[j["status"]] += 1
+                lv = j.get("level")
+                if lv and (d["best"] is None or lv["depth"] > d["best"]["moves"]):
+                    d["best"] = {"moves": lv["depth"], "code": lv["code"], "by": j.get("reporter"), "at": j["done_at"]}
+            out[str(ex)] = d
+        return out
 
     def covered(self, jid):
         j = self.jobs[jid]

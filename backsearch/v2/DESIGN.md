@@ -283,3 +283,56 @@ saturated one core, report p95 25 s, socket timeouts. Not acceptable; see
    when their leases expire, so it is safe), one transaction per report batch
    (validate every element first, apply all valid ones together), prepared
    statements only, no per-node JSON re-parsing on the hot path.
+
+## 8. Control-panel GUI (added 2026-09-23 from the owner's brief)
+
+The local page is a control panel, not a status readout. It must let a
+volunteer understand the system and steer it without reading any docs.
+
+Server support:
+- `lease {token, n, exit?}`: `exit` is a preference. Grant from that exit's
+  open jobs first; if it has none, grant from any exit and set
+  `exit_fallback: true` in the response so the panel can say so.
+- `heartbeat` response gains `me`: `{jobs_done, splits, nodes_done, cpu_s,
+  states, solver_calls, best: {moves, code, exit, at} | null, rank,
+  contributors, first_seen}` computed for this token's *name* (a person may
+  re-register), and `exits`: per exit `{roots, roots_covered, open, leased,
+  done, split, cpu_s, best: {moves, code, by, at} | null}` where
+  `roots_covered` is the audit's covered-root count (from the 60 s cache).
+  "Done" for an exit is reported as covered roots / roots plus CPU hours;
+  total work is unknown, so no percentage of work is ever shown.
+
+Panel sections (top to bottom):
+1. **Controls**: name (fixed), workers (number input, apply), exit selector
+   (Any / 0 / 1 / 2 / 6 / 7 / 12 with each exit's covered-roots and open jobs
+   in the label), Pause/Resume, Stop. Every control that is not instantaneous
+   shows a "working…" state until `/state` reflects it: workers change ("2
+   workers finishing their jobs…"), exit change ("current jobs finish first;
+   new leases use exit 7"), pause ("freezing…" until all workers show T),
+   stop ("waiting for N workers to print their remaining work…").
+2. **What is happening**: per worker: job seed, exit, window time left, local
+   stack size, nodes done this window, phase (search / absorbing / reporting),
+   current board (grey = undecided cells).
+3. **Levels**: three boards with Pathology codes and copy buttons: best on
+   this machine in the last second, best on this machine in the last hour,
+   best known globally for the selected exit (from `exits`). Each with depth,
+   and for the global one who found it and when.
+4. **Your stats** (from `me`): jobs done, splits handed back, trivial
+   children absorbed locally, CPU hours, states searched, solver calls, your
+   deepest level, rank among contributors, first seen, session uptime, jobs
+   this session, mean job length, longest job this session.
+5. **Campaign**: per-exit table (roots covered / roots, open, leased, CPU
+   hours, best), total CPU hours, active volunteers, worker version/hash.
+6. **How it works**: short explanations of a job (a subtree named by a seed
+   path), windows and splitting (a job that outlives its window prints the
+   exact remaining subtrees, which become new jobs; nothing is lost), pausing
+   (freezes processes, keeps memory, jobs reserved for up to 12 h), stopping
+   (each worker hands back its remaining work, seconds), changing workers
+   (extra workers finish their current job; new ones start at once), leases
+   (a job left unfinished returns to the pool after an hour), what a "done"
+   fraction means and why there is no percentage of total work.
+
+Rules: the page never talks to workers or to the campaign server directly;
+it only reads `/state` and posts to the client's control endpoints. Client
+fetches `/api/v2/status` at most every 30 s for the campaign table; `me` and
+`exits` arrive with each heartbeat. All text from the server is escaped.

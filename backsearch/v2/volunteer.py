@@ -111,6 +111,22 @@ class Api:
             raise ApiError(status, {"error": "bad json from server"}, True)
 
 
+    def get(self, path, timeout=15.0):
+        req = urllib.request.Request(self.server + path, method="GET",
+                                     headers={"User-Agent": "pathology-volunteer/2"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read(4 * 1024 * 1024)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, {"error": "HTTP %d" % e.code}, e.code >= 500)
+        except Exception as e:
+            raise ApiError(0, {"error": str(e)[:200]}, True)
+        try:
+            return json.loads(raw.decode("utf-8", "replace") or "{}")
+        except Exception:
+            raise ApiError(200, {"error": "bad json from server"}, True)
+
+
 class Slot:
     """One worker slot: a thread that runs worker processes one job at a time."""
 
@@ -205,6 +221,22 @@ class Volunteer:
         self.ui_close_at = 0.0
         self.no_jobs_until = 0.0
         self.last_no_jobs_log = 0.0
+        # section 8: control panel state
+        self.exit_pref = args.exit                   # None = any exit
+        self.exit_applied = args.exit is None        # a lease with the preferred exit arrived
+        self.exit_fallback = False                   # last lease had to fall back to other exits
+        self.me = None                               # heartbeat `me`
+        self.exits = None                            # heartbeat `exits`
+        self.campaign_status = None                  # GET /api/v2/status (at most every 30 s)
+        self.campaign_status_at = 0.0
+        self.session_start = time.time()
+        self.job_total_s = 0.0
+        self.longest_job_s = 0.0
+        self.hour_best = collections.deque()         # monotonic deque of (t, depth, code, exit): rolling 1 h max
+        self.workers_changed_at = 0.0
+        self.workers_prev = self.workers
+        self.pause_requested_at = 0.0
+        self.resume_requested_at = 0.0
         self.sigint_count = 0
 
     def log(self, msg):
@@ -431,8 +463,13 @@ class Volunteer:
             if want <= 0 or time.time() - self.last_lease_at < self.fparam("batch_interval_s", 10):
                 continue
             self.last_lease_at = time.time()
+            body = {"token": self.token, "n": want}
+            with self.lock:
+                pref = self.exit_pref
+            if pref is not None:
+                body["exit"] = pref
             try:
-                res = self.api.post("/api/v2/lease", {"token": self.token, "n": want})
+                res = self.api.post("/api/v2/lease", body)
             except ApiError as e:
                 if e.status == 403 and isinstance(e.body, dict) and e.body.get("error") == "revoked":
                     self.request_stop("token revoked by the server")
@@ -465,10 +502,17 @@ class Volunteer:
                     sa = self.fparam("split_after_s", 1800)
                 good.append({"id": jid, "exit": ex, "seed": seed, "split_after_s": max(1.0, sa),
                              "leased_at": time.time()})
+            fallback = bool(isinstance(res, dict) and res.get("exit_fallback"))
             with self.cond:
                 if good:
                     self.queue.extend(good)
                     self.cond.notify_all()
+                    if pref is not None and self.exit_pref == pref:
+                        if any(j["exit"] == pref for j in good):
+                            self.exit_applied = True
+                        if fallback and not self.exit_fallback:
+                            self.log("the server had no open jobs for exit %d; it fell back to other exits" % pref)
+                        self.exit_fallback = fallback
                 else:
                     wait = max(5.0, self.fparam("batch_interval_s", 10))
                     self.no_jobs_until = time.time() + wait
@@ -642,6 +686,8 @@ class Volunteer:
         dur = time.time() - start
         with self.lock:
             self.job_durations.append(dur)
+            self.job_total_s += dur
+            self.longest_job_s = max(self.longest_job_s, dur)
             self.stats["jobs_done"] += 1
             self.stats["nodes_done"] += counts.get("done", 0)
             self.stats["nodes_open"] += counts.get("open", 0)
@@ -787,6 +833,16 @@ class Volunteer:
                      % (slot.idx, bad_remaining))
         return summary, remaining, level, run_hash
 
+    def _hour_best_add(self, now, depth, code, exit_):
+        """Rolling one-hour maximum (caller holds the lock): drop older entries that the
+        new one dominates, so the leftmost entry is always the current hour's best."""
+        hb = self.hour_best
+        while hb and hb[-1][1] <= depth:
+            hb.pop()
+        hb.append((now, depth, code, exit_))
+        while hb and now - hb[0][0] > 3600:
+            hb.popleft()
+
     def _on_status(self, slot, text):
         try:
             s = json.loads(text)
@@ -816,6 +872,7 @@ class Volunteer:
                 slot.win_hist.append((now, win["depth"], win["code"]))
                 if slot.best is None or win["depth"] > slot.best["depth"]:
                     slot.best = win
+                self._hour_best_add(now, win["depth"], win["code"], slot.job["exit"] if slot.job else None)
             elif "best" in s and slot.best is None:
                 try:
                     slot.best = {"depth": int(s["best"]), "code": None}
@@ -980,6 +1037,27 @@ class Volunteer:
         slot.state = "finishing"
         slot.stop_sent_at = time.time()
 
+    def set_exit(self, value):
+        """Exit preference for the next lease request (None = any). Returns (ok, message)."""
+        if value is None or value == "":
+            ex = None
+        else:
+            try:
+                ex = int(value)
+            except (TypeError, ValueError):
+                return False, "exit must be a number or null"
+            allowed = self.campaign.get("exits")
+            if isinstance(allowed, list) and allowed and ex not in [int(a) for a in allowed if str(a).lstrip("-").isdigit()]:
+                return False, "exit %d is not part of this campaign (%s)" % (ex, ", ".join(str(a) for a in allowed))
+            if ex < 0:
+                return False, "exit must be >= 0"
+        with self.lock:
+            self.exit_pref = ex
+            self.exit_applied = ex is None
+            self.exit_fallback = False
+        self.log("exit preference: %s (applies to the next lease request)" % ("any" if ex is None else ex))
+        return True, None
+
     def pause(self):
         with self.lock:
             if self.paused or self.stopping:
@@ -989,6 +1067,8 @@ class Volunteer:
                 if s.proc and s.state == "running":
                     self._signal(s, signal.SIGSTOP)
                     s.state = "paused"
+        with self.lock:
+            self.pause_requested_at = 0.0
         self.log("paused (workers stopped with SIGSTOP; their memory stays allocated)")
         self.heartbeat()
 
@@ -1001,6 +1081,8 @@ class Volunteer:
                 if s.proc and s.state == "paused":
                     self._signal(s, signal.SIGCONT)
                     s.state = "running"
+        with self.lock:
+            self.resume_requested_at = 0.0
         self.log("resumed")
         self.heartbeat()
 
@@ -1042,6 +1124,9 @@ class Volunteer:
             wmax = 64
         n = max(1, min(wmax, n))
         with self.lock:
+            if n != self.workers:
+                self.workers_prev = self.workers
+                self.workers_changed_at = time.time()
             self.workers = n
             self._reconcile_slots()
         self.log("workers set to %d" % n)
@@ -1091,6 +1176,11 @@ class Volunteer:
             self.request_stop("the campaign's accepted worker hashes changed; update and rebuild (git pull && ./build_pgo.sh)")
         if res.get("revoked"):
             self.request_stop("this client was revoked by the server")
+        with self.lock:
+            if isinstance(res.get("me"), dict):
+                self.me = res["me"]
+            if isinstance(res.get("exits"), dict):
+                self.exits = res["exits"]
         leases = res.get("leases")
         if isinstance(leases, list):
             with self.lock:
@@ -1100,6 +1190,44 @@ class Volunteer:
             if lost:
                 self.log("warning: the server no longer lists these running jobs as leased to us: %s" % lost)
         return res
+
+    def fetch_campaign_status(self):
+        try:
+            st = self.api.get("/api/v2/status")
+        except ApiError as e:
+            self.log("campaign status unavailable: %s" % e)
+            return
+        if isinstance(st, dict):
+            with self.lock:
+                self.campaign_status = st
+
+    def pending_flags(self, now):
+        """Human-readable 'working...' phases for controls that are not instantaneous (8.1)."""
+        p = {"workers": None, "exit": None, "pause": None, "stop": None}
+        retiring = [s for s in self.slots if s.retire and s.job is not None]
+        fresh = [s for s in self.slots if not s.retire and s.job is None and s.thread and s.thread.is_alive()]
+        if retiring:
+            p["workers"] = "%d worker%s finishing %s current job before retiring…" % (
+                len(retiring), "" if len(retiring) == 1 else "s", "its" if len(retiring) == 1 else "their")
+        elif fresh and now - self.workers_changed_at < 60 and self.workers > self.workers_prev and not self.paused:
+            p["workers"] = "%d new worker%s waiting for a job (next lease within %d s)…" % (
+                len(fresh), "" if len(fresh) == 1 else "s", int(self.fparam("batch_interval_s", 10)))
+        if self.exit_pref is not None and not self.exit_applied and not self.stopping:
+            p["exit"] = "current jobs finish first; new leases use exit %d" % self.exit_pref
+        running = [s for s in self.slots if s.proc and s.state == "running"]
+        if self.pause_requested_at and (not self.paused or running) and not self.stopping:
+            p["pause"] = "freezing %d worker%s…" % (len(running), "" if len(running) == 1 else "s")
+        elif self.resume_requested_at and self.paused and not self.stopping:
+            p["pause"] = "resuming…"
+        if self.stopping:
+            alive = [s for s in self.slots if s.proc]
+            if alive:
+                p["stop"] = "waiting for %d worker%s to print their remaining work…" % (len(alive), "" if len(alive) == 1 else "s")
+            elif self.pending or self.outbox_files():
+                p["stop"] = "sending the last report…"
+            else:
+                p["stop"] = "exiting…"
+        return p
 
     def handle_wake(self, gap):
         self.log("clock jumped %.0f s (sleep?). Re-validating leases before the workers continue." % gap)
@@ -1139,6 +1267,14 @@ class Volunteer:
         with self.lock:
             self.ui_last_poll = now
             slots = [s.snapshot(now) for s in self.slots if not (s.retire and s.job is None and s.state in ("dead", "idle"))]
+            best_second = None
+            for sn in slots:
+                w = sn.get("win")
+                if w and (best_second is None or w["depth"] > best_second["depth"]):
+                    best_second = dict(w, exit=sn.get("exit"))
+            while self.hour_best and now - self.hour_best[0][0] > 3600:
+                self.hour_best.popleft()
+            hb = self.hour_best
             return {
                 "name": self.name,
                 "workers": self.workers,
@@ -1161,6 +1297,29 @@ class Volunteer:
                 "slots": slots,
                 "log": list(self.ring)[-25:],
                 "time": now,
+                # section 8
+                "exit_pref": self.exit_pref,
+                "exit_applied": self.exit_applied,
+                "exit_fallback": self.exit_fallback,
+                "campaign_exits": self.campaign.get("exits"),
+                "pending_flags": self.pending_flags(now),
+                "me": self.me,
+                "exits": self.exits,
+                "campaign_status": self.campaign_status,
+                "campaign_status_age": round(now - self.campaign_status_at) if self.campaign_status else None,
+                "best_second": best_second,
+                "best_hour": ({"depth": hb[0][1], "code": hb[0][2], "exit": hb[0][3], "at": hb[0][0]} if hb else None),
+                "session": {
+                    "uptime_s": round(now - self.session_start),
+                    "jobs": self.stats["jobs_done"],
+                    "mean_job_s": round(self.job_total_s / self.stats["jobs_done"], 1) if self.stats["jobs_done"] else None,
+                    "longest_job_s": round(self.longest_job_s, 1),
+                    "absorbed": max(0, self.stats["nodes_done"] - self.stats["done"]),
+                    "splits": self.stats["split"],
+                    "open_handed_back": self.stats["nodes_open"],
+                    "runs": self.stats["runs"],
+                },
+                "worker_path": " ".join(self.worker_argv_base()),
             }
 
     # ------------------------------------------------------------ main loop
@@ -1197,6 +1356,9 @@ class Volunteer:
             if now >= next_outbox:
                 next_outbox = now + 15
                 self.flush_outbox()
+            if not self.args.no_ui and now - self.ui_last_poll < 60 and now - self.campaign_status_at >= 30:
+                self.campaign_status_at = now
+                threading.Thread(target=self.fetch_campaign_status, daemon=True).start()
             with self.lock:
                 for s in self.slots:
                     if s.stop_pending and s.proc and now - s.run_started_at > 5.0:
@@ -1296,16 +1458,24 @@ class Volunteer:
                 except ValueError:
                     body = {}
                 if path == "/pause":
+                    with vol.lock:
+                        vol.pause_requested_at = time.time()
                     threading.Thread(target=vol.pause, daemon=True).start()
-                    return self._send(200, {"ok": True})
+                    return self._send(200, {"ok": True, "pending": True})
                 if path == "/resume":
+                    with vol.lock:
+                        vol.resume_requested_at = time.time()
                     threading.Thread(target=vol.resume, daemon=True).start()
-                    return self._send(200, {"ok": True})
+                    return self._send(200, {"ok": True, "pending": True})
+                if path == "/exit":
+                    ok, msg = vol.set_exit(body.get("exit") if isinstance(body, dict) else None)
+                    return self._send(200 if ok else 400, {"ok": ok, "error": msg, "exit": vol.exit_pref})
                 if path == "/stop":
                     threading.Thread(target=vol.request_stop, args=("Stop pressed in the UI",), daemon=True).start()
                     return self._send(200, {"ok": True})
                 if path == "/workers":
-                    return self._send(200, {"ok": True, "workers": vol.set_workers(body.get("workers"))})
+                    n = vol.set_workers(body.get("workers"))
+                    return self._send(200, {"ok": True, "workers": n, "pending": True})
                 if path == "/close":
                     if not vol.args.no_stop_on_close:
                         with vol.lock:
@@ -1333,6 +1503,7 @@ def main():
     ap = argparse.ArgumentParser(description="Pathology collective search v2 volunteer client")
     ap.add_argument("--name", help="your display name (fixed at first registration)")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--exit", type=int, default=None, help="prefer jobs of this exit (default: any)")
     ap.add_argument("--server", default=os.environ.get("VOLUNTEER_SERVER", DEFAULT_SERVER))
     ap.add_argument("--port", type=int, default=8765, help="local GUI port (127.0.0.1 only)")
     ap.add_argument("--worker", default=os.path.join(".", "backsearch_worker_nt"),

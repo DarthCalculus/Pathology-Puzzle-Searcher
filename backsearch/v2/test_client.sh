@@ -169,7 +169,25 @@ test_c() {
   case "$st" in *T*) bad "after /resume STAT still '$st'";; *) ok "after /resume workers run again (STAT $st)";; esac
   http_post "http://127.0.0.1:$UPORT/workers" '{"workers": 1}' 1 >/dev/null; sleep 0.5
   [ "$(state_field "s['workers']")" = 1 ] && ok "/workers changed the count to 1" || bad "/workers did not change the count"
+  pw=$(state_field "s['pending_flags']['workers']")
+  case "$pw" in *finishing*) ok "pending flag: \"$pw\"";; *) bad "no pending workers phase: '$pw'";; esac
+  # section 8: exit preference, pending phase text, me/exits from the heartbeat
+  r=$(http_post "http://127.0.0.1:$UPORT/exit" '{"exit": 2}' 1)
+  case "$r" in 200*) ok "/exit 2 accepted immediately";; *) bad "/exit answered: $r";; esac
+  [ "$(state_field "s['exit_pref']")" = 2 ] && ok "/state shows exit preference 2" || bad "exit_pref not 2"
+  pe=$(state_field "s['pending_flags']['exit']")
+  case "$pe" in *"new leases use exit 2"*) ok "pending flag: \"$pe\"";; *) bad "no pending exit phase: '$pe'";; esac
+  r=$(http_post "http://127.0.0.1:$UPORT/exit" '{"exit": 99}' 1)
+  case "$r" in 400*) ok "/exit 99 (not in the campaign) refused with 400";; *) bad "/exit 99 answered: $r";; esac
+  http_post "http://127.0.0.1:$UPORT/exit" '{"exit": null}' 1 >/dev/null
+  [ "$(state_field "s['exit_pref'] is None and s['pending_flags']['exit'] is None")" = True ] && ok "/exit null clears the preference and its pending flag" || bad "exit not cleared"
+  me=$(state_field "sorted(s['me'].keys())[:4]")
+  case "$me" in *best*contributors*cpu_s*) ok "/state carries me from the heartbeat (${me} ...)";; *) bad "me missing: $me";; esac
+  ex=$(state_field "s['exits']['0']['roots'], s['exits']['0']['roots_covered'], 'best' in s['exits']['0']")
+  case "$ex" in "2 0 True") ok "/state carries exits from the heartbeat (exit 0: roots 2, covered 0)";; *) bad "exits missing or wrong: $ex";; esac
   http_post "http://127.0.0.1:$UPORT/stop" '{}' 1 >/dev/null
+  ps_=$(state_field "s['pending_flags']['stop']" 2>/dev/null)
+  case "$ps_" in *waiting*|*sending*|*exiting*) ok "pending flag: \"$ps_\"";; *) bad "no pending stop phase: '$ps_'";; esac
   if wait_exit "$CLIENT_PID" 20; then wait "$CLIENT_PID"; rc=$?; [ "$rc" = 0 ] && ok "/stop: client exited 0" || bad "/stop: exit code $rc"; else bad "client did not exit after /stop"; fi
   CLIENT_PID=""
   a=$(audit); echo "   audit: $(echo "$a" | cut -c1-150)"
@@ -194,7 +212,7 @@ test_d() {
 test_e() {
   say "test e: coalesce (trivial jobs, one-node reports, batched)"
   start_server 60 30 4 || return
-  FAKE_MIN_S=0.2 FAKE_MAX_S=0.5 start_client e.log --workers 2 --no-ui || return
+  FAKE_MIN_S=0.2 FAKE_MAX_S=0.5 start_client e.log --workers 2 --no-ui --exit 2 || return
   sleep 12
   kill -INT "$CLIENT_PID"
   if wait_exit "$CLIENT_PID" 20; then wait "$CLIENT_PID"; rc=$?; [ "$rc" = 0 ] && ok "client exited 0" || bad "exit code $rc"; else bad "client did not exit"; return; fi
@@ -204,6 +222,8 @@ test_e() {
   [ "$one" -ge 10 ] && ok "$one of them were one-node reports (trivial jobs)" || bad "one-node reports: $one"
   [ "$bp" -ge 1 ] && [ $(( bp * 3 )) -le "$rb" ] && ok "sent as $bp batch(es) (largest $mb): at most one POST /reports per 10 s" || bad "$bp batches for $rb reports"
   [ "$lr" -le 3 ] && ok "$lr lease request(s) in 12 s (at most one per 10 s, sized for 300 s of work)" || bad "$lr lease requests"
+  grep -q "exit=2" "$TMP/server.log" && ok "lease requests carried the exit preference (--exit 2)" || bad "no exit preference in lease requests"
+  grep -q "fallback" "$TMP/server.log" && ok "server fell back to other exits once exit 2 ran dry; client logged: $(grep -c 'fell back' "$TMP/e.log") notice(s)" || ok "(exit 2 never ran dry in this run; no fallback to observe)"
   grep -q '!!!' "$TMP/e.log" && bad "client logged an error: $(grep '!!!' "$TMP/e.log" | head -2)" || ok "no protocol errors logged"
   stop_server; done_test
 }

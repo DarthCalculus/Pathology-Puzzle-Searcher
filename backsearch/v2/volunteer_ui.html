@@ -7,57 +7,57 @@
 <style>
   /* palette and tile rules copied from PathologyRecords/server/public/style.css */
   :root {
-    --bg: rgb(38, 38, 38);
-    --panel: rgb(50, 50, 50);
-    --panel2: rgb(64, 64, 64);
-    --text: #ffffff;
-    --muted: rgb(180, 180, 180);
-    --accent: rgb(90, 160, 255);
-    --good: rgb(0, 200, 0);
-    --bad: rgb(255, 50, 50);
-    --warn: rgb(240, 180, 40);
-    --level-block: rgb(0, 0, 0);
-    --level-block-border: rgb(183, 119, 57);
-    --level-end: rgb(229, 229, 229);
-    --level-grid: rgb(14, 168, 117);
-    --level-grid-used: rgb(4, 110, 80);
-    --level-grid-text: rgb(0, 0, 0);
-    --level-hole: rgb(65, 65, 65);
-    --level-hole-border: rgb(106, 106, 106);
-    --level-player: rgb(244, 114, 182);
-    --level-wall: rgb(38, 38, 38);
-    --level-unknown: rgb(120, 120, 120);
+    --bg: rgb(38, 38, 38); --panel: rgb(50, 50, 50); --panel2: rgb(64, 64, 64);
+    --text: #ffffff; --muted: rgb(180, 180, 180); --accent: rgb(90, 160, 255);
+    --good: rgb(0, 200, 0); --bad: rgb(255, 50, 50); --warn: rgb(240, 180, 40);
+    --level-block: rgb(0, 0, 0); --level-block-border: rgb(183, 119, 57); --level-end: rgb(229, 229, 229);
+    --level-grid: rgb(14, 168, 117); --level-grid-used: rgb(4, 110, 80); --level-grid-text: rgb(0, 0, 0);
+    --level-hole: rgb(65, 65, 65); --level-hole-border: rgb(106, 106, 106); --level-player: rgb(244, 114, 182);
+    --level-wall: rgb(38, 38, 38); --level-unknown: rgb(120, 120, 120);
   }
-  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
-  body { padding: 16px 20px 40px; }
-  h1 { font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 14px; font-size: 13px; }
-  .row { display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-start; }
-  .panel { background: var(--panel); border-radius: 10px; padding: 14px 18px; }
-  .controls { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
-  label { color: var(--muted); font-size: 13px; }
-  input[type=text] { background: var(--panel2); color: var(--muted); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 4px 8px; width: 180px; }
-  input[type=number] { width: 60px; background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 3px 6px; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  body { padding: 14px 16px 40px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 2px; }
+  h2 { font-size: 16px; margin: 0 0 8px; color: var(--muted); font-weight: 600; letter-spacing: .3px; }
+  h2 .n { display: inline-block; width: 22px; height: 22px; border-radius: 50%; background: var(--panel2); color: var(--text); text-align: center; line-height: 22px; font-size: 13px; margin-right: 8px; }
+  .sub { color: var(--muted); margin: 0 0 14px; font-size: 13px; word-break: break-all; }
+  section { background: var(--panel); border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: flex-end; }
+  label { color: var(--muted); font-size: 12.5px; display: block; }
+  input[type=text] { background: var(--panel2); color: var(--muted); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 5px 8px; width: 160px; max-width: 100%; }
+  input[type=number] { width: 64px; background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 4px 6px; }
+  select { background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 5px 6px; max-width: 100%; }
   button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
   button.secondary { background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); font-weight: 500; }
   button.danger { background: var(--bad); color: #fff; }
+  button.small { padding: 3px 9px; font-size: 12px; }
   button:disabled { opacity: .4; cursor: default; }
-  .hint { color: var(--muted); font-size: 12.5px; max-width: 420px; }
-  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 22px; }
-  .tot .k { color: var(--muted); font-size: 12px; }
-  .tot .v { font-size: 20px; font-weight: 600; }
+  .hint { color: var(--muted); font-size: 12.5px; }
+  .working { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--panel2); border-left: 3px solid var(--warn); font-size: 13px; }
+  .working::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--warn); border-right-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .banner { background: var(--panel2); border-left: 4px solid var(--warn); padding: 8px 12px; border-radius: 6px; margin-top: 10px; }
+  .banner.bad { border-left-color: var(--bad); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 16px; }
+  .tile-k { color: var(--muted); font-size: 12px; }
+  .tile-v { font-size: 18px; font-weight: 600; word-break: break-word; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; background: var(--muted); vertical-align: middle; }
   .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
-  .workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(560px, 1fr)); gap: 12px; margin-top: 14px; }
-  .worker { background: var(--panel); border-radius: 10px; padding: 12px 16px; }
-  .worker h3 { margin: 0 0 6px; font-size: 15px; display: flex; gap: 10px; align-items: baseline; }
-  .worker h3 .st { font-size: 12px; color: var(--muted); font-weight: 400; }
-  .worker .seed { color: var(--muted); font-family: Consolas, Menlo, monospace; font-size: 12px; word-break: break-all; }
-  .boards { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
-  .board .cap { color: var(--muted); font-size: 12px; margin-bottom: 3px; }
+  .workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
+  .worker { background: var(--panel2); border-radius: 8px; padding: 10px 12px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .worker .facts { flex: 1 1 150px; font-size: 13px; }
+  .worker .facts div { margin: 1px 0; }
+  .worker .k { color: var(--muted); }
+  .seed { font-family: Consolas, Menlo, monospace; font-size: 12px; word-break: break-all; }
+  .boards { display: flex; gap: 16px; flex-wrap: wrap; }
+  .board { flex: 0 1 auto; max-width: 100%; }
+  .board .cap { color: var(--muted); font-size: 12.5px; margin-bottom: 3px; }
   .board .cap b { color: var(--text); }
-  .bests { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
-  .lvlgrid { display: grid; gap: 2px; background: var(--bg); padding: 8px; border-radius: 4px; width: max-content; font-weight: 400; }
+  .board .who { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .code { display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
+  .code code { font-family: Consolas, Menlo, monospace; font-size: 11.5px; background: var(--bg); padding: 3px 6px; border-radius: 4px; word-break: break-all; }
+  .lvlgrid { display: grid; gap: 2px; background: var(--bg); padding: 8px; border-radius: 4px; width: max-content; font-weight: 400; max-width: 100%; }
   .tile { position: relative; background: var(--level-grid); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; user-select: none; }
   .tile.visited { background: var(--level-grid-used); }
   .tile.wall { background: var(--level-wall); }
@@ -66,49 +66,86 @@
   .tile.unknown { background: var(--level-unknown); }
   .tile .block { position: absolute; inset: 0; background: var(--level-block); border-color: var(--level-block-border); }
   .tile .player { position: absolute; inset: 0; background: var(--level-player); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; z-index: 2; }
-  .empty { color: var(--muted); padding: 20px 4px; }
-  pre.log { background: var(--panel2); border-radius: 6px; padding: 8px 10px; font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0; }
-  .banner { background: var(--panel2); border-left: 4px solid var(--warn); padding: 8px 12px; border-radius: 6px; margin-bottom: 12px; }
-  .banner.bad { border-left-color: var(--bad); }
-  .placeholder { width: 100px; height: 100px; background: var(--panel2); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; }
+  .placeholder { width: 96px; height: 96px; background: var(--bg); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; text-align: center; padding: 6px; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-size: 13.5px; min-width: 520px; }
+  th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid rgb(80,80,80); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; }
+  td.num, th.num { text-align: right; }
+  tr.sel td { background: rgba(90, 160, 255, .12); }
+  dl { margin: 0; }
+  dt { font-weight: 600; margin-top: 8px; }
+  dd { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; }
+  pre.log { background: var(--panel2); border-radius: 6px; padding: 8px 10px; font-size: 12px; max-height: 180px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0; }
+  details summary { cursor: pointer; color: var(--muted); }
+  @media (max-width: 480px) { body { padding: 10px 10px 30px; } section { padding: 12px; } .tile-v { font-size: 16px; } .workers { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <h1>Pathology volunteer</h1>
-<p class="sub">Local control panel for <code id="serverUrl"></code>. This page only talks to the client on this machine.</p>
-<div id="banner" hidden></div>
+<p class="sub">Control panel for the search client on this machine. This page talks only to <code>127.0.0.1</code>; the client talks to <code id="serverUrl"></code>.</p>
+<div id="banner" class="banner" hidden></div>
 
-<div class="row">
-  <div class="panel">
-    <div class="controls">
-      <div><label>Name<br><input type="text" id="name" readonly title="fixed after registration"></label></div>
-      <div><label>Workers<br><input type="number" id="workers" min="1" max="64"> <button class="secondary" id="applyWorkers">Apply</button></label></div>
-      <div><button id="pauseBtn">Pause</button> <button id="resumeBtn" class="secondary">Resume</button> <button id="stopBtn" class="danger">Stop</button></div>
-    </div>
-    <p class="hint"><b>Pause</b> freezes the worker processes (SIGSTOP). They keep their memory (up to several GB per worker), so pause when you need the CPU, stop when you need the RAM. <b>Stop</b> lets each worker print its remaining subtrees, reports them, and exits the client; nothing is lost. Reducing the worker count lets surplus workers finish their current job first.</p>
+<section id="controls">
+  <h2><span class="n">1</span>Controls</h2>
+  <div class="row">
+    <div><label>Name (fixed after registration)<input type="text" id="name" readonly></label></div>
+    <div><label>Workers</label><div class="row" style="gap:6px"><input type="number" id="workers" min="1" max="64"> <button class="secondary" id="applyWorkers">Apply</button></div></div>
+    <div><label>Exit to work on</label><select id="exitSel"><option value="">Any exit</option></select></div>
+    <div class="row" style="gap:8px"><button id="pauseBtn">Pause</button><button id="resumeBtn" class="secondary">Resume</button><button id="stopBtn" class="danger">Stop</button></div>
   </div>
-  <div class="panel totals">
-    <div class="tot"><div class="k">Server</div><div class="v" id="conn"><span class="dot"></span>…</div></div>
-    <div class="tot"><div class="k">Jobs done</div><div class="v" id="jobsDone">0</div></div>
-    <div class="tot"><div class="k">CPU hours</div><div class="v" id="cpuHours">0</div></div>
-    <div class="tot"><div class="k">Outbox</div><div class="v" id="outbox">0</div></div>
-    <div class="tot"><div class="k">Leased ahead</div><div class="v" id="queued">0</div></div>
-    <div class="tot"><div class="k">Reports pending</div><div class="v" id="pending">0</div></div>
-    <div class="tot"><div class="k">Worker hash</div><div class="v" id="hash" style="font-size:12px;font-family:monospace"></div></div>
+  <div id="pendingBox"></div>
+  <div id="fallback" class="banner" hidden></div>
+  <p class="hint" style="margin:10px 0 0"><b>Pause</b> freezes the worker processes: they keep their memory (up to several GB each) and their jobs stay reserved for you (<span id="pausedMax">12 h</span>). <b>Stop</b> makes every worker hand back the exact unexplored part of its job within seconds, sends the last report and exits the client. Fewer workers: the extra ones finish their current job first. More workers: they start with the next lease. The exit choice applies to the next lease request; running jobs are not interrupted.</p>
+  <div class="tiles" style="margin-top:12px">
+    <div><div class="tile-k">Server</div><div class="tile-v" id="conn"><span class="dot"></span>…</div></div>
+    <div><div class="tile-k">Leased ahead</div><div class="tile-v" id="queued">0</div></div>
+    <div><div class="tile-k">Reports waiting</div><div class="tile-v" id="pendingReports">0</div></div>
+    <div><div class="tile-k">Outbox (unsent)</div><div class="tile-v" id="outbox">0</div></div>
   </div>
-</div>
+</section>
 
-<div class="panel" style="margin-top:14px">
-  <div class="k" style="color:var(--muted);font-size:12px">Best valid level per exit (this session)</div>
-  <div class="bests" id="bests"><div class="empty">Nothing accepted yet.</div></div>
-</div>
+<section>
+  <h2><span class="n">2</span>What is happening</h2>
+  <div class="workers" id="workersBox"></div>
+  <p class="hint" style="margin:8px 0 0">Each worker owns one <b>job</b> (a subtree named by its seed path) for a <b>window</b>. Inside the window it keeps a local stack of sub-trees; at the end it briefly probes what is left (absorbing) and reports the whole tree once. Grey cells in the board are not decided yet.</p>
+</section>
 
-<div class="workers" id="workers"></div>
+<section>
+  <h2><span class="n">3</span>Levels</h2>
+  <div class="boards" id="levels"></div>
+  <p class="hint" style="margin:8px 0 0">Depth = number of moves the level needs. The codes are Pathology level codes (rows separated by <code>/</code>): copy one to play it.</p>
+</section>
 
-<div class="panel" style="margin-top:14px">
-  <div style="color:var(--muted);font-size:12px">Client log</div>
-  <pre class="log" id="log"></pre>
-</div>
+<section>
+  <h2><span class="n">4</span>Your stats</h2>
+  <div class="tiles" id="meBox"><div class="empty">Waiting for the first heartbeat…</div></div>
+  <h2 style="margin-top:14px">This session</h2>
+  <div class="tiles" id="sessionBox"></div>
+</section>
+
+<section>
+  <h2><span class="n">5</span>Campaign</h2>
+  <div class="tablewrap"><table id="campTable"><thead><tr><th>Exit</th><th class="num">Roots covered</th><th class="num">Open</th><th class="num">Leased</th><th class="num">CPU hours</th><th class="num">Best</th><th>By</th></tr></thead><tbody></tbody></table></div>
+  <div class="tiles" style="margin-top:10px" id="campTotals"></div>
+  <p class="hint" style="margin:8px 0 0">"Roots covered" counts the top-level jobs whose whole subtree is finished. The total amount of work is unknown until it is done, so no percentage of the search is shown anywhere.</p>
+</section>
+
+<section>
+  <h2><span class="n">6</span>How it works</h2>
+  <dl>
+    <dt>A job</dt><dd>One node of the search tree and everything below it, named by its <i>seed path</i> (a list of backward moves such as <code>U2,R3,L1</code>). Any worker given the same seed explores exactly the same subtree, so nothing depends on who runs it or when.</dd>
+    <dt>Windows and splitting</dt><dd>A worker keeps a job for a window of <span id="windowLen">30 min</span>. A job that outlives its window prints the exact list of subtrees it has not finished; those become new jobs and the parent is marked split. The pieces are disjoint and together they are precisely the unexplored part, so nothing is lost or repeated. Trivial pieces are finished on this machine and never reach the server.</dd>
+    <dt>Pausing</dt><dd>Pause freezes the worker processes (SIGSTOP). They keep their memory, and their jobs stay reserved for up to <span id="pausedMax2">12 h</span>, so a paused laptop resumes exactly where it was.</dd>
+    <dt>Stopping</dt><dd>Stop asks each worker to hand back its remaining work. That takes seconds: the worker prints its remaining subtrees, the client reports them, and only then exits. Closing this tab also stops the client.</dd>
+    <dt>Changing the worker count</dt><dd>Extra workers finish their current job and then retire; new workers start with the next lease (within <span id="batchLen">10 s</span>).</dd>
+    <dt>Leases</dt><dd>A job is reserved for the client that took it for <span id="leaseLen">1.0 h</span>. If that client vanishes (crash, power loss), the job simply returns to the pool afterwards and someone else picks it up.</dd>
+    <dt>"Done" fractions</dt><dd>An exit is proven when every root job is covered: finished, or split with all children covered. The panel shows covered roots out of all roots plus CPU hours spent. Roots differ enormously in size, so this is not a percentage of the total work, and no such percentage exists before the end.</dd>
+  </dl>
+  <details style="margin-top:10px"><summary>Client log</summary><pre class="log" id="log"></pre></details>
+  <p class="hint" style="margin:8px 0 0">Worker: <code id="workerPath"></code> · hash <code id="hash"></code></p>
+</section>
 
 <script>
 'use strict';
@@ -142,21 +179,42 @@ function renderLevel(code, moves, scale = 30) {
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-/* boards arrive as rows joined by '/'; only level characters are allowed through */
+const SCALE = window.innerWidth < 480 ? 16 : 20;
 function boardText(code) {
   const s = String(code || '');
-  if (!/^[0-9A-Z?]+(\/[0-9A-Z?]+)*$/.test(s)) return null;
+  if (!/^[0-9A-Z?]+(\/[0-9A-Z?]+)*$/.test(s)) return null;   // only level characters get through
   return s.split('/').join('\n');
 }
-function boardEl(caption, b, scale) {
+function fmtH(sec) { return (Number(sec || 0) / 3600).toFixed(2); }
+function fmtDur(sec) { sec = Math.round(Number(sec || 0)); if (sec < 90) return sec + ' s'; if (sec < 5400) return Math.round(sec / 60) + ' min'; if (sec < 172800) return (sec / 3600).toFixed(1) + ' h'; return Math.round(sec / 86400) + ' d'; }
+function fmtWhen(ts) { if (!ts) return ''; const d = new Date(Number(ts) * 1000); return isNaN(d) ? '' : d.toLocaleString(); }
+function fmtN(n) { return n == null ? '–' : Number(n).toLocaleString(); }
+function copyText(txt, btn) {
+  const done = () => { const o = btn.textContent; btn.textContent = 'copied'; setTimeout(() => { btn.textContent = o; }, 1200); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, () => fallbackCopy(txt, done));
+  else fallbackCopy(txt, done);
+}
+function fallbackCopy(txt, done) {
+  const ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); done(); } catch (e) {} document.body.removeChild(ta);
+}
+/* A board with caption, depth, optional attribution, and the Pathology code with a copy button. */
+function boardEl(caption, b, opts = {}) {
   const wrap = document.createElement('div'); wrap.className = 'board';
   const cap = document.createElement('div'); cap.className = 'cap';
-  const depth = b && b.depth != null ? `depth <b>${esc(b.depth)}</b>` : 'no data';
-  cap.innerHTML = `${esc(caption)} · ${depth}`;
+  cap.innerHTML = `${esc(caption)}${b && b.depth != null ? ` · depth <b>${esc(b.depth)}</b>` : ''}${b && b.exit != null && opts.showExit ? ` · exit ${esc(b.exit)}` : ''}`;
   wrap.appendChild(cap);
   const txt = b && boardText(b.code);
-  if (txt) wrap.appendChild(renderLevel(txt, null, scale));
-  else { const ph = document.createElement('div'); ph.className = 'placeholder'; ph.textContent = b && b.depth != null ? 'depth only' : '—'; wrap.appendChild(ph); }
+  if (txt) {
+    wrap.appendChild(renderLevel(txt, null, opts.scale || SCALE));
+    if (opts.who) { const w = document.createElement('div'); w.className = 'who'; w.textContent = opts.who; wrap.appendChild(w); }
+    if (opts.code !== false) {
+      const c = document.createElement('div'); c.className = 'code';
+      const code = document.createElement('code'); code.textContent = b.code; c.appendChild(code);
+      const btn = document.createElement('button'); btn.className = 'secondary small'; btn.textContent = 'copy'; btn.onclick = () => copyText(b.code, btn); c.appendChild(btn);
+      wrap.appendChild(c);
+    }
+  } else { const ph = document.createElement('div'); ph.className = 'placeholder'; ph.textContent = opts.empty || (b && b.depth != null ? 'depth only' : 'nothing yet'); wrap.appendChild(ph); }
   return wrap;
 }
 
@@ -167,12 +225,31 @@ async function post(path, body) {
   } catch (e) { return { error: String(e) }; }
 }
 
-let nameSet = false, workersEdited = false, lastSlots = '';
+let nameSet = false, workersEdited = false, lastSlots = '', exitOptions = '', exitEditing = false;
 $('workers').addEventListener('input', () => { workersEdited = true; });
-$('applyWorkers').onclick = async () => { const n = Number($('workers').value); if (n >= 1) { await post('/workers', { workers: n }); } workersEdited = false; };
+$('applyWorkers').onclick = async () => { const n = Number($('workers').value); if (n >= 1) await post('/workers', { workers: n }); workersEdited = false; };
+$('exitSel').addEventListener('focus', () => { exitEditing = true; });
+$('exitSel').addEventListener('blur', () => { exitEditing = false; });
+$('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; const r = await post('/exit', { exit: v === '' ? null : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
 $('pauseBtn').onclick = () => post('/pause');
 $('resumeBtn').onclick = () => post('/resume');
-$('stopBtn').onclick = () => { if (confirm('Stop the client? Workers will print their remaining subtrees and the client exits.')) post('/stop'); };
+$('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands back its remaining work (seconds), then the client exits.')) post('/stop'); };
+
+function renderExitSelector(st) {
+  const exits = Array.isArray(st.campaign_exits) ? st.campaign_exits : Object.keys(st.exits || {}).map(Number);
+  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open]; }));
+  if (key !== exitOptions && !exitEditing) {
+    exitOptions = key;
+    const sel = $('exitSel'); sel.innerHTML = '<option value="">Any exit</option>';
+    for (const e of exits) {
+      const x = (st.exits || {})[String(e)];
+      const o = document.createElement('option'); o.value = String(e);
+      o.textContent = x ? `Exit ${e} — ${x.roots_covered}/${x.roots} roots covered, ${x.open} open` : `Exit ${e}`;
+      sel.appendChild(o);
+    }
+  }
+  if (!exitEditing) $('exitSel').value = st.exit_pref == null ? '' : String(st.exit_pref);
+}
 
 function render(st) {
   $('serverUrl').textContent = st.server.url;
@@ -181,62 +258,102 @@ function render(st) {
   $('pauseBtn').disabled = st.paused || st.stopping;
   $('resumeBtn').disabled = !st.paused || st.stopping;
   $('stopBtn').disabled = st.stopping;
+  $('exitSel').disabled = st.stopping;
+  renderExitSelector(st);
 
   const banner = $('banner');
-  if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + ' — waiting for workers to print their SUMMARY, then the client exits.'; }
-  else if (st.paused) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Paused. Workers are frozen and still hold their memory.'; }
+  if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + '.'; }
+  else if (st.paused) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Paused. Workers are frozen and still hold their memory; their jobs stay reserved for you.'; }
   else banner.hidden = true;
+
+  const pf = st.pending_flags || {}; const pb = $('pendingBox'); pb.innerHTML = '';
+  for (const k of ['stop', 'pause', 'workers', 'exit']) if (pf[k]) { const d = document.createElement('div'); d.className = 'working'; d.textContent = pf[k]; pb.appendChild(d); pb.appendChild(document.createElement('br')); }
+  const fb = $('fallback');
+  if (st.exit_pref != null && st.exit_fallback) { fb.hidden = false; fb.textContent = `Exit ${st.exit_pref} had no open jobs when the last lease was requested, so the server handed out jobs from other exits instead. Your preference stays and is tried again at each lease.`; }
+  else fb.hidden = true;
 
   const age = st.server.last_ok ? st.time - st.server.last_ok : Infinity;
   const cls = st.server.connected ? (age < 120 ? 'ok' : 'warn') : 'bad';
   $('conn').innerHTML = `<span class="dot ${cls}"></span>${st.server.connected ? 'connected' : 'unreachable'}` +
     (st.server.last_error ? `<div class="hint" style="font-size:11px">${esc(st.server.last_error)}</div>` : '');
-  $('jobsDone').textContent = `${st.stats.jobs_done}`;
-  $('jobsDone').title = `${st.stats.done} exhausted, ${st.stats.split} split; ${st.stats.nodes_done} tree nodes finished locally, ${st.stats.nodes_open} handed back open; ${st.stats.runs_without_summary} run(s) without SUMMARY, ${st.stats.reports_failed} rejected`;
-  $('cpuHours').textContent = st.stats.cpu_hours.toFixed(2);
-  $('outbox').textContent = st.outbox;
-  $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
   $('queued').textContent = st.queued;
-  $('pending').textContent = st.pending;
-  $('pending').title = `${st.stats.batches_sent} batch(es) sent, ${st.stats.reports_sent} report(s) delivered; next batch at most ${st.campaign.batch_interval_s || 10} s away`;
-  $('hash').textContent = (st.src_hash || '').slice(0, 16) + (st.src_hash && st.src_hash.length > 16 ? '…' : '');
+  $('pendingReports').textContent = st.pending;
+  $('outbox').textContent = st.outbox; $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
+  const c = st.campaign || {};
+  if (c.paused_max_s) { $('pausedMax').textContent = fmtDur(c.paused_max_s); $('pausedMax2').textContent = fmtDur(c.paused_max_s); }
+  if (c.split_after_s) $('windowLen').textContent = fmtDur(c.split_after_s);
+  if (c.lease_s) $('leaseLen').textContent = fmtDur(c.lease_s);
+  if (c.batch_interval_s) $('batchLen').textContent = fmtDur(c.batch_interval_s);
 
-  const bests = $('bests'); bests.innerHTML = '';
-  const exits = Object.keys(st.best_per_exit || {}).sort((a, b) => Number(a) - Number(b));
-  if (!exits.length) bests.innerHTML = '<div class="empty">Nothing accepted yet.</div>';
-  for (const ex of exits) bests.appendChild(boardEl(`exit ${ex}`, st.best_per_exit[ex], 22));
-
-  const box = $('workers');
+  /* 2. workers */
+  const box = $('workersBox');
   const want = st.slots.map(s => s.idx).join(',');
   if (want !== lastSlots) { box.innerHTML = ''; lastSlots = want; for (const s of st.slots) { const d = document.createElement('div'); d.className = 'worker'; d.id = 'w' + s.idx; box.appendChild(d); } }
+  if (!st.slots.length) box.innerHTML = '<div class="empty">No workers.</div>';
   for (const s of st.slots) {
     const d = $('w' + s.idx); if (!d) continue;
-    const win = s.job_id != null ? ` · ${esc(s.phase || 'window')} ${esc(s.window_left)} s left · stack ${esc(s.stack_size)} · ${esc(s.nodes_done)} node${s.nodes_done === 1 ? '' : 's'} done` : '';
-    const head = `<h3>Worker ${s.idx + 1} <span class="st">${esc(s.state)}${s.pid ? ' · pid ' + esc(s.pid) : ''}${s.job_id != null ? ` · job #${esc(s.job_id)} exit ${esc(s.exit)} · ${esc(s.elapsed)} s${win}` : ''}</span></h3>` +
-      `<div class="seed">${s.job_id != null ? 'job ' + esc(s.seed) : (s.state === 'idle' ? 'waiting for a job' : '')}</div>` +
-      (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed">now ${esc(s.cur_seed)}</div>` : '');
-    d.innerHTML = head;
-    const boards = document.createElement('div'); boards.className = 'boards';
-    boards.appendChild(boardEl('current node', s.cur, 22));
-    boards.appendChild(boardEl('best this job', s.best, 22));
-    boards.appendChild(boardEl('best in the last second', s.win, 22));
-    d.appendChild(boards);
+    const phase = s.state === 'paused' ? 'paused' : s.state === 'finishing' ? 'handing back' : s.phase === 'absorb' ? 'absorbing' : s.phase === 'window' ? 'searching' : s.state === 'retiring' ? 'finishing, then retiring' : 'waiting for a job';
+    const facts = document.createElement('div'); facts.className = 'facts';
+    facts.innerHTML = `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
+      (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
+        `<div class="seed">${esc(s.seed)}</div>` +
+        (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') +
+        `<div><span class="k">${s.phase === 'absorb' ? 'absorbing, ' : 'window, '}</span>${esc(s.window_left)} s left</div>` +
+        `<div><span class="k">local stack</span> ${esc(s.stack_size)} · <span class="k">nodes done</span> ${esc(s.nodes_done)} · <span class="k">running</span> ${esc(s.elapsed)} s</div>`
+        : `<div class="k">${s.state === 'idle' && !st.paused ? 'waiting for the next lease' : ''}</div>`);
+    d.innerHTML = ''; d.appendChild(facts);
+    d.appendChild(boardEl('current node', s.cur, { code: false, empty: 'no board yet' }));
   }
+
+  /* 3. levels */
+  const lv = $('levels'); lv.innerHTML = '';
+  lv.appendChild(boardEl('best here, last second', st.best_second, { showExit: true, empty: 'nothing in the last second' }));
+  lv.appendChild(boardEl('best here, last hour', st.best_hour, { showExit: true, empty: 'nothing in the last hour' }));
+  const selExit = st.exit_pref != null ? String(st.exit_pref) : (st.exits ? Object.keys(st.exits).sort((a, b) => a - b).find(e => st.exits[e].best) : null);
+  const g = selExit != null && st.exits && st.exits[selExit] ? st.exits[selExit].best : null;
+  const gb = g ? { depth: g.moves, code: g.code, exit: Number(selExit) } : null;
+  lv.appendChild(boardEl(selExit != null ? `best known globally, exit ${selExit}` : 'best known globally', gb, { showExit: false, who: g ? `found by ${g.by || 'unknown'}${g.at ? ' on ' + fmtWhen(g.at) : ''}` : '', empty: st.exits ? 'no level yet for this exit' : 'waiting for the server' }));
+
+  /* 4. me + session */
+  const me = st.me;
+  if (me) {
+    const tiles = [['Jobs done', fmtN(me.jobs_done)], ['Splits handed back', fmtN(me.splits)], ['Nodes finished', fmtN(me.nodes_done)],
+      ['CPU hours', fmtH(me.cpu_s)], ['States searched', fmtN(me.states)], ['Solver calls', fmtN(me.solver_calls)],
+      ['Your deepest level', me.best ? `${me.best.moves} moves (exit ${me.best.exit})` : '–'], ['Rank', me.rank ? `${me.rank} of ${me.contributors}` : '–'], ['First seen', me.first_seen ? fmtWhen(me.first_seen) : '–']];
+    $('meBox').innerHTML = tiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join('');
+  }
+  const se = st.session || {};
+  const stiles = [['Uptime', fmtDur(se.uptime_s)], ['Jobs this session', fmtN(se.jobs)], ['Mean job length', se.mean_job_s != null ? fmtDur(se.mean_job_s) : '–'], ['Longest job', se.jobs ? fmtDur(se.longest_job_s) : '–'],
+    ['Children absorbed', fmtN(se.absorbed)], ['Splits handed back', fmtN(se.splits)], ['Open pieces handed back', fmtN(se.open_handed_back)], ['CPU hours', fmtH(st.stats.cpu_seconds)]];
+  $('sessionBox').innerHTML = stiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join('');
+
+  /* 5. campaign */
+  const tb = $('campTable').querySelector('tbody'); tb.innerHTML = '';
+  const exits = st.exits || {};
+  let totalCpu = 0;
+  for (const e of Object.keys(exits).sort((a, b) => a - b)) {
+    const x = exits[e]; totalCpu += Number(x.cpu_s || 0);
+    const tr = document.createElement('tr'); if (String(st.exit_pref) === e) tr.className = 'sel';
+    tr.innerHTML = `<td>${esc(e)}</td><td class="num">${esc(x.roots_covered)} / ${esc(x.roots)}</td><td class="num">${esc(x.open)}</td><td class="num">${esc(x.leased)}</td><td class="num">${fmtH(x.cpu_s)}</td><td class="num">${x.best ? esc(x.best.moves) : '–'}</td><td>${x.best ? esc(x.best.by || '') : ''}</td>`;
+    tb.appendChild(tr);
+  }
+  if (!Object.keys(exits).length) tb.innerHTML = '<tr><td colspan="7" class="empty">Waiting for the first heartbeat…</td></tr>';
+  const cs = st.campaign_status || {};
+  const tot = [['Total CPU hours', cs.cpu_hours != null ? Number(cs.cpu_hours).toFixed(2) : fmtH(totalCpu)], ['Active volunteers', cs.active_clients != null ? fmtN(cs.active_clients) : (Array.isArray(cs.clients) ? fmtN(cs.clients.length) : '–')],
+    ['Campaign', c.title || '–'], ['Grid', c.grid || '–'], ['Status age', st.campaign_status_age != null ? st.campaign_status_age + ' s' : 'not fetched yet']];
+  $('campTotals').innerHTML = tot.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v" style="font-size:15px">${esc(v)}</div></div>`).join('');
+
+  $('workerPath').textContent = st.worker_path || ''; $('hash').textContent = st.src_hash || '';
   $('log').textContent = (st.log || []).join('\n');
 }
 
 let failures = 0;
 async function poll() {
-  try {
-    const r = await fetch('/state', { cache: 'no-store' });
-    render(await r.json()); failures = 0;
-  } catch (e) {
-    if (++failures === 8) { const b = $('banner'); b.hidden = false; b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). Close this tab.'; }
-  }
+  try { const r = await fetch('/state', { cache: 'no-store' }); render(await r.json()); failures = 0; }
+  catch (e) { if (++failures === 8) { const b = $('banner'); b.hidden = false; b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). You can close this tab.'; } }
 }
 setInterval(poll, 250); poll();
-/* Window close = Stop (DESIGN 4). The client waits 3 s for a new /state poll
-   (a reload) before actually stopping. */
+/* Window close = Stop (DESIGN 4). The client waits 3 s for a new /state poll (a reload) before stopping. */
 window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': '1' }, body: '{}' }); } catch (e) {} });
 </script>
 </body>
