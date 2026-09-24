@@ -1158,7 +1158,11 @@ class Volunteer:
         return out[:self.workers]
 
     def heartbeat(self):
-        body = {"token": self.token, "workers": self.workers, "paused": self.paused, "boards": self.boards()}
+        with self.lock:
+            holding = [s.job["id"] for s in self.slots if s.job] + [j["id"] for j in self.queue]
+        # `holding` lets the server renew exactly what we hold, hand back a job whose lease lapsed
+        # while we slept if nobody took it, and tell us to drop one that someone else now holds
+        body = {"token": self.token, "workers": self.workers, "paused": self.paused, "boards": self.boards(), "holding": holding}
         try:
             res = self.api.post("/api/v2/heartbeat", body, timeout=20)
         except ApiError as e:
@@ -1179,8 +1183,11 @@ class Volunteer:
         with self.lock:
             if isinstance(res.get("me"), dict):
                 self.me = res["me"]
-            if isinstance(res.get("exits"), dict):
-                self.exits = res["exits"]
+            ex = res.get("exits")
+            if isinstance(ex, dict):
+                self.exits = ex
+            elif isinstance(ex, list):   # older servers sent a list
+                self.exits = {str(e.get("exit")): e for e in ex if isinstance(e, dict)}
         leases = res.get("leases")
         if isinstance(leases, list):
             with self.lock:
@@ -1189,6 +1196,22 @@ class Volunteer:
                 lost = [j for j in running if j not in self.leases_from_server]
             if lost:
                 self.log("warning: the server no longer lists these running jobs as leased to us: %s" % lost)
+        drop = res.get("drop")
+        if isinstance(drop, list) and drop:
+            drop = set(int(x) for x in drop if isinstance(x, (int, str)) and str(x).isdigit())
+            with self.lock:
+                for s in self.slots:
+                    if s.job and s.job["id"] in drop and s.proc:
+                        self.log("job %d is held by someone else now (our lease lapsed); stopping worker %d without a report" % (s.job["id"], s.idx))
+                        s.killed_by_client = True
+                        self._signal(s, signal.SIGKILL)
+                gone = [j["id"] for j in self.queue if j["id"] in drop]
+                if gone:
+                    self.log("dropping queued jobs now held by others: %s" % gone)
+                    self.queue = collections.deque(j for j in self.queue if j["id"] not in drop)
+        reclaimed = res.get("reclaimed")
+        if isinstance(reclaimed, list) and reclaimed:
+            self.log("server handed back %d job(s) whose lease had lapsed while we were silent" % len(reclaimed))
         return res
 
     def fetch_campaign_status(self):

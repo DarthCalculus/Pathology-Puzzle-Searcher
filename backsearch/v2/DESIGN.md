@@ -100,10 +100,20 @@ Routes (all JSON; POST bodies ≤ 4 MB; per-token rate limit 30/min)
 - `POST /api/v2/register {name, workers}` → `{token, campaign, queue_position?}`.
   Fails with 503 + `queue_position` when active clients ≥ `max_clients`
   (active = `last_seen` within 3 min and not revoked). Name 1–40 chars.
-- `POST /api/v2/heartbeat {token, workers, paused, boards:[{depth,cur,best}]}`
-  → `{ok, leases:[job ids still valid], revoked?}`. Updates `last_seen`,
-  clamps `workers` to `workers_max`, stores at most `workers` boards of at
-  most 200 chars each. Paused leases are extended up to `paused_max_s`.
+- `POST /api/v2/heartbeat {token, workers, paused, boards:[{depth,cur,best}],
+  holding?:[job ids running or queued]}`
+  → `{ok, leases:[ids held after this call], drop:[ids to abandon],
+  reclaimed:[ids handed back], campaign, me, exits (object keyed by exit)}`.
+  Updates `last_seen`, clamps `workers`, stores ≤ `workers` boards.
+  **Lease renewal (2026-09-24):** every heartbeat pushes the deadline of every
+  held lease to now + `lease_s` (paused: capped at leased_at + lease_s +
+  paused_max_s), so a lease expires only `lease_s` after a client's LAST
+  heartbeat, never while it is alive. The original design started the clock
+  at grant time; with up to 200 jobs leased ahead, heavy members expired while
+  still queued and were re-run by others (3 % of CPU on day one). `holding`
+  ids that expired and are still open are re-leased to the caller
+  (`reclaimed`); ids held by another client or finished come back in `drop`
+  and the client kills that worker without reporting.
 - `POST /api/v2/lease {token, n}` → `{jobs:[{id, exit, seed}]}`. Grants at most
   `3 × workers − currently leased` jobs, oldest open first, preferring the
   exit with the most open work. Sets `lease_until = now + lease_s`.
