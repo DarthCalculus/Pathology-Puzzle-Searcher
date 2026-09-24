@@ -14,6 +14,20 @@
 #   ./build_pgo.sh --no-torch      # force the no-NN stub even if libtorch is present
 #   ./build_pgo.sh --train "--grid 6x6 --exit 0 --time 6"   # custom training run
 #   CC=gcc-13 ./build_pgo.sh   # pick the compiler (clang and GCC PGO are both handled)
+#   KNOBS="-DHP64_SIZE=(1<<9) -DPATH_TOK_MAX=16" ./build_pgo.sh -o /tmp/knob_worker
+#                              # a "knob build": compile-time table-size overrides (tests)
+#   ./build_pgo.sh --print-hash      # print the SRC_HASH this build would carry, then exit
+#
+# SRC_HASH (the v2 protocol's build identity, v2/PROTOCOL3.md §2.1) is the sha256
+# of backsearch.c + sokoban_bfs.c + sokoban_bfs.h, PLUS the sorted list of KNOBS
+# overrides when any are given:
+#   no KNOBS : sha256(cat backsearch.c sokoban_bfs.c sokoban_bfs.h)
+#   KNOBS    : sha256(the same bytes, then "\0KNOBS\0", then the -D tokens sorted
+#              (LC_ALL=C) one per line, each followed by "\n")
+# so a knob build can never carry (and be whitelisted under) the release hash.
+# -D/-U/-O/-f flags smuggled in through CC are refused: they would change the
+# search without changing the hash.  The binary's --version prints the effective
+# knob values (KNOBS line).
 #
 # libtorch: if nn_inference.o exists and `python3 -c 'import torch'` works,
 # the NN hooks are linked against the pip-installed libtorch exactly as the
@@ -25,20 +39,45 @@ cd "$(dirname "$0")"
 OUT=./backsearch_worker
 TRAIN_ARGS="--grid 5x5 --exit 0 --time 4"
 USE_TORCH=auto
+PRINT_HASH=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) OUT="$2"; shift 2 ;;
     --no-torch) USE_TORCH=no; shift ;;
     --torch) USE_TORCH=yes; shift ;;
     --train) TRAIN_ARGS="$2"; shift 2 ;;
+    --print-hash) PRINT_HASH=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+# --- knob overrides (KNOBS="-DNAME=VALUE ...") ---------------------------------
+KNOBS=${KNOBS:-}
+for k in $KNOBS; do
+  case "$k" in
+    -D[A-Za-z_]*) ;;
+    *) echo "KNOBS may only contain -DNAME or -DNAME=VALUE tokens (got '$k')" >&2; exit 2 ;;
+  esac
+done
+case " ${CC:-cc} " in
+  *" -D"*|*" -U"*|*" -O"*|*" -f"*|*" -W"*|*" -m"*|*" -include"*)
+    echo "CC='${CC:-}' carries compiler flags: put compile-time overrides in KNOBS=\"-D...\" (they are folded into SRC_HASH)" >&2; exit 2 ;;
+esac
+
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo "")
-# Source hash for the v2 job protocol (v2/DESIGN.md): sha256 of the search sources,
-# independent of compiler/PGO so every honest build of the same code agrees.
-SRC_HASH=$(cat backsearch.c sokoban_bfs.c sokoban_bfs.h | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-64)
+# Source hash for the v2 job protocol (v2/PROTOCOL3.md §2.1): sha256 of the search
+# sources (plus the sorted knob overrides, if any), independent of compiler/PGO so
+# every honest build of the same code agrees.
+sha256_stdin() { { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-64; }
+if [ -z "$KNOBS" ]; then
+  SRC_HASH=$(cat backsearch.c sokoban_bfs.c sokoban_bfs.h | sha256_stdin)
+else
+  # shellcheck disable=SC2086
+  SORTED_KNOBS=$(printf '%s\n' $KNOBS | LC_ALL=C sort)
+  SRC_HASH=$( { cat backsearch.c sokoban_bfs.c sokoban_bfs.h; printf '\0KNOBS\0'; printf '%s\n' "$SORTED_KNOBS"; } | sha256_stdin)
+fi
+if [ "$PRINT_HASH" = 1 ]; then echo "$SRC_HASH"; exit 0; fi
+[ -n "$KNOBS" ] && echo "knob build: $KNOBS (SRC_HASH $SRC_HASH)"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -74,7 +113,7 @@ EOF
   NN_OBJ="$TMP/nn_stub.o"
 fi
 
-CFLAGS="-O3 -DGIT_SHA_STR=\"$SHA\" -DSRC_HASH_STR=\"$SRC_HASH\""
+CFLAGS="-O3 $KNOBS -DGIT_SHA_STR=\"$SHA\" -DSRC_HASH_STR=\"$SRC_HASH\""
 LIBS="-lz -lm"
 
 # --- compiler family: clang (macOS, or clang on Linux) vs GCC ------------------

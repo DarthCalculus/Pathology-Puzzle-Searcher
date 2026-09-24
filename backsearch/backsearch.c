@@ -14,9 +14,9 @@
  * choices maximise forward solve length, so the result is an upper
  * bound on the final puzzle's forward solve.
  *
- * Grid size is configurable at runtime via --grid RxC (R,C in [1..5]).
- * The underlying sokoban_bfs.c stays a 5x5 solver; smaller grids are
- * emulated by treating cells outside the R*C window as permanent walls.
+ * Grid size is configurable at runtime via --grid RxC (any R*C <= 64 =
+ * MAX_NCELLS).  States are packed into 64 or 128 bits for the solver; a
+ * state that does not fit ends the run with status "error" (exit 5).
  *
  * Win condition (verified in sokoban_bfs.c:682) is "player ends turn
  * on exit_pos" — the existing header comment about blocks reaching
@@ -36,6 +36,8 @@
 #include <limits.h>
 #include <zlib.h>
 #include <signal.h>
+#include <stddef.h>
+#include <sys/resource.h>
 
 #define DEFAULT_CAP_S    0.0    /* 0 = no time limit (run until queue is empty) */
 
@@ -224,11 +226,25 @@ static long long g_export_entries = 0;
  *   3  un-consume  (introduces a new block AND a new hole simultaneously,
  *                   reversing a forward block-into-hole consumption)
  */
-#define PATH_TOK_MAX 250
+/* Tree paths hold one token per backward move.  PATH_TOK_MAX bounds the depth
+ * of every node a run can hand back (REMAINING) and of every --seed-path: a
+ * node that would need more tokens ends the run with status path_overflow
+ * (exit 4, no REMAINING), a longer seed is a bad_seed (exit 3).  Printed by
+ * --version (LIMITS path_tok_max).  The buffer is rounded up to 64 bytes so
+ * bs_copy() can copy the used part in whole 64-byte chunks. */
+#ifndef PATH_TOK_MAX
+#define PATH_TOK_MAX 1024
+#endif
+#if PATH_TOK_MAX < 1 || PATH_TOK_MAX > 65535
+#error "PATH_TOK_MAX must be in [1, 65535] (BState.plen is a uint16_t)"
+#endif
+#define PATH_BUF ((((PATH_TOK_MAX) + 63) / 64) * 64)
+#define PATH_TEXT_CAP (3 * (PATH_TOK_MAX) + 8)   /* "D1," per token: path_text() buffers */
 typedef struct { int8_t direction; int8_t variant; } SeedStep;
-static SeedStep g_seed_path[1024];
+static SeedStep g_seed_path[PATH_TOK_MAX];
 static int      g_seed_path_n = 0;
-static int      g_seed_path_overflow = 0;   /* set by parse_seed_path when the token cap is hit */
+static int      g_seed_path_overflow = 0;   /* set by parse_seed_path when the seed has more than PATH_TOK_MAX tokens */
+static int      g_seed_parse_error = 0;     /* --seed-path text was malformed or too long: status bad_seed, exit 3 */
 static int      g_have_seed_path = 0;
 static int      g_print_seed_key = 0; /* build the --seed-path state, print its canonical key, exit */
 static uint64_t g_watch_key = 0;       /* if nonzero, report when this canonical key shows up in a rollout pool */
@@ -344,7 +360,10 @@ static uint64_t apply_sym_mask(const Sym *s, uint64_t m) {
     return out;
 }
 
-/* Filter g_d4 to those that fix (exit_pos, g_walkable_mask, g_fixed_holes_mask). */
+/* Filter g_d4 to those that fix every per-cell rule of the search: the exit,
+ * g_walkable_mask, g_fixed_holes_mask, each --place-holes cell mask and the
+ * --mandatory-holes forced cells.  Symmetry folding (root directions and
+ * canonical_state_key) is sound only under elements that preserve all of them. */
 static void compute_exit_syms(int exit_pos) {
     g_n_exit_syms = 0;
     for (int i = 0; i < g_n_d4; i++) {
@@ -352,6 +371,11 @@ static void compute_exit_syms(int exit_pos) {
         if (s->cell[exit_pos] != exit_pos) continue;
         if (apply_sym_mask(s, g_walkable_mask) != g_walkable_mask) continue;
         if (apply_sym_mask(s, g_fixed_holes_mask) != g_fixed_holes_mask) continue;
+        if (apply_sym_mask(s, g_forced_mand_cells) != g_forced_mand_cells) continue;
+        int place_ok = 1;
+        for (int p = 0; p < g_place_count; p++)
+            if (g_place[p].mask && apply_sym_mask(s, g_place[p].mask) != g_place[p].mask) { place_ok = 0; break; }
+        if (!place_ok) continue;
         g_exit_syms[g_n_exit_syms++] = s;
     }
 }
@@ -453,14 +477,26 @@ typedef struct {
     uint8_t  adjflags;                   /* bit d: at some suffix moment (depth >= 2) since the exit block last landed on the exit, the player
                                           * stood on adj[exit][d] with the far cell adj[exit][d^2] committed and block-free -- a pull-off in
                                           * direction d would give that moment a one-move win (see exit_block_dead) */
-    uint8_t  plen;                       /* tree path from the exit root: one byte per backward step, (variant << 2) | direction;
+    uint16_t plen;                       /* tree path from the exit root: one byte per backward step, (variant << 2) | direction;
                                           * a bulk walk-back child carries the whole walk (BFS-parent chain).  Fixes the DFS
                                           * position of every node, so a run can be checkpointed by one path (CURSOR) and
-                                          * restricted to a DFS-order range (--from / --until). */
-    uint8_t  path[PATH_TOK_MAX];
+                                          * restricted to a DFS-order range (--from / --until).  MUST stay the last two fields:
+                                          * bs_copy() copies the header up to `path` plus only the used part of `path`. */
+    uint8_t  path[PATH_BUF];
 } BState;
+/* Copy a state: the fixed header, then only the used part of the path, in whole
+ * 64-byte chunks (PATH_BUF is a multiple of 64, so the last chunk stays inside
+ * the buffer).  Bytes of dst->path past plen are left unspecified -- nothing
+ * reads a path beyond plen.  This keeps the hot-path copies (successor build,
+ * stack push/pop) no larger than they were with the old 250-token paths. */
+#define BS_HDR offsetof(BState, path)
+static inline void bs_copy(BState *restrict d, const BState *restrict s) {
+    memcpy(d, s, BS_HDR);
+    for (int i = 0; i < (int)s->plen; i += 64) memcpy(d->path + i, s->path + i, 64);
+}
+static int g_path_overflow = 0;   /* a node needed more than PATH_TOK_MAX tokens: the run ends with status path_overflow */
 static inline int path_push(BState *s, int D, int V) {
-    if (s->plen >= PATH_TOK_MAX) return 0;
+    if (s->plen >= PATH_TOK_MAX) { g_path_overflow = 1; return 0; }
     if (V == 3) V = 2;   /* push-existing and new-block are mutually exclusive at a state and share the text digit 2: one byte value */
     s->path[s->plen++] = (uint8_t)((V << 2) | (D & 3));
     return 1;
@@ -501,6 +537,17 @@ static void on_stop_signal(int sig) { (void)sig; g_stop_requested = 1; }
 #define SRC_HASH_STR ""
 #endif
 static double g_split_after_s   = 0;     /* 0 = never */
+/* Protocol mode = --status-every was given (every v2 client run passes it).
+ * In protocol mode the BS_* debug variables (BS_DUMP_SEED, BS_TRACE_*,
+ * BS_DUMP_PRUNE, BS_DEBUG_RANGE) are ignored unless BS_ALLOW_DEBUG=1, and the
+ * flags that make the search non-exhaustive by design are refused (M48). */
+static int    g_protocol_mode   = 0;
+static int    g_seed_error      = 0;     /* --seed-path did not replay: status bad_seed, exit 3 */
+static int    g_debug_stop      = 0;     /* BS_DUMP_SEED stopped the run: status "debug" (never coverage) */
+static const char *bs_getenv(const char *name) {
+    if (g_protocol_mode) { const char *a = getenv("BS_ALLOW_DEBUG"); if (!a || strcmp(a, "1") != 0) return NULL; }
+    return getenv(name);
+}
 static FILE  *g_trace_valid    = NULL;  /* BS_TRACE_VALID=file: one line per accepted valid state: path, depth, level code -- the job-decomposition invariant */
 static int    g_status_every_ms = 0;     /* 0 = off */
 static int    g_split_fired     = 0;     /* this exit's search ended by --split-after or a signal (REMAINING printed) */
@@ -534,13 +581,29 @@ typedef struct { SokRefTable t; int next_free, rc; } PTab;   /* rc: queued state
 static PTab *g_ptab = NULL; static int g_ptab_n = 0, g_ptab_cap = 0, g_ptab_free = -1;
 static int  g_ptab_active = 0;                /* DFS mode only */
 static int  g_no_ptab = 0;                    /* --no-parent-table */
+#ifndef HTP_EXPORT_MAX
 #define HTP_EXPORT_MAX 32768
+#endif
+static void fatal_error(const char *msg);   /* status "error", exit 5 (defined near main) */
+static void oom_fatal(const char *what, size_t bytes) {
+    char m[160]; snprintf(m, sizeof m, "out of memory: %s (%zu bytes)", what, bytes); fatal_error(m);
+}
+static void *xrealloc(void *old, size_t sz, const char *what) {
+    void *p = realloc(old, sz);
+    if (!p && sz) oom_fatal(what, sz);
+    return p;
+}
+static void *xcalloc(size_t n, size_t sz, const char *what) {
+    void *p = calloc(n, sz);
+    if (!p && n && sz) oom_fatal(what, n * sz);
+    return p;
+}
 static long long g_ptab_saved = 0, g_ptab_used = 0, g_ptab_live = 0, g_ptab_live_peak = 0, g_ptab_live_slots = 0, g_ptab_live_slots_peak = 0;
 static int ptab_alloc(const uint64_t *k, const int32_t *c, int n) {
     int id;
     if (g_ptab_free >= 0) { id = g_ptab_free; g_ptab_free = g_ptab[id].next_free; }
     else {
-        if (g_ptab_n == g_ptab_cap) { g_ptab_cap = g_ptab_cap ? g_ptab_cap * 2 : 1024; g_ptab = realloc(g_ptab, g_ptab_cap * sizeof *g_ptab); memset(g_ptab + g_ptab_n, 0, (g_ptab_cap - g_ptab_n) * sizeof *g_ptab); }
+        if (g_ptab_n == g_ptab_cap) { g_ptab_cap = g_ptab_cap ? g_ptab_cap * 2 : 1024; g_ptab = xrealloc(g_ptab, g_ptab_cap * sizeof *g_ptab, "parent-table pool"); memset(g_ptab + g_ptab_n, 0, (g_ptab_cap - g_ptab_n) * sizeof *g_ptab); }
         id = g_ptab_n++;
     }
     PTab *t = &g_ptab[id];
@@ -927,8 +990,11 @@ static uint64_t state_key(const BState *s) {
 /* Permute every cell-valued field of s through symmetry sym, then re-sort
  * blocks and holes so the result has canonical sort order.  Used by
  * canonical_state_key to fold sym-equivalent states into one dedup entry. */
+/* Only the fields state_key() reads are set in *out (the rest of it, the path
+ * included, is left unspecified): no full-state copy per symmetry element. */
 static void apply_sym_to_state(const Sym *sym, const BState *in, BState *out) {
-    *out = *in;
+    out->nblocks = in->nblocks;
+    out->nholes  = in->nholes;
     out->committed_empty = apply_sym_mask(sym, in->committed_empty);
     out->player_pos = sym->cell[(int)in->player_pos];
     for (int i = 0; i < in->nblocks; i++) {
@@ -1009,19 +1075,31 @@ static void shallow_evict(void) {
             hist[d]++;
         }
     long long target = g_shallow_count / 2;
-    long long acc = 0;
+    long long acc = 0, below = 0;
     int thresh = 255;
     for (int d = 0; d < 256; d++) {
         acc += hist[d];
         if (acc >= target) { thresh = d; break; }
+        below = acc;
+    }
+    /* Progress guarantee: keeping the whole threshold bucket can keep nearly
+     * everything when one depth holds most entries; the table then stays above
+     * the 80% trigger and every insert re-runs this eviction.  When the bucket
+     * would push the survivors past 3/4, keep only a key-hash fraction of it
+     * (deterministic; entries are dedup hints, dropping any is sound), so each
+     * eviction frees at least a quarter.  Normal evictions are unchanged. */
+    uint64_t part_lim = UINT64_MAX;   /* keep a depth == thresh entry iff (key >> 48) < part_lim */
+    if (acc * 4 > g_shallow_count * 3 && hist[thresh] > 0) {
+        long long want = target - below; if (want < 0) want = 0;
+        part_lim = (uint64_t)((double)want / (double)hist[thresh] * 65536.0);
     }
     /* Rehash survivors (depth <= thresh) into a fresh table. */
-    ShallowSlot *fresh = calloc(SHALLOW_CAP, sizeof *fresh);
-    if (!fresh) { perror("calloc shallow_evict"); exit(1); }
+    ShallowSlot *fresh = xcalloc(SHALLOW_CAP, sizeof *fresh, "dedup shallow table");
     long long kept = 0;
     for (size_t i = 0; i < SHALLOW_CAP; i++) {
         if (g_shallow[i].key == 0) continue;
         if (g_shallow[i].depth > thresh) continue;
+        if (g_shallow[i].depth == thresh && part_lim != UINT64_MAX && (g_shallow[i].key >> 48) >= part_lim) continue;
         size_t j = (size_t)g_shallow[i].key & SHALLOW_MASK;
         while (fresh[j].key != 0) j = (j + 1) & SHALLOW_MASK;
         fresh[j] = g_shallow[i];
@@ -1063,8 +1141,7 @@ static void recent_evict(void) {
     }
     uint64_t thresh_clock = lo + (uint64_t)thresh_bin * step;
     /* Rehash survivors (clock >= thresh_clock) into a fresh table. */
-    RecentSlot *fresh = calloc(RECENT_CAP, sizeof *fresh);
-    if (!fresh) { perror("calloc recent_evict"); exit(1); }
+    RecentSlot *fresh = xcalloc(RECENT_CAP, sizeof *fresh, "dedup recent table");
     long long kept = 0;
     for (size_t i = 0; i < RECENT_CAP; i++) {
         if (g_recent[i].key == 0) continue;
@@ -1129,22 +1206,26 @@ static int dedup_two_tables(uint64_t key, int depth) {
              * our hoisted local is now stale; reread for the insert. */
         }
         ShallowSlot * const stab2 = g_shallow;
-        size_t j = (size_t)key & SHALLOW_MASK;
-        while (stab2[j].key != 0) j = (j + 1) & SHALLOW_MASK;
-        stab2[j].key = key;
-        stab2[j].depth = depth;
-        g_shallow_count++;
+        size_t j = (size_t)key & SHALLOW_MASK, probes = 0;
+        while (stab2[j].key != 0 && ++probes < SHALLOW_CAP) j = (j + 1) & SHALLOW_MASK;
+        if (stab2[j].key == 0) {   /* a full table skips the insert: always sound for dedup */
+            stab2[j].key = key;
+            stab2[j].depth = depth;
+            g_shallow_count++;
+        }
     }
     /* --- Insert into recent if missing --- */
     if (!seen_recent) {
         if (g_recent_count * 5 >= (long long)RECENT_CAP * 4) recent_evict();
         RecentSlot * const rtab2 = g_recent;
-        size_t j = (size_t)key & RECENT_MASK;
-        while (rtab2[j].key != 0) j = (j + 1) & RECENT_MASK;
-        rtab2[j].key = key;
-        rtab2[j].depth = depth;
-        rtab2[j].clock = now;
-        g_recent_count++;
+        size_t j = (size_t)key & RECENT_MASK, probes = 0;
+        while (rtab2[j].key != 0 && ++probes < RECENT_CAP) j = (j + 1) & RECENT_MASK;
+        if (rtab2[j].key == 0) {
+            rtab2[j].key = key;
+            rtab2[j].depth = depth;
+            rtab2[j].clock = now;
+            g_recent_count++;
+        }
     }
     return 0;
 }
@@ -1177,17 +1258,16 @@ static void q_push(const BState *s) {
         return;
     }
     if ((size_t)g_q_tail == g_q_cap) {
-        g_q_cap = g_q_cap ? g_q_cap * 2 : 65536;
-        g_queue = realloc(g_queue, g_q_cap * sizeof(BState));
-        if (!g_queue) { perror("realloc queue"); exit(1); }
+        g_q_cap = g_q_cap ? g_q_cap * 2 : 4096;
+        g_queue = xrealloc(g_queue, g_q_cap * sizeof(BState), "DFS stack");
     }
-    g_queue[g_q_tail++] = *s;
+    bs_copy(&g_queue[g_q_tail++], s);
     if (g_q_tail > g_q_peak) g_q_peak = g_q_tail;
 }
 
 static int q_pop(BState *out) {
     if (g_q_tail == 0) return 0;
-    *out = g_queue[--g_q_tail];
+    bs_copy(out, &g_queue[--g_q_tail]);
     return 1;
 }
 
@@ -1602,6 +1682,132 @@ static long long g_pruned_cap     = 0;   /* states pruned by --shortcut-state-ca
 static long long g_pruned_axis    = 0;   /* states pruned by --single-axis-blocks */
 static long long g_solver_calls   = 0;
 
+/* -------------------------------------------------------------------------
+ * Solver-result classification (v2/PROTOCOL3.md §1 and §2.4).  Every consumer
+ * of a shortcut-check result goes through classify():
+ *   x >= 0          PRUNE    a real shortcut of length x exists
+ *   -1              ACCEPT   no shortcut within the cutoff (proven exhaustively)
+ *   -2 / -3 / -5    UNKNOWN  the check hit a capacity limit (pending cap /
+ *                            probe limit / full big table) and proved nothing:
+ *                            the state is explored like an accepted one, is NOT
+ *                            counted as valid, never becomes best, never exports
+ *                            a parent table, and (no block on the exit) is kept
+ *                            as an unresolved candidate
+ *   -4              PRUNE    --shortcut-state-cap (an explicit heuristic prune;
+ *                            refused in protocol mode)
+ *   anything else   ERROR    e.g. SOK_NO_FIT: the run ends with status "error"
+ * The exactness invariant is then V <= T <= V u U (verified levels V, true
+ * levels T, unresolved candidates U).
+ * ------------------------------------------------------------------------- */
+enum { SC_PRUNE = 0, SC_ACCEPT = 1, SC_UNKNOWN = 2, SC_ERROR = 3 };
+static inline int classify(int x) {
+    if (x >= 0)  return SC_PRUNE;
+    if (x == -1) return SC_ACCEPT;
+    if (x == SOK_PENDING_CAP || x == SOK_PROBE_LIMIT || x == SOK_TABLE_FULL) return SC_UNKNOWN;
+    if (x == -4) return SC_PRUNE;
+    return SC_ERROR;
+}
+static long long g_unknown = 0, g_unknown_pq = 0, g_unknown_probe = 0, g_unknown_big = 0;   /* inconclusive checks, by cause */
+static const char *unknown_cause(int x) { return x == SOK_PENDING_CAP ? "pq" : x == SOK_PROBE_LIMIT ? "probe" : "big"; }
+static void count_unknown(int x) {
+    g_unknown++;
+    if (x == SOK_PENDING_CAP) g_unknown_pq++; else if (x == SOK_PROBE_LIMIT) g_unknown_probe++; else g_unknown_big++;
+}
+
+/* Unresolved candidates: UNKNOWN states with no block on the exit.  The deepest
+ * UNRESOLVED_MAX are kept (a min-heap on depth; among equal depths the earliest
+ * found stay); at the end of an exit's search the ones deeper than the verified
+ * best are printed as UNRESOLVED lines.  g_cand_dropped_max is the depth of the
+ * deepest candidate that did not fit: if it exceeds the final best, the printed
+ * list is incomplete for the exactness rule (SUMMARY "unresolved_dropped_max"). */
+#ifndef UNRESOLVED_MAX
+#define UNRESOLVED_MAX 1000
+#endif
+typedef struct { int32_t depth; int8_t cause; uint16_t plen; long long seq; char code[80]; uint8_t path[PATH_TOK_MAX]; } Cand;
+static Cand     *g_cands = NULL;
+static int       g_ncands = 0;
+static long long g_cand_seq = 0;
+static int       g_cand_dropped_max = 0;
+static FILE     *g_trace_unresolved = NULL;   /* BS_TRACE_UNRESOLVED=file: EVERY candidate, same line format as BS_TRACE_VALID */
+static int cand_worse(const Cand *a, const Cand *b) {   /* a would be dropped before b */
+    return a->depth < b->depth || (a->depth == b->depth && a->seq > b->seq);
+}
+static void cand_sift_down(int i) {
+    for (;;) {
+        int l = 2 * i + 1, r = l + 1, m = i;
+        if (l < g_ncands && cand_worse(&g_cands[l], &g_cands[m])) m = l;
+        if (r < g_ncands && cand_worse(&g_cands[r], &g_cands[m])) m = r;
+        if (m == i) return;
+        Cand t = g_cands[i]; g_cands[i] = g_cands[m]; g_cands[m] = t; i = m;
+    }
+}
+static void cand_add(const BState *s, int x) {
+    if (g_trace_unresolved) {
+        char pb[PATH_TEXT_CAP], code[128];
+        path_text(s->path, s->plen, pb, sizeof pb); level_code_text(s, g_exit_pos, '1', code, sizeof code);
+        fprintf(g_trace_unresolved, "%s\t%d\t%s\n", pb, s->depth, code);
+    }
+    if (!g_cands) g_cands = xcalloc(UNRESOLVED_MAX, sizeof *g_cands, "unresolved candidates");
+    Cand *c; int replaced_root = 0;
+    if (g_ncands < UNRESOLVED_MAX) {
+        c = &g_cands[g_ncands++];
+    } else {
+        /* full: the new one replaces the root (the shallowest, latest) only if it is strictly deeper */
+        if (s->depth <= g_cands[0].depth) { if (s->depth > g_cand_dropped_max) g_cand_dropped_max = s->depth; return; }
+        if (g_cands[0].depth > g_cand_dropped_max) g_cand_dropped_max = g_cands[0].depth;
+        c = &g_cands[0]; replaced_root = 1;
+    }
+    c->depth = s->depth; c->cause = (int8_t)x; c->seq = g_cand_seq++;
+    c->plen = s->plen; memcpy(c->path, s->path, s->plen);
+    level_code_text(s, g_exit_pos, '1', c->code, sizeof c->code);
+    if (replaced_root) cand_sift_down(0);
+    else {   /* sift the new leaf up */
+        int i = (int)(c - g_cands);
+        while (i > 0) { int p = (i - 1) / 2; if (!cand_worse(&g_cands[i], &g_cands[p])) break; Cand t = g_cands[i]; g_cands[i] = g_cands[p]; g_cands[p] = t; i = p; }
+    }
+}
+static void cands_reset(void) { g_ncands = 0; g_cand_seq = 0; g_cand_dropped_max = 0; }
+static int cand_print_cmp(const void *a, const void *b) {   /* deepest first, then in the order found */
+    const Cand *x = a, *y = b;
+    if (x->depth != y->depth) return x->depth > y->depth ? -1 : 1;
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+/* Print the kept candidates deeper than `best` (the exit's verified best) as
+ * UNRESOLVED lines; returns how many were printed.  Reorders g_cands. */
+static int print_unresolved(int best) {
+    if (!g_ncands) return 0;
+    qsort(g_cands, (size_t)g_ncands, sizeof *g_cands, cand_print_cmp);
+    int n = 0;
+    for (int i = 0; i < g_ncands && g_cands[i].depth > best; i++) {
+        char pb[PATH_TEXT_CAP]; path_text(g_cands[i].path, g_cands[i].plen, pb, sizeof pb);
+        printf("UNRESOLVED\t%d\t%s\t%s\t%s\n", g_cands[i].depth, g_cands[i].code, pb, unknown_cause(g_cands[i].cause));
+        n++;
+    }
+    g_ncands = 0;   /* sorted: no longer a heap */
+    return n;
+}
+
+/* Split / time / status checks.  The DFS loop checks the clock every 64
+ * expansions; a long expansion (big solves, bulk fallbacks) is covered by the
+ * clock readings shortcut_check() takes anyway: every tick interval they print
+ * a due STATUS line and ask the DFS loop to re-check split and time right after
+ * the current expansion. */
+static int           g_timers_on = 0;
+static struct timespec g_t0_run;
+static double        g_tick_interval_s = 1.0, g_next_tick_s = 0, g_last_status_s = 0;
+static int           g_tick_flag = 0;
+static const BState *g_cur_node = NULL;          /* node being expanded (DFS mode) */
+static long long     g_split_after_nodes = 0;    /* --split-after-nodes N: split after exactly N expansions (0 = off) */
+static void print_status(const BState *s);
+static inline double ts_diff(struct timespec a, struct timespec b) { return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) * 1e-9; }
+static void timer_tick(struct timespec now) {
+    double el = ts_diff(g_t0_run, now);
+    if (el < g_next_tick_s) return;
+    g_next_tick_s = el + g_tick_interval_s;
+    g_tick_flag = 1;
+    if (g_status_every_ms > 0 && g_cur_node && el - g_last_status_s >= g_status_every_ms / 1000.0) { print_status(g_cur_node); g_last_status_s = el; }
+}
+
 /* Cross-exit overall best (for streaming new bests as they happen). */
 static int             g_overall_best_depth = 0;
 static BState          g_overall_best_state;
@@ -1677,10 +1883,11 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
  * therefore at most d-1 (one parity step below).  So we only need to
  * search for paths of length <= depth-2 (depth = d+1 here, so d-1 = depth-2).
  *
- * Returns:
- *    >= 0 : a real shortcut of that length exists — caller should prune.
- *    -1   : no shortcut within the cutoff — caller should accept the state.
- *    -2   : solver overflow (treat as prune for safety). */
+ * Returns the solver's code (see sokoban_bfs.h and classify()):
+ *    >= 0 : a real shortcut of that length exists — caller prunes.
+ *    -1   : no shortcut within the cutoff — caller accepts the state.
+ *    -2/-3/-5 : the check hit a capacity limit: UNKNOWN, never a prune.
+ *    -6   : the state does not fit the solver's packing: an internal error. */
 /* Per-depth solver-call accounting (profiling).  Buckets correspond to
  * the state's backward depth at the moment of the shortcut call. */
 #define SHORTCUT_PROFILE_BUCKETS 96
@@ -1688,10 +1895,11 @@ static long long g_solver_calls_by_depth[SHORTCUT_PROFILE_BUCKETS];
 static double    g_solver_time_by_depth[SHORTCUT_PROFILE_BUCKETS];
 static int       g_solver_profile = 0;   /* print per-depth solver-call profile; opt-in via --solver-profile */
 
-/* shortcut_check return codes, extended:
+/* shortcut_check return codes, extended (all consumers use classify()):
  *   >= 0 : real shortcut of that length exists (caller prunes)
  *   -1   : no shortcut within the cutoff (caller accepts the state)
- *   -2   : heap overflow (caller prunes conservatively)
+ *   -2/-3/-5 : capacity limit hit: UNKNOWN (explored, not counted, candidate)
+ *   -6   : state does not fit the packing (internal error, run ends)
  *   -4   : --shortcut-state-cap exceeded; treated as a prune.  The forward
  *          solver explored more than g_shortcut_state_cap states without
  *          finding a shortcut, signalling a "branchy" subtree unlikely to
@@ -1706,6 +1914,7 @@ static int shortcut_check(const BState *s) {
     clock_gettime(CLOCK_MONOTONIC, &t0);
     int rc = sokoban_solve_cutoff(&pz, NULL, &prof, max_cost);
     clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (g_timers_on) timer_tick(t1);   /* reuses this clock reading: split/status checks inside long expansions */
     /* Branching signal stamped into BState.branch_factor.  Default: states_popped
      * (total unique expanded states) — grows with how much work the forward
      * solver did.  With --beam-score-tailwidth: a deep-weighted sum of the
@@ -1731,8 +1940,8 @@ static int shortcut_check(const BState *s) {
     g_solver_time_by_depth[b] += (t1.tv_sec - t0.tv_sec)
                               + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     /* Only enforce the cap when no real shortcut was found.  If rc >= 0
-     * the state is pruned anyway; if rc == -2 the heap already overflowed
-     * (separate signal).  Otherwise high states_popped means the forward
+     * the state is pruned anyway; if rc is a capacity code the check is
+     * UNKNOWN (separate signal).  Otherwise high states_popped means the forward
      * solver expanded a lot of states without finding a shortcut, which is
      * the "too branchy to deepen" signal we want to prune on. */
     if (g_shortcut_state_cap > 0 && rc == -1
@@ -1837,14 +2046,22 @@ static void flush_surrogate_pending(void) {
         }
 
         int x = shortcut_check(s);
-        if (x >= 0 || x == -2 || x == -4) {
+        int cls = classify(x);   /* same rule as try_successor_x (N21: -3 used to be accepted here) */
+        if (cls == SC_PRUNE) {
             g_pruned_short++;
             if (x == -4) g_pruned_cap++;
-            harvest_emit(s, sid, x >= 0 ? 'S' : (x == -4 ? 'V' : 'E'), x);
+            harvest_emit(s, sid, x >= 0 ? 'S' : 'V', x);
             continue;
         }
+        if (cls == SC_ERROR) { char m[160]; snprintf(m, sizeof m, "solver code %d on a state with %d blocks, %d holes (does not fit the packing)", x, s->nblocks, s->nholes); fatal_error(m); }
+        int unknown = (cls == SC_UNKNOWN);
+        if (unknown) {
+            count_unknown(x);
+            int bx = 0; for (int j = 0; j < s->nblocks; j++) if (s->block_pos[j] == g_exit_pos) { bx = 1; break; }
+            if (!bx) cand_add(s, x);   /* NB: this experimental path never records the edge token in the path */
+        }
 
-        if (s->depth > g_best_depth) {
+        if (!unknown && s->depth > g_best_depth) {
             int block_on_exit = 0;
             if (!g_allow_block_on_exit)
                 for (int j = 0; j < s->nblocks; j++)
@@ -1860,7 +2077,7 @@ static void flush_surrogate_pending(void) {
                 }
             }
         }
-        harvest_emit(s, sid, 'A', -1);
+        harvest_emit(s, sid, unknown ? 'E' : 'A', unknown ? x : -1);
 
         BState ns = *s;
         ns.state_id = (int32_t)sid;
@@ -1915,7 +2132,7 @@ static int parse_seed_path(const char *s) {
         /* Remap user-facing digit to internal variant number:
          *   1 -> 1 (walk-back), 2 -> 2 (push, auto 2/3), 3 -> 4 (un-consume) */
         int var = (user_action == 3) ? 4 : user_action;
-        if (g_seed_path_n >= (int)(sizeof(g_seed_path)/sizeof(*g_seed_path))) { g_seed_path_overflow = 1; return 0; }
+        if (g_seed_path_n >= PATH_TOK_MAX) { g_seed_path_overflow = 1; return 0; }   /* longer than any path a run can hand back */
         g_seed_path[g_seed_path_n].direction = (int8_t)dir;
         g_seed_path[g_seed_path_n].variant   = (int8_t)var;
         g_seed_path_n++;
@@ -2112,9 +2329,9 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         int dead = exit_block_stuck(s, adjflags);
         if (dead) {
             static int dumped = 0; static int dump_max = -1;
-            if (dump_max < 0) dump_max = getenv("BS_DUMP_PRUNE") ? atoi(getenv("BS_DUMP_PRUNE")) : 0;
+            if (dump_max < 0) dump_max = bs_getenv("BS_DUMP_PRUNE") ? atoi(bs_getenv("BS_DUMP_PRUNE")) : 0;
             if (dumped < dump_max) {   /* debugging aid: show pruned states */
-                char pb[4 * PATH_TOK_MAX + 8]; path_text(s->path, s->plen, pb, sizeof pb);
+                char pb[PATH_TEXT_CAP]; path_text(s->path, s->plen, pb, sizeof pb);
                 printf("PRUNED (%s) depth %d exit cell %d player %d adjflags U%d R%d D%d L%d path %s\n",
                        dead == 1 ? "exit block permanently stuck" : "every pull-off refuted by a suffix moment",
                        s->depth, g_exit_pos, s->player_pos, adjflags & 1, adjflags >> 1 & 1, adjflags >> 2 & 1, adjflags >> 3 & 1, pb);
@@ -2207,21 +2424,27 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
       g_wb_time[k] += _dt;
       int kc = g_cur_ref_k >= 3 ? 3 : g_cur_ref_k; g_rk_calls[kc]++; g_rk_pops[kc] += g_last_peak_heap; g_rk_time[kc] += _dt; }
 #endif
-    /* shortcut_check (cutoff variant) returns:
-     *   >= 0 : a shortcut of that length exists (definitely prune).
-     *   -1   : no shortcut within the cutoff (accept).
-     *   -2   : heap overflow (conservatively prune).
-     *   -3   : hash-probe limit / heap cap hit — the state space was NOT
-     *          fully explored, so "no shortcut" is unproven.  Prune
-     *          conservatively (previously fell through and was accepted).
-     *   -4   : --shortcut-state-cap exceeded (prune as too-branchy). */
-    if (x >= 0 || x == -2 || x == -3 || x == -4) {
+    /* classify(): PRUNE on a real shortcut (x >= 0) or --shortcut-state-cap
+     * (-4); ACCEPT on -1; UNKNOWN on a capacity result (-2 pending cap, -3
+     * probe limit, -5 big table full): explored below exactly like an accepted
+     * state, but not counted as valid, never best, no exported table, and kept
+     * as an unresolved candidate.  Pruning it (the old rule) could silently
+     * drop a valid level and its whole subtree. */
+    int cls = classify(x);
+    if (cls == SC_PRUNE) {
         g_pruned_short++;
         if (x == -4) g_pruned_cap++;
-        harvest_emit(s, sid, x >= 0 ? 'S' : (x == -4 ? 'V' : 'E'), x);
+        harvest_emit(s, sid, x >= 0 ? 'S' : 'V', x);
         return;
     }
-    if (s->depth > g_best_depth) {
+    if (cls == SC_ERROR) {
+        char m[160]; snprintf(m, sizeof m, "solver code %d on a state with %d blocks, %d holes at depth %d (does not fit the %d-bit packing)",
+                              x, s->nblocks, s->nholes, s->depth, sokoban_state_bits_max());
+        fatal_error(m);
+    }
+    const int unknown = (cls == SC_UNKNOWN);
+    if (unknown) count_unknown(x);
+    if (!unknown && s->depth > g_best_depth) {
         /* Reject candidates with a block sitting on the exit cell, unless
          * --allow-block-on-exit permits it. */
         int block_on_exit = 0;
@@ -2239,18 +2462,20 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
             }
         }
     }
-    harvest_emit(s, sid, 'A', -1);
-    { int bx = 0; for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) { bx = 1; break; }
-      if (!bx) { g_accepted_valid++; if (g_status_every_ms && s->depth > g_win_depth) { g_win_depth = s->depth; g_win_state = *s; }
-                 if (g_trace_valid) { char pb[4 * PATH_TOK_MAX + 8], code[128]; path_text(s->path, s->plen, pb, sizeof pb); level_code_text(s, g_exit_pos, '1', code, sizeof code); fprintf(g_trace_valid, "%s\t%d\t%s\n", pb, s->depth, code); } } }
-    BState ns = *s;
+    harvest_emit(s, sid, unknown ? 'E' : 'A', unknown ? x : -1);
+    BState ns; bs_copy(&ns, s);
     ns.branch_factor = g_last_peak_heap;
     ns.adjflags = adjflags;   /* the record of shortcut moments, extended by this state's own */
     ns.rflags = 0;            /* only range_filter() marks a child as an ancestor of a cut point */
     if (g_emit_D >= 0) path_push(&ns, g_emit_D, g_emit_V);   /* single-step edge; bulk children (g_emit_D < 0) carry their walk already */
+    { int bx = 0; for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) { bx = 1; break; }
+      if (!bx && !unknown) { g_accepted_valid++; if (g_status_every_ms && s->depth > g_win_depth) { g_win_depth = s->depth; g_win_state = *s; }
+                 if (g_trace_valid) { char pb[PATH_TEXT_CAP], code[128]; path_text(ns.path, ns.plen, pb, sizeof pb); level_code_text(s, g_exit_pos, '1', code, sizeof code); fprintf(g_trace_valid, "%s\t%d\t%s\n", pb, s->depth, code); } }
+      if (!bx && unknown) cand_add(&ns, x);   /* ns: the node's own path (s lacks its single-step edge token) */
+    }
     if (g_ptab_active) {
         int exported = 0;
-        if (!have_x) {
+        if (!have_x && !unknown) {   /* an UNKNOWN check never exports: its table is incomplete (inheriting an ancestor's stays sound) */
             /* Every single-solved accepted state owns a table of its own (solved
              * with a reference, the reference's entries are folded in at +k, see
              * sokoban_export_settled), so its children reference it at k = 1. */
@@ -2357,25 +2582,26 @@ static int bulk_generate(const BState *s) {
         int c = q[i];
         if (have_anchor && adist[c] >= 0 && adist[c] < s->seg_len + dist[c]) { g_pruned_walkseg++; continue; }
         if (s->depth + dist[c] > g_max_depth) { g_states_checked++; g_pruned_short++; continue; }
-        BState ns = *s;
-        ns.ptab1      = 0;
-        ns.player_pos = (int8_t)c;
-        ns.depth      = s->depth + dist[c];
-        ns.wh         = 0;
-        if (s->seg_anchor1 > 0) { int sl = s->seg_len + dist[c]; ns.seg_len = (int8_t)(sl > 127 ? 127 : sl); }
-        ns.bulk_walk  = 1;
+        BState *ns = &cand[nk];   /* built in place: kept only if it survives the dedup below */
+        bs_copy(ns, s);
+        ns->ptab1      = 0;
+        ns->player_pos = (int8_t)c;
+        ns->depth      = s->depth + dist[c];
+        ns->wh         = 0;
+        if (s->seg_anchor1 > 0) { int sl = s->seg_len + dist[c]; ns->seg_len = (int8_t)(sl > 127 ? 127 : sl); }
+        ns->bulk_walk  = 1;
         {   /* path: the BFS-parent chain P -> c as walk tokens (moving the player from a to
              * g_adj[a][d] is the backward walk whose token direction is d ^ 2, see expand()) */
             int chain[MAX_NCELLS], cn = 0;
             for (int x = c; x != P; x = par[x]) chain[cn++] = pd[x];
-            for (int k = cn - 1; k >= 0; k--) path_push(&ns, chain[k] ^ 2, 1);
+            for (int k = cn - 1; k >= 0; k--) path_push(ns, chain[k] ^ 2, 1);   /* a full path sets g_path_overflow: the run ends */
         }
-        if (ns.depth <= g_dupe_threshold) {
-            uint64_t key = canonical_state_key(&ns);
-            int dup = g_two_tables ? dedup_two_tables(key, ns.depth) : dedup_check_and_insert(key, ns.depth);
+        if (ns->depth <= g_dupe_threshold) {
+            uint64_t key = canonical_state_key(ns);
+            int dup = g_two_tables ? dedup_two_tables(key, ns->depth) : dedup_check_and_insert(key, ns->depth);
             if (dup) { g_states_checked++; g_pruned_dedup++; continue; }
         } else g_skipped_dedup++;
-        cand[nk++] = ns;
+        nk++;
     }
     if (!nk) return 1;
     Puzzle pz; build_partial_puzzle(s, &pz);
@@ -2399,13 +2625,20 @@ static int bulk_generate(const BState *s) {
 #endif
         uint8_t refk[24]; int have_ref = 0;
         if (g_ptab_active && s->ptab1) {   /* table loaded once by expand(); per-start chain offsets */
-            for (int j = 0; j < n; j++) { int kk = s->ptab_k + dist[starts[j]]; refk[j] = (uint8_t)(kk > 250 ? 250 : kk); }
-            sokoban_ref_set_k(0); sokoban_ref_set_xor(s->ptab_xor); sokoban_ref_suspend(0); have_ref = sokoban_ref_active();
-            if (have_ref && s->ptab_delta) sokoban_set_reference_delta(s->ptab_delta, pz.walls, g_exit_pos);
+            /* The multi solver takes uint8 chain offsets.  A capped k would make the
+             * reference prune stronger than proven (M46), so an offset above 250
+             * disables the reference for this multi solve (sound: less pruning). */
+            int kmax = 0;
+            for (int j = 0; j < n; j++) { int kk = s->ptab_k + dist[starts[j]]; if (kk > kmax) kmax = kk; refk[j] = (uint8_t)(kk > 250 ? 250 : kk); }
+            if (kmax <= 250) {
+                sokoban_ref_set_k(0); sokoban_ref_set_xor(s->ptab_xor); sokoban_ref_suspend(0); have_ref = sokoban_ref_active();
+                if (have_ref && s->ptab_delta) sokoban_set_reference_delta(s->ptab_delta, pz.walls, g_exit_pos);
+            }
             for (int j = 0; j < n; j++) { cand[base + j].ptab1 = s->ptab1; cand[base + j].ptab_k = (int16_t)(s->ptab_k + dist[starts[j]]); cand[base + j].ptab_delta = s->ptab_delta; cand[base + j].ptab_xor = s->ptab_xor; }
         }
         int rc = sokoban_solve_multi(&pz, starts, cut, pred, have_ref ? refk : NULL, n, out, &prof);
         sokoban_ref_suspend(1);   /* k = 0 here is meaningless for any other check */
+        if (g_timers_on && prof.states_popped > 4096) { struct timespec tn; clock_gettime(CLOCK_MONOTONIC, &tn); timer_tick(tn); }   /* long bulk solve */
 #ifdef WBPROF
         clock_gettime(CLOCK_MONOTONIC, &b1); g_bulk_time += (b1.tv_sec - b0.tv_sec) + (b1.tv_nsec - b0.tv_nsec) * 1e-9;
         g_bulk_pops += prof.states_popped; g_bulk_expansions += prof.peak_heap_sz;
@@ -2439,7 +2672,7 @@ static int bulk_generate(const BState *s) {
             sokoban_ref_suspend(1);
             int x = sokoban_solve_cutoff(&p2, NULL, &pr2, cut[i]);
             int single_short = (x >= 0);
-            if (x != -2 && x != -3 && single_short != out[i]) {
+            if (classify(x) != SC_UNKNOWN && classify(x) != SC_ERROR && single_short != out[i]) {
                 static int nrep = 0;
                 if (nrep++ < 4) {
                     fprintf(stderr, "BULK MISMATCH: depth %d P=%d start %d dist %d cut %d multi=%d single=%d nb=%d nh=%d committed=%llx\n",
@@ -2530,14 +2763,14 @@ static void expand(const BState *s) {
                 if (walk_dist_bits(passable, C, s->seg_anchor1 - 1) < s->seg_len + 1) { walk_ok = 0; g_pruned_walkseg++; }
             }
             if (walk_ok) {
-                BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;
+                BState *ns = &d_bufs[d_n]; bs_copy(ns, s); ns->bulk_walk = 0; ns->ptab1 = 0;   /* built in place (no second copy) */
                 d_ref[d_n] = 1;   /* same puzzle up to the newly committed cell C (delta) */   /* only bulk_generate() makes bulk children */
-                ns.player_pos      = (int8_t)C;
-                ns.committed_empty = new_E;
-                ns.depth           = s->depth + 1;
-                ns.wh              = wh_after_walk(s->wh, w);
-                ns.seg_len         = (int8_t)(s->seg_len + 1);
-                d_var[d_n] = 1; d_bufs[d_n++] = ns;
+                ns->player_pos      = (int8_t)C;
+                ns->committed_empty = new_E;
+                ns->depth           = s->depth + 1;
+                ns->wh              = wh_after_walk(s->wh, w);
+                ns->seg_len         = (int8_t)(s->seg_len + 1);
+                d_var[d_n] = 1; d_n++;
             }
         }
 
@@ -2553,20 +2786,20 @@ static void expand(const BState *s) {
                     /* Successor 2: backward-push existing block from B to P.
                      * Mask of that block gets bit D OR'd in. */
                     int idx = blk_idx_at[B];
-                    BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
-                    if (P == g_exit_pos) ns.adjflags = 0;   /* a different block now sits on the exit: its own moments only */
+                    BState *ns = &d_bufs[d_n]; bs_copy(ns, s); ns->bulk_walk = 0; ns->ptab1 = 0;   /* only bulk_generate() makes bulk children */
+                    if (P == g_exit_pos) ns->adjflags = 0;   /* a different block now sits on the exit: its own moments only */
                     /* Identical forward puzzle iff the origin cell was already committed and the
                      * block already had this push direction: then the parent's table applies. */
                     d_ref[d_n] = (s->block_mask[idx] >> D) & 1;   /* mask unchanged: same puzzle up to cell C */
-                    ns.block_pos [idx]  = (int8_t)P;
-                    ns.block_mask[idx] |= (uint8_t)(1 << D);
-                    sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
-                    ns.player_pos      = (int8_t)C;
-                    ns.committed_empty = new_E;
-                    ns.depth           = s->depth + 1;
-                    ns.wh              = 0;   /* push resets the walk run */
-                    ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
-                    d_var[d_n] = 2; d_bufs[d_n++] = ns;
+                    ns->block_pos [idx]  = (int8_t)P;
+                    ns->block_mask[idx] |= (uint8_t)(1 << D);
+                    sort_blocks(ns->block_pos, ns->block_mask, ns->nblocks);
+                    ns->player_pos      = (int8_t)C;
+                    ns->committed_empty = new_E;
+                    ns->depth           = s->depth + 1;
+                    ns->wh              = 0;   /* push resets the walk run */
+                    ns->seg_anchor1 = (int8_t)(C + 1); ns->seg_len = 0;
+                    d_var[d_n] = 2; d_n++;
                 } else if (hole_occ & (1ULL <<B)) {
                     /* B has an active hole — variant 3 (no consume) is impossible
                      * since a block can't sit on an active hole.  Variant 4
@@ -2586,17 +2819,17 @@ static void expand(const BState *s) {
                      * occupying B for the entire backward trace up to now),
                      * then push it back to P. */
                     if (!(s->committed_empty & (1ULL <<B)) && s->nblocks < g_max_blocks) {
-                        BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
-                        ns.block_pos [ns.nblocks] = (int8_t)P;
-                        ns.block_mask[ns.nblocks] = (uint8_t)(1 << D);
-                        ns.nblocks++;
-                        sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
-                        ns.player_pos      = (int8_t)C;
-                        ns.committed_empty = new_E | (1ULL <<B);
-                        ns.depth           = s->depth + 1;
-                        ns.wh              = 0;   /* push resets the walk run */
-                        ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
-                        d_var[d_n] = 3; d_bufs[d_n++] = ns;
+                        BState *ns = &d_bufs[d_n]; bs_copy(ns, s); ns->bulk_walk = 0; ns->ptab1 = 0;   /* only bulk_generate() makes bulk children */
+                        ns->block_pos [ns->nblocks] = (int8_t)P;
+                        ns->block_mask[ns->nblocks] = (uint8_t)(1 << D);
+                        ns->nblocks++;
+                        sort_blocks(ns->block_pos, ns->block_mask, ns->nblocks);
+                        ns->player_pos      = (int8_t)C;
+                        ns->committed_empty = new_E | (1ULL <<B);
+                        ns->depth           = s->depth + 1;
+                        ns->wh              = 0;   /* push resets the walk run */
+                        ns->seg_anchor1 = (int8_t)(C + 1); ns->seg_len = 0;
+                        d_var[d_n] = 3; d_n++;
                     }
 
                     /* Successor 4: backward un-consume.  Reverses a forward push
@@ -2612,23 +2845,23 @@ static void expand(const BState *s) {
                     int v4_blocked = v4_hole_blocked(s, B);
                     if (!v4_blocked && !g_holeless
                         && s->nblocks < g_max_blocks && s->nholes < g_max_holes) {
-                        BState ns = *s; ns.bulk_walk = 0; ns.ptab1 = 0;   /* only bulk_generate() makes bulk children */
-                        ns.block_pos [ns.nblocks] = (int8_t)P;
-                        ns.block_mask[ns.nblocks] = (uint8_t)(1 << D);
-                        ns.nblocks++;
-                        sort_blocks(ns.block_pos, ns.block_mask, ns.nblocks);
-                        ns.hole_pos[ns.nholes++] = (int8_t)B;
-                        sort_holes(ns.hole_pos, ns.nholes);
-                        ns.player_pos      = (int8_t)C;
-                        ns.committed_empty = new_E | (1ULL <<B);
-                        ns.depth           = s->depth + 1;
-                        ns.wh              = 0;   /* push resets the walk run */
-                        ns.seg_anchor1 = (int8_t)(C + 1); ns.seg_len = 0;
+                        BState *ns = &d_bufs[d_n]; bs_copy(ns, s); ns->bulk_walk = 0; ns->ptab1 = 0;   /* only bulk_generate() makes bulk children */
+                        ns->block_pos [ns->nblocks] = (int8_t)P;
+                        ns->block_mask[ns->nblocks] = (uint8_t)(1 << D);
+                        ns->nblocks++;
+                        sort_blocks(ns->block_pos, ns->block_mask, ns->nblocks);
+                        ns->hole_pos[ns->nholes++] = (int8_t)B;
+                        sort_holes(ns->hole_pos, ns->nholes);
+                        ns->player_pos      = (int8_t)C;
+                        ns->committed_empty = new_E | (1ULL <<B);
+                        ns->depth           = s->depth + 1;
+                        ns->wh              = 0;   /* push resets the walk run */
+                        ns->seg_anchor1 = (int8_t)(C + 1); ns->seg_len = 0;
                         /* Once the new block is consumed into B the board is the parent's exactly
                          * (hole keys are per cell), the key differing by the consumed block's term:
                          * the parent's table applies to that part of the child's search. */
                         d_ref[d_n] = 1; d_xor[d_n] = sokoban_zobrist_block(1 << D, g_consumed);
-                        d_var[d_n] = 4; d_bufs[d_n++] = ns;
+                        d_var[d_n] = 4; d_n++;
                     }
                 }
             }
@@ -3210,7 +3443,7 @@ static int rollout_step(BState *cur, int32_t *out_bf) {
     }
     for (int k = 0; k < n; k++) {
         BState *cand = &buf[order[k]];
-        if (shortcut_check(cand) == -1) {   /* -1 = no shortcut: valid */
+        if (classify(shortcut_check(cand)) == SC_ACCEPT) {   /* -1 = no shortcut: valid */
             rollout_record(cand);           /* every traversed state is a real puzzle */
             *out_bf = g_last_peak_heap;
             *cur = *cand;
@@ -3250,7 +3483,7 @@ static int rollout_valid_successors(const BState *cur, RollSucc *out, int max) {
     int n = enumerate_successors(cur, buf, 16);
     int nv = 0;
     for (int i = 0; i < n && nv < max; i++) {
-        if (shortcut_check(&buf[i]) == -1) {
+        if (classify(shortcut_check(&buf[i])) == SC_ACCEPT) {   /* rollouts are heuristic: UNKNOWN is not a valid step */
             out[nv].st = buf[i];
             out[nv].bf = g_last_peak_heap;
             rollout_record(&buf[i]);
@@ -3269,7 +3502,7 @@ static int count_valid_successors(const BState *cur) {
     int n = enumerate_successors(cur, buf, 16);
     int nv = 0;
     for (int i = 0; i < n; i++)
-        if (shortcut_check(&buf[i]) == -1) nv++;
+        if (classify(shortcut_check(&buf[i])) == SC_ACCEPT) nv++;
     return nv;
 }
 
@@ -3280,7 +3513,7 @@ static int rollout_dfs_extend(const BState *cur, int remaining, BState *out) {
     BState buf[16];
     int n = enumerate_successors(cur, buf, 16);
     for (int i = 0; i < n; i++) {
-        if (shortcut_check(&buf[i]) == -1) {
+        if (classify(shortcut_check(&buf[i])) == SC_ACCEPT) {   /* rollouts are heuristic: UNKNOWN is not a valid step */
             rollout_record(&buf[i]);
             if (rollout_dfs_extend(&buf[i], remaining - 1, out)) return 1;
         }
@@ -3381,7 +3614,7 @@ static void rollout_dfs_collect(const BState *cur, int remaining, int32_t cur_bf
     }
     for (int oi = 0; oi < n && *pnc < cap; oi++) {
         BState *nx = &buf[order[oi]];
-        if (shortcut_check(nx) == -1) {
+        if (classify(shortcut_check(nx)) == SC_ACCEPT) {
             int32_t bf = g_last_peak_heap;
             rollout_record(nx);
             rollout_dfs_collect(nx, remaining - 1, bf, cand, pnc, cap);
@@ -3423,7 +3656,7 @@ static int rollout_alloc(const BState *cur, int remaining, int32_t cur_bf,
     RollSucc sv[16];
     int nb = 0;
     for (int i = 0; i < n; i++) {
-        if (shortcut_check(&buf[i]) == -1) {    /* -1 = no shortcut: valid */
+        if (classify(shortcut_check(&buf[i])) == SC_ACCEPT) {    /* -1 = no shortcut: valid */
             sv[nb].st = buf[i];
             sv[nb].bf = g_last_peak_heap;
             rollout_record(&buf[i]);            /* every traversed state is a puzzle */
@@ -3534,7 +3767,7 @@ static int rollout_alloc_flow(const BState *cur, int remaining, int32_t cur_bf,
         HEnt *e = hfind(canonical_state_key(nx));
         int valid;
         if (e->sc == 0) {                                   /* unknown: solve once */
-            valid = (shortcut_check(nx) == -1);
+            valid = (classify(shortcut_check(nx)) == SC_ACCEPT);
             e->bf = g_last_peak_heap;
             e->sc = valid ? 1 : 2;
             if (valid) rollout_record(nx);
@@ -3573,7 +3806,7 @@ static int seed_rollout_pop(const BState *root, BState *pop) {
         for (int b = 0; b < buf[i].nblocks; b++)
             if (buf[i].block_pos[b] == g_exit_pos) { on_exit = 1; break; }
         if (on_exit && buf[i].nholes == root->nholes
-            && shortcut_check(&buf[i]) == -1) {
+            && classify(shortcut_check(&buf[i])) == SC_ACCEPT) {
             pop[m++] = buf[i];
         }
     }
@@ -4048,7 +4281,7 @@ static int           g_task_seed_count = 0;
 /* -------------------------------------------------------------------------
  * --estimate: Knuth random-probe tree-size estimation (see globals above).
  * ------------------------------------------------------------------------- */
-typedef struct { BState st; char path[4 * PATH_TOK_MAX + 8]; uint8_t key[64]; } LayerNode;   /* key: DFS-order sort key (per level, 63 - generation rank) */
+typedef struct { BState st; char path[PATH_TEXT_CAP]; uint8_t key[64]; } LayerNode;   /* key: DFS-order sort key (per level, 63 - generation rank) */
 static int layer_cmp(const void *a, const void *b) { return memcmp(((const LayerNode *)a)->key, ((const LayerNode *)b)->key, 64); }
 
 static void path_append(char *path, size_t cap, int D, int V) {
@@ -4076,16 +4309,16 @@ static void run_estimate(void) {
 
     /* Roots, exactly as run_exit_search would seed them. */
     size_t lcap = 4096, ln = 0;
-    LayerNode *layer = malloc(lcap * sizeof *layer);
+    LayerNode *layer = xrealloc(NULL, lcap * sizeof *layer, "layer nodes");
     if (g_have_seed_path) {
         BState seed;
-        if (!build_seed_path_seed(&seed)) { free(layer); return; }
+        if (g_seed_parse_error || !build_seed_path_seed(&seed)) { g_seed_error = 1; free(layer); return; }
         layer[ln].st = seed; memset(layer[ln].key, 0, 64);
         path_text(seed.path, seed.plen, layer[ln].path, sizeof layer[ln].path);   /* prefix = the seed path itself */
         ln++;
     } else if (g_task_seeds && g_task_seed_count > 0) {
         for (int i = 0; i < g_task_seed_count; i++) {
-            if (ln == lcap) { lcap *= 2; layer = realloc(layer, lcap * sizeof *layer); }
+            if (ln == lcap) { lcap *= 2; layer = xrealloc(layer, lcap * sizeof *layer, "layer nodes"); }
             layer[ln].st = g_task_seeds[i]; memset(layer[ln].key, 0, 64); snprintf(layer[ln].path, sizeof layer[ln].path, "task%d.%d", g_only_task, i); ln++;
         }
     } else {
@@ -4099,14 +4332,14 @@ static void run_estimate(void) {
     /* 1. Exact enumeration of the depth-K layer (dedup ON, probe intercept ON). */
     g_probe_mode = 1;
     long long layer_nodes_seen = 0;   /* accepted nodes strictly above the layer */
-    LayerNode *next = malloc(lcap * sizeof *next); size_t ncap = lcap, nn = 0;
+    LayerNode *next = xrealloc(NULL, lcap * sizeof *next, "layer nodes"); size_t ncap = lcap, nn = 0;
     for (int d = root_depth; d < K; d++) {
         nn = 0;
         for (size_t i = 0; i < ln; i++) {
             g_probe_n = 0;
             expand(&layer[i].st);
             for (int c = 0; c < g_probe_n; c++) {
-                if (nn == ncap) { ncap *= 2; next = realloc(next, ncap * sizeof *next); }
+                if (nn == ncap) { ncap *= 2; next = xrealloc(next, ncap * sizeof *next, "layer nodes"); }
                 next[nn].st = g_probe_buf[c];
                 path_text(next[nn].st.path, next[nn].st.plen, next[nn].path, sizeof next[nn].path);
                 memcpy(next[nn].key, layer[i].key, 64);
@@ -4140,10 +4373,10 @@ static void run_estimate(void) {
     /* 2. Probes: no dedup below the layer. */
     int saved_thr = g_dupe_threshold; g_dupe_threshold = -1;
     int m = (int)((g_estimate_probes + (long)ln - 1) / (long)ln); if (m < 1) m = 1;
-    double *node_est = calloc(ln, sizeof(double));      /* est accepted nodes in subtree (excl. layer node) */
-    double *node_est2 = calloc(ln, sizeof(double));
-    double *chk_est = calloc(ln, sizeof(double));       /* est states checked in subtree */
-    double *time_est = calloc(ln, sizeof(double)), *time_est2 = calloc(ln, sizeof(double)); /* est expand() seconds in subtree */
+    double *node_est = xcalloc(ln, sizeof(double), "estimate");      /* est accepted nodes in subtree (excl. layer node) */
+    double *node_est2 = xcalloc(ln, sizeof(double), "estimate");
+    double *chk_est = xcalloc(ln, sizeof(double), "estimate");       /* est states checked in subtree */
+    double *time_est = xcalloc(ln, sizeof(double), "estimate"), *time_est2 = xcalloc(ln, sizeof(double), "estimate"); /* est expand() seconds in subtree */
     static double depth_est[4096]; memset(depth_est, 0, sizeof depth_est);
     int max_probe_depth = 0; long probes = 0;
     long long chk0 = g_states_checked; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -4211,7 +4444,7 @@ static void run_estimate(void) {
     }
     /* Heaviest layer nodes (job-splitting hints). */
     int show = ln < 12 ? (int)ln : 12;
-    int *idx = malloc(ln * sizeof(int)); for (size_t i = 0; i < ln; i++) idx[i] = (int)i;
+    int *idx = xcalloc(ln, sizeof(int), "estimate"); for (size_t i = 0; i < ln; i++) idx[i] = (int)i;
     for (int a = 0; a < show; a++) {
         int best = a;
         for (size_t b = a + 1; b < ln; b++) if (node_est[idx[b]] > node_est[idx[best]]) best = (int)b;
@@ -4278,8 +4511,8 @@ static void range_filter(const BState *s, long long t0) {
         if (m >= 0) { hi = m + 1; if (ch[m].plen < g_from_n) ch[m].rflags |= 1; }
         else {
             g_range_unmatched++;
-            if (getenv("BS_DEBUG_RANGE")) {
-                char pb[1100]; path_text(s->path, s->plen, pb, sizeof pb);
+            if (bs_getenv("BS_DEBUG_RANGE")) {
+                char pb[PATH_TEXT_CAP]; path_text(s->path, s->plen, pb, sizeof pb);
                 fprintf(stderr, "[range] --from child not found under '%s' (depth %d, bulk_walk %d): want tok %c%d; %lld children (%lld bulk):", pb, s->depth, s->bulk_walk,
                         "URDL"[g_from_path[s->plen] & 3], g_from_path[s->plen] >> 2, n, nbulk);
                 for (long long i = 0; i < n; i++) fprintf(stderr, " %c%d/%d", "URDL"[ch[i].path[ch[i].plen - 1] & 3], ch[i].path[ch[i].plen - 1] >> 2, ch[i].plen - s->plen);
@@ -4310,7 +4543,7 @@ static void range_filter(const BState *s, long long t0) {
  * for splitting the remainder into parallel ranges.  At most ~4000 FRONTIER
  * lines (evenly sampled) to keep the output small. */
 static void print_cursor(const BState *s) {
-    char buf[4 * PATH_TOK_MAX + 8]; path_text(s->path, s->plen, buf, sizeof buf);
+    char buf[PATH_TEXT_CAP]; path_text(s->path, s->plen, buf, sizeof buf);
     printf("CURSOR\t%d\t%s\t%d\n", g_exit_pos, buf, s->depth);
     long long n = g_q_tail, step = n > 4000 ? (n + 3999) / 4000 : 1;
     for (long long i = n - 1; i >= 0; i -= step) {
@@ -4324,7 +4557,7 @@ static void print_cursor(const BState *s) {
  * (its subtree is re-run from scratch), then every pending stack entry from
  * the top down.  These subtrees are disjoint and cover exactly what is left. */
 static void print_remaining(const BState *s) {
-    char buf[4 * PATH_TOK_MAX + 8]; path_text(s->path, s->plen, buf, sizeof buf);
+    char buf[PATH_TEXT_CAP]; path_text(s->path, s->plen, buf, sizeof buf);
     printf("REMAINING\t%s\n", buf);
     for (long long i = g_q_tail - 1; i >= 0; i--) { path_text(g_queue[i].path, g_queue[i].plen, buf, sizeof buf); printf("REMAINING\t%s\n", buf); }
     fflush(stdout);
@@ -4333,7 +4566,7 @@ static void print_status(const BState *s) {
     char cur[128], win[128];
     level_code_text(s, g_exit_pos, '?', cur, sizeof cur);
     if (g_win_depth > 0) level_code_text(&g_win_state, g_exit_pos, '1', win, sizeof win); else win[0] = 0;
-    printf("STATUS\t{\"depth\":%d,\"cur\":\"%s\",\"best\":%d,\"win_best\":%d,\"win\":\"%s\"}\n", s->depth, cur, g_best_depth, g_win_depth, win);
+    printf("STATUS\t{\"depth\":%d,\"cur\":\"%s\",\"best\":%d,\"win_best\":%d,\"win\":\"%s\",\"unknown\":%lld}\n", s->depth, cur, g_best_depth, g_win_depth, win, g_unknown);
     fflush(stdout);
     g_win_depth = 0;
 }
@@ -4364,6 +4597,8 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_solver_calls   = 0;
     g_dedup_full     = 0;
     g_skipped_dedup  = 0;
+    g_unknown = g_unknown_pq = g_unknown_probe = g_unknown_big = 0;
+    cands_reset();
 
     /* Bulk walk-back generation only fits the plain DFS (children at depth+k
      * break beam levels and layer listings) and needs no exact solve lengths
@@ -4375,15 +4610,19 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_ptab_saved = g_ptab_used = g_ptab_inherited = g_ptab_delta_refs = 0;
     g_emit_D = -1; g_emit_V = -1;   /* the root gets no edge token */
     g_range_unmatched = 0; g_range_root_pending = 1;
-    g_split_fired = 0; g_win_depth = 0; double last_status_s = 0; (void)last_status_s;
+    g_split_fired = 0; g_win_depth = 0;
+    g_path_overflow = 0; g_tick_flag = 0; g_cur_node = NULL;
 
     if (g_have_seed_path) {
         /* Seed-path mode: start from the standard root and replay the
          * user-supplied sequence of (direction, variant) steps.  The
          * resulting state is the SOLE seed.  DFS then explores its
-         * subtree exhaustively (subject to --time / --max-depth). */
+         * subtree exhaustively (subject to --time / --max-depth).
+         * A seed that does not replay (malformed, longer than PATH_TOK_MAX,
+         * or an invalid step under these flags) is status bad_seed, exit 3. */
         BState seed;
-        if (!build_seed_path_seed(&seed)) {
+        if (g_seed_parse_error || !build_seed_path_seed(&seed)) {
+            g_seed_error = 1;
             if (out_exhausted)  *out_exhausted = 0;
             if (out_dedup_full) *out_dedup_full = 0;
             return 0.0;
@@ -4391,14 +4630,15 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
         fprintf(stderr, "[seed-path] seed built: depth=%d player=%d nblocks=%d nholes=%d committed_pop=%d\n",
                 seed.depth, seed.player_pos, seed.nblocks, seed.nholes,
                 __builtin_popcountll(seed.committed_empty & g_active_mask));
-        if (getenv("BS_DUMP_SEED")) {   /* print the seed state as a puzzle and stop (uncommitted cells drawn as walls) */
+        if (bs_getenv("BS_DUMP_SEED")) {   /* print the seed state as a puzzle and stop (uncommitted cells drawn as walls) */
             printf("seed state for --seed-path (depth %d, player %d, wh %d, bulk_walk %d, committed 0x%llx):\n",
                    seed.depth, seed.player_pos, seed.wh, seed.bulk_walk, (unsigned long long)seed.committed_empty);
             print_puzzle_for_exit(&seed, g_exit_pos); fflush(stdout);
-            if (out_exhausted) *out_exhausted = 1; if (out_dedup_full) *out_dedup_full = 0; return 0.0;
+            g_debug_stop = 1;   /* status "debug": never coverage (M48) */
+            if (out_exhausted) *out_exhausted = 0; if (out_dedup_full) *out_dedup_full = 0; return 0.0;
         }
         g_best_state = seed;
-        try_successor(&seed);
+        try_successor(&seed);   /* an UNKNOWN root is explored like any other UNKNOWN state */
     } else if (g_task_seeds && g_task_seed_count > 0) {
         /* Task mode: skip default depth-0 roots; feed each seed through
          * try_successor.  This is what registers the seed itself as a
@@ -4515,6 +4755,10 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     int exhausted = 1;
     long long iter = 0;
     int unlimited = (remaining_s <= 0);
+    g_t0_run = t0; g_last_status_s = 0; g_next_tick_s = 0;
+    g_timers_on = (!unlimited || g_split_after_s > 0 || g_status_every_ms > 0);
+    g_tick_interval_s = g_status_every_ms > 0 ? g_status_every_ms / 1000.0 : 1.0;
+    if (g_tick_interval_s > 1.0) g_tick_interval_s = 1.0;
 
     if (g_rollout_steps > 0) {
         /* DFS-fill target (g_rollout_dfsfill < 0 = auto) is mode-dependent and
@@ -4631,24 +4875,34 @@ beam_done:
     } else {
         while (1) {
             BState s;
+            if (g_path_overflow) { exhausted = 0; break; }   /* a node needed more than PATH_TOK_MAX tokens: no REMAINING can name it */
             if (!q_pop(&s)) break;
             if (g_trace_csv || HARVEST_ACTIVE) g_current_parent_id = s.state_id;
             if (g_range_root_pending) { s.rflags = (uint8_t)((g_from_n ? 1 : 0) | (g_until_n ? 2 : 0)); g_range_root_pending = 0; }
             long long qt0 = g_q_tail;
-            if (g_trace_visits) { char pb[4 * PATH_TOK_MAX + 8]; path_text(s.path, s.plen, pb, sizeof pb); fprintf(g_trace_visits, "%s\n", pb); }
+            if (g_trace_visits) { char pb[PATH_TEXT_CAP]; path_text(s.path, s.plen, pb, sizeof pb); fprintf(g_trace_visits, "%s\n", pb); }
+            g_cur_node = &s;
             expand(&s);
+            g_cur_node = NULL;
+            ++iter;
             if (g_from_n || g_until_n) range_filter(&s, qt0);
             /* DFS mode: flush after every expand() — no level boundary to
              * batch larger.  Smaller batches but correct ordering. */
             if (g_nn_surrogate_loaded) flush_surrogate_pending();
+            if (g_path_overflow) { exhausted = 0; break; }   /* status path_overflow: never print REMAINING (a truncated path names another node) */
             if (g_dedup_full) { exhausted = 0; break; }
             if (g_stop_requested) { print_cursor(&s); print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }   /* checkpoint: resume with --from, or re-run the REMAINING subtrees */
-            if ((!unlimited || g_split_after_s > 0 || g_status_every_ms > 0) && (++iter & 1023) == 0) {
+            /* --split-after-nodes: deterministic split after exactly N expansions (tests) */
+            if (g_split_after_nodes > 0 && iter >= g_split_after_nodes && g_q_tail > 0) { print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
+            /* Clock checks every 64 expansions, and right after any expansion
+             * during which a solver-side tick came due (long expansions). */
+            if (g_timers_on && ((iter & 63) == 0 || g_tick_flag)) {
+                g_tick_flag = 0;
                 clock_gettime(CLOCK_MONOTONIC, &t_now);
                 double el = elapsed_s(t0, t_now);
                 if (!unlimited && el >= remaining_s) { print_cursor(&s); print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
                 if (g_split_after_s > 0 && el >= g_split_after_s) { print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
-                if (g_status_every_ms > 0 && el - last_status_s >= g_status_every_ms / 1000.0) { print_status(&s); last_status_s = el; }
+                if (g_status_every_ms > 0 && el - g_last_status_s >= g_status_every_ms / 1000.0) { print_status(&s); g_last_status_s = el; }
             }
         }
     }
@@ -4803,7 +5057,7 @@ static void print_usage(const char *prog) {
         "  --no-bulk-walk        generate walk-back children one step at a time with a solver\n"
         "                          call each instead of deciding every walk-back descendant over\n"
         "                          committed cells with one multi-start solve (default on; exact\n"
-        "                          either way; ~10% faster on deep 5x5 classes).  --bulk-walk = on.\n"
+        "                          either way; ~10%% faster on deep 5x5 classes).  --bulk-walk = on.\n"
         "  --estimate N          do not search: estimate the size of the DFS tree instead.\n"
         "                          Enumerates the depth-K layer exactly (K = --estimate-depth,\n"
         "                          default 6), then runs ~N random root-to-leaf probes (Knuth\n"
@@ -4822,6 +5076,15 @@ static void print_usage(const char *prog) {
         "                          (exit, --seed-path string, depth, blocks, holes), then exit.\n"
         "                          Feed the paths to independent --seed-path --time 0 jobs to\n"
         "                          split an exhaustive search across processes / sessions.\n"
+        "  --seed-path PATH      search only the subtree of the node with this path (a REMAINING or\n"
+        "                          LAYER path, at most %d tokens).  A path that does not replay ends\n"
+        "                          with status bad_seed (exit 3).\n"
+        "  --split-after SEC     v2 jobs: stop after SEC seconds and print the remaining work as\n"
+        "                          REMAINING seed paths (status split).\n"
+        "  --split-after-nodes N same, deterministically after N node expansions (tests).\n"
+        "  --status-every MS     v2 jobs: stream a STATUS line every MS ms (protocol mode: BS_* debug\n"
+        "                          variables are ignored unless BS_ALLOW_DEBUG=1).\n"
+        "  --version             print SRC_HASH, GIT_SHA, PROTOCOL, LIMITS and KNOBS, then exit.\n"
         "  --harvest FILE        emit a packed binary record per *visited* state (accepted +\n"
         "                          shortcut-pruned + dedup-pruned + cap-pruned) with full state\n"
         "                          blob, canonical key, and forward-solve value.  If FILE ends in\n"
@@ -4849,9 +5112,78 @@ static void print_usage(const char *prog) {
         "\nVisited table is %lu MB (2^%d slots × 16 B).  On overflow the search\n"
         "exits the current root gracefully.  To enlarge, recompile with -DHASH_LG2=N.\n"
         "\nNew bests are streamed to stdout as they are found, prefixed with elapsed time.\n",
-        prog, MAX_NCELLS, DEFAULT_CAP_S, MAX_BLOCKS, MAX_HOLES,
-        (unsigned long)((size_t)HASH_CAP * sizeof(HashSlot) / (1024*1024)), HASH_LG2);
+        prog, MAX_NCELLS, DEFAULT_CAP_S, MAX_BLOCKS, MAX_HOLES, PATH_TOK_MAX,
+        (unsigned long)((size_t)HASH_CAP * sizeof(HashSlot) / (1024*1024)), (int)HASH_LG2);
 }
+
+/* --version: everything the server needs to whitelist (and to bound) a build. */
+static void print_version(void) {
+    printf("SRC_HASH\t%s\nGIT_SHA\t%s\n", SRC_HASH_STR, GIT_SHA_STR);
+    printf("PROTOCOL\t3\n");
+    printf("LIMITS\t{\"path_tok_max\":%d,\"max_ncells\":%d,\"max_blocks\":%d,\"state_bits\":%d}\n",
+           PATH_TOK_MAX, MAX_NCELLS, MAX_BLOCKS, sokoban_state_bits_max());
+    printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"UNRESOLVED_MAX\":%d,%s,\"defs\":\"%s\"}\n",
+           (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (int)UNRESOLVED_MAX, sokoban_knobs_json(),
+           ""
+#ifdef REF_CHECK
+           "REF_CHECK "
+#endif
+#ifdef BULK_CHECK
+           "BULK_CHECK "
+#endif
+#ifdef WBPROF
+           "WBPROF "
+#endif
+           );
+    fflush(stdout);
+}
+
+/* JSON string body (quotes and backslashes escaped, control bytes dropped). */
+static void json_str(FILE *f, const char *t) {
+    for (; t && *t; t++) {
+        unsigned char c = (unsigned char)*t;
+        if (c == '"' || c == '\\') { fputc('\\', f); fputc(c, f); }
+        else if (c >= 0x20) fputc(c, f);
+    }
+}
+static double cpu_seconds(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+    return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
+}
+static int g_last_unresolved_printed = 0;
+/* SUMMARY: the last protocol line of an exit's run (v2/PROTOCOL3.md §2.2). */
+static void print_summary(const char *st, double elapsed, int verify, const char *err) {
+    int bulk_eff = g_bulk_walk && g_beam_width == 0 && g_rollout_steps == 0 && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
+    long long accepted = g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_axis - g_unknown;   /* pruned_cap is part of pruned_short */
+    printf("SUMMARY\t{\"status\":\"%s\",\"seed\":\"", st);
+    json_str(stdout, g_seed_text);
+    printf("\",\"exit\":%d,\"states\":%lld,\"accepted\":%lld,\"valid\":%lld,\"best\":%d,"
+           "\"verify\":%d,\"evict_shallow\":%lld,\"evict_recent\":%lld,\"elapsed\":%.3f,\"solver_calls\":%lld,\"src_hash\":\"%s\","
+           "\"protocol\":3,\"cpu_s\":%.3f,\"unknown\":%lld,\"unknown_pq\":%lld,\"unknown_probe\":%lld,\"unknown_big\":%lld,"
+           "\"unresolved\":%d,\"unresolved_dropped_max\":%d,"
+           "\"flags\":{\"grid\":\"%dx%d\",\"exit\":%d,\"transit\":%d,\"block_on_exit\":%d,\"max_holes\":%d,\"max_blocks\":%d,\"min_walls\":%d,\"bulk_walk\":%d}",
+           g_exit_pos, g_states_checked, accepted, g_accepted_valid, g_best_depth,
+           verify, g_two_tables ? g_evictions_shallow : 0LL, g_two_tables ? g_evictions_recent : 0LL, elapsed, g_solver_calls, SRC_HASH_STR,
+           cpu_seconds(), g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big,
+           g_last_unresolved_printed, g_cand_dropped_max,
+           g_grid_rows, g_grid_cols, g_exit_pos, g_allow_exit_transit, g_allow_block_on_exit, g_max_holes, g_max_blocks, g_min_walls, bulk_eff);
+    if (err) { printf(",\"error\":\""); json_str(stdout, err); printf("\""); }
+    printf("}\n");
+    fflush(stdout);
+}
+/* Internal error (allocation failure, a state the solver cannot pack, ...):
+ * message on stderr, SUMMARY with status "error", exit 5.  Never REMAINING. */
+static struct timespec g_t_main_start;
+static void fatal_error(const char *msg) {
+    fflush(stdout);
+    fprintf(stderr, "error: %s\n", msg); fflush(stderr);
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    g_last_unresolved_printed = 0;
+    print_summary("error", ts_diff(g_t_main_start, t), -1, msg);
+    exit(5);
+}
+static void solver_fatal(const char *msg) { fatal_error(msg); }
 
 static int parse_grid(const char *s) {
     int r, c;
@@ -4864,13 +5196,12 @@ static int parse_grid(const char *s) {
 
 int main(int argc, char **argv) {
     signal(SIGINT, on_stop_signal); signal(SIGTERM, on_stop_signal);
+    clock_gettime(CLOCK_MONOTONIC, &g_t_main_start);
+    sokoban_set_fatal_handler(solver_fatal);
     { int quiet = 0; for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) quiet = 1;
       if (!quiet) { printf("SRC_HASH\t%s\n", SRC_HASH_STR); fflush(stdout); } }
-    if (getenv("BS_TRACE_VISITS")) {   /* one file per process: <name>.<pid>, so parallel workers do not clobber each other */
-        char tn[1024]; snprintf(tn, sizeof tn, "%s.%d", getenv("BS_TRACE_VISITS"), (int)getpid());
-        g_trace_visits = fopen(tn, "w");
-    }
-    if (getenv("BS_TRACE_VALID")) { char tn[1024]; snprintf(tn, sizeof tn, "%s.%d", getenv("BS_TRACE_VALID"), (int)getpid()); g_trace_valid = fopen(tn, "w"); }
+    /* Protocol mode is known before anything reads a BS_* variable (see bs_getenv). */
+    for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--status-every")) g_protocol_mode = 1;
     /* Seed rand() so --stochastic produces a different sequence per run.
      * Mixes wall-clock and PID so multi-worker ensembles diverge. */
     srand((unsigned)(time(NULL) ^ (long)getpid()));
@@ -4917,7 +5248,11 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]); return 0;
         } else if (strcmp(argv[i], "--version") == 0) {
-            printf("SRC_HASH\t%s\nGIT_SHA\t%s\n", SRC_HASH_STR, GIT_SHA_STR); return 0;
+            print_version(); return 0;
+        } else if (strcmp(argv[i], "--split-after-nodes") == 0) {
+            if (++i >= argc) { fprintf(stderr, "error: --split-after-nodes requires N\n"); return 1; }
+            g_split_after_nodes = atoll(argv[i]);
+            if (g_split_after_nodes < 0) { fprintf(stderr, "error: --split-after-nodes must be >= 0 (0 = never)\n"); return 1; }
         } else if (strcmp(argv[i], "--split-after") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --split-after requires SEC\n"); return 1; }
             g_split_after_s = atof(argv[i]);
@@ -5114,12 +5449,12 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--seed-path") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --seed-path requires \"D1V1,D2V2,...\"\n"); return 1; }
             if (!parse_seed_path(argv[i])) {
+                /* not fatal here: the run reports status bad_seed (exit 3) once the grid is set up */
                 if (g_seed_path_overflow)
-                    fprintf(stderr, "error: --seed-path too long (max %d tokens)\n",
-                            (int)(sizeof(g_seed_path)/sizeof(*g_seed_path)));
+                    fprintf(stderr, "error: --seed-path too long (max %d tokens = PATH_TOK_MAX)\n", PATH_TOK_MAX);
                 else
                     fprintf(stderr, "error: --seed-path must be tokens like U2,R3,L1 (dir letter U/R/D/L + action digit 1=walk, 2=push, 3=consume)\n");
-                return 1;
+                g_seed_parse_error = 1;
             }
             g_have_seed_path = 1; g_seed_text = argv[i];
         } else if (strcmp(argv[i], "--print-seed-key") == 0) {
@@ -5422,6 +5757,19 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Protocol mode (--status-every): a v2 job must be an exhaustive search of
+     * its subtree, so the heuristic modes and prunes are refused outright. */
+    if (g_protocol_mode) {
+        const char *bad = g_shortcut_state_cap > 0 ? "--shortcut-state-cap" : g_nn_surrogate_model_path ? "--nn-surrogate-model"
+                        : g_beam_width > 0 ? "--beam" : g_rollout_steps > 0 ? "--rollout" : NULL;
+        if (bad) { fprintf(stderr, "error: %s is not allowed in protocol mode (--status-every): v2 jobs must be exhaustive\n", bad); return 2; }
+    }
+    /* Debug traces (one file per process: <name>.<pid>, so parallel workers do not
+     * clobber each other).  Ignored in protocol mode unless BS_ALLOW_DEBUG=1. */
+    if (bs_getenv("BS_TRACE_VISITS")) { char tn[1024]; snprintf(tn, sizeof tn, "%s.%d", bs_getenv("BS_TRACE_VISITS"), (int)getpid()); g_trace_visits = fopen(tn, "w"); }
+    if (bs_getenv("BS_TRACE_VALID"))  { char tn[1024]; snprintf(tn, sizeof tn, "%s.%d", bs_getenv("BS_TRACE_VALID"), (int)getpid()); g_trace_valid = fopen(tn, "w"); }
+    if (bs_getenv("BS_TRACE_UNRESOLVED")) { char tn[1024]; snprintf(tn, sizeof tn, "%s.%d", bs_getenv("BS_TRACE_UNRESOLVED"), (int)getpid()); g_trace_unresolved = fopen(tn, "w"); }
+
     /* Load the bf-target curve now that --rollout-bf-smooth has also been seen. */
     if (g_bf_target_path && !load_bf_target(g_bf_target_path, g_bf_smooth_w))
         return 1;
@@ -5579,12 +5927,10 @@ int main(int argc, char **argv) {
     }
 
     if (g_two_tables) {
-        g_shallow = calloc(SHALLOW_CAP, sizeof *g_shallow);
-        g_recent  = calloc(RECENT_CAP,  sizeof *g_recent);
-        if (!g_shallow || !g_recent) { perror("calloc two-tables"); return 1; }
+        g_shallow = xcalloc(SHALLOW_CAP, sizeof *g_shallow, "dedup shallow table");
+        g_recent  = xcalloc(RECENT_CAP,  sizeof *g_recent, "dedup recent table");
     } else {
-        g_visited = calloc(HASH_CAP, sizeof *g_visited);
-        if (!g_visited) { perror("calloc visited"); return 1; }
+        g_visited = xcalloc(HASH_CAP, sizeof *g_visited, "dedup table");
     }
 
     /* Build the list of exits to search.  Sources, in priority order:
@@ -5741,6 +6087,7 @@ int main(int argc, char **argv) {
      * solver stop at the first win unless exact lengths are being recorded. */
     sokoban_set_decision_only(!HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump);
     int unlimited = (g_time_cap_s == 0);
+    int run_rc = 0;   /* process exit code: 0 exhausted/split, 3 bad_seed, 4 path_overflow (5 error exits directly) */
     for (int ei = 0; ei < n_exits; ei++) {
         /* In --task-id mode, skip exits that don't host the target task. */
         if (g_only_task >= 0 && exits[ei] != task_target_exit) continue;
@@ -5766,7 +6113,7 @@ int main(int argc, char **argv) {
             g_task_seed_count = 0;
         }
 
-        if (g_estimate_probes > 0) { run_estimate(); continue; }
+        if (g_estimate_probes > 0) { run_estimate(); if (g_seed_error) return 3; continue; }
 
         int exhausted, dedup_full;
         double exit_elapsed = run_exit_search(remain, &exhausted, &dedup_full);
@@ -5777,17 +6124,33 @@ int main(int argc, char **argv) {
          * drain could otherwise be missed by the stream). */
         flush_pending_new_best(session_elapsed());
 
-        /* Verify and report this exit. */
+        /* Status of this exit's run (v2/PROTOCOL3.md §2.3).  The void ones
+         * (bad_seed, path_overflow, debug) carry no LEVEL / UNRESOLVED lines. */
+        const char *st = g_path_overflow ? "path_overflow" : g_seed_error ? "bad_seed" : g_debug_stop ? "debug"
+                       : dedup_full ? "dedup_full" : exhausted ? "exhausted" : g_split_fired ? "split" : "time_cap";
+        int void_run = g_path_overflow || g_seed_error || g_debug_stop;
+        if (g_path_overflow && run_rc < 4) run_rc = 4;
+        if (g_seed_error && run_rc < 3) run_rc = 3;
+
+        /* Verify this exit's best: a cutoff solve at best-2 with no reference
+         * table (bounded by the solver's table limits: it can never hang), i.e.
+         * the acceptance check re-run from scratch.  -1 there, the backward path
+         * of length best and parity give an optimum of exactly best.  Skipped
+         * after a split (the child jobs verify their own) and for void runs. */
         int verify = -1;
-        if (g_best_depth > 0) {
+        int handed_back = g_split_fired && (g_split_after_s > 0 || g_split_after_nodes > 0 || g_stop_requested);   /* not a --time cap */
+        if (g_best_depth > 0 && !handed_back && !void_run) {
             Puzzle pz;
             build_partial_puzzle(&g_best_state, &pz);
-            verify = sokoban_solve(&pz, NULL, NULL);
+            sokoban_clear_reference();
+            int v = sokoban_solve_cutoff(&pz, NULL, NULL, g_best_depth - 2);
+            verify = (v == -1) ? g_best_depth : v;
         }
 
         printf("--- Exit %d (%s) ---\n", g_exit_pos,
+               g_path_overflow ? "path overflow" : g_seed_error ? "bad seed" : g_debug_stop ? "debug stop" :
                dedup_full ? "dedup table full"
-                          : (exhausted ? "exhausted" : g_stop_requested ? "interrupted" : g_split_fired && g_split_after_s > 0 ? "split" : "time cap"));
+                          : (exhausted ? "exhausted" : g_stop_requested ? "interrupted" : g_split_fired && (g_split_after_s > 0 || g_split_after_nodes > 0) ? "split" : "time cap"));
         if (g_from_n || g_until_n) printf("  range:          %s%s (%lld cut points not found in this run, placed by edge order)\n",
                                           g_from_n ? "from given" : "from start", g_until_n ? ", until given" : ", to end", g_range_unmatched);
         printf("  elapsed:        %.3f s\n", exit_elapsed);
@@ -5812,7 +6175,10 @@ int main(int argc, char **argv) {
                    g_refstat[0], g_refstat[1], g_refstat[2], g_refstat[3], g_refstat[4], g_refstat[5], g_refstat[6], g_export_entries); } }
 #endif
         printf("  accepted:       %lld  (walk-segment pruned before check: %lld)\n",
-               g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_cap - g_pruned_axis, g_pruned_walkseg);
+               g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_axis - g_unknown, g_pruned_walkseg);
+        if (g_unknown)
+            printf("  UNDECIDED:      %lld checks hit a solver capacity limit (pending cap %lld, probe limit %lld, big table full %lld): explored, not counted as valid\n",
+                   g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big);
         printf("  valid levels:   %lld  (block-on-exit states pruned: %lld permanently stuck, %lld every pull-off refuted by a suffix shortcut)\n", g_accepted_valid, g_pruned_exitstuck, g_pruned_exitadj);
         if (g_ptab_active) printf("  parent tables:  %lld saved, %lld used as reference (%lld with a puzzle delta), %lld states inherited an ancestor's; peak %lld live tables, %.1f MB\n", g_ptab_saved, g_ptab_used, g_ptab_delta_refs, g_ptab_inherited, g_ptab_live_peak, g_ptab_live_slots_peak * 12.0 / 1048576);
 #ifdef REF_CHECK
@@ -5836,18 +6202,20 @@ int main(int argc, char **argv) {
         }
         printf("  stack peak:     %lld\n", g_q_peak);
         printf("  best depth:     %d", g_best_depth);
-        if (g_best_depth > 0)
-            printf("  (verify %d %s)", verify, verify == g_best_depth ? "OK" : "MISMATCH");
+        if (g_best_depth > 0) {
+            if (verify == g_best_depth) printf("  (verify %d OK)", verify);
+            else if (verify == -1) printf("  (verify skipped)");
+            else if (classify(verify) == SC_UNKNOWN) printf("  (verify %d UNDECIDED)", verify);
+            else printf("  (verify %d MISMATCH)", verify);
+        }
         printf("\n");
-        {   /* v2 protocol: machine-readable result (LEVEL before SUMMARY; SUMMARY is the last line of a run) */
-            if (g_best_depth > 0) { char code[128]; level_code_text(&g_best_state, g_exit_pos, '1', code, sizeof code); printf("LEVEL\t%d\t%s\n", g_best_depth, code); }
-            const char *st = dedup_full ? "dedup_full" : exhausted ? "exhausted" : g_split_fired ? "split" : "time_cap";
-            printf("SUMMARY\t{\"status\":\"%s\",\"seed\":\"%s\",\"exit\":%d,\"states\":%lld,\"accepted\":%lld,\"valid\":%lld,\"best\":%d,"
-                   "\"verify\":%d,\"evict_shallow\":%lld,\"evict_recent\":%lld,\"elapsed\":%.3f,\"solver_calls\":%lld,\"src_hash\":\"%s\"}\n",
-                   st, g_seed_text, g_exit_pos, g_states_checked,
-                   g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_cap - g_pruned_axis, g_accepted_valid, g_best_depth, verify,
-                   g_two_tables ? g_evictions_shallow : 0LL, g_two_tables ? g_evictions_recent : 0LL, exit_elapsed, g_solver_calls, SRC_HASH_STR);
-            fflush(stdout);
+        {   /* v2 protocol: machine-readable result (LEVEL, UNRESOLVED, then SUMMARY as the last line of a run) */
+            g_last_unresolved_printed = 0;
+            if (!void_run) {
+                if (g_best_depth > 0) { char code[128]; level_code_text(&g_best_state, g_exit_pos, '1', code, sizeof code); printf("LEVEL\t%d\t%s\n", g_best_depth, code); }
+                g_last_unresolved_printed = print_unresolved(g_best_depth);
+            }
+            print_summary(st, exit_elapsed, verify, NULL);
         }
 
         total_states       += g_states_checked;
@@ -5855,6 +6223,7 @@ int main(int argc, char **argv) {
         total_pruned_dedup += g_pruned_dedup;
         total_solver_calls += g_solver_calls;
         total_elapsed      += exit_elapsed;
+        if (void_run) break;   /* the other exits would fail the same way */
 
         /* Cross-exit overall best is updated incrementally inside try_successor
          * (so streaming sees it).  Nothing to do here. */
@@ -5925,5 +6294,8 @@ int main(int argc, char **argv) {
     if (g_harvest_gz)  { gzclose(g_harvest_gz); g_harvest_gz = NULL; }
     if (g_nn_loaded) nn_close();
     if (g_nn_surrogate_loaded) nn_surrogate_close();
-    return 0;
+    if (g_trace_valid) fclose(g_trace_valid);
+    if (g_trace_unresolved) fclose(g_trace_unresolved);
+    if (g_trace_visits) fclose(g_trace_visits);
+    return run_rc;
 }

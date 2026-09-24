@@ -203,6 +203,35 @@ static int g_heap_cap = 0;
 
 void sokoban_set_heap_cap(int n) { g_heap_cap = (n > 0) ? n : 0; }
 
+/* Fatal errors (allocation failure): never a silent NULL dereference.  The
+ * default handler prints the message and exits with code 5 (the protocol's
+ * `error` status); backsearch installs its own that also prints a SUMMARY line
+ * with status "error" before exiting 5.  The handler must not return. */
+static void sok_default_fatal(const char *msg) { fprintf(stderr, "fatal: %s\n", msg); fflush(stderr); exit(5); }
+static void (*g_sok_fatal)(const char *) = sok_default_fatal;
+void sokoban_set_fatal_handler(void (*fn)(const char *msg)) { g_sok_fatal = fn ? fn : sok_default_fatal; }
+static void sok_oom(const char *what, size_t bytes) {
+    char msg[160];
+    snprintf(msg, sizeof msg, "out of memory: %s (%zu bytes)", what, bytes);
+    g_sok_fatal(msg);
+    abort();   /* a handler that returns is a bug */
+}
+static void *sok_xcalloc(size_t n, size_t sz, const char *what) {
+    void *p = calloc(n, sz);
+    if (!p && n && sz) sok_oom(what, n * sz);
+    return p;
+}
+static void *sok_xmalloc(size_t sz, const char *what) {
+    void *p = malloc(sz);
+    if (!p && sz) sok_oom(what, sz);
+    return p;
+}
+static void *sok_xrealloc(void *old, size_t sz, const char *what) {
+    void *p = realloc(old, sz);
+    if (!p && sz) sok_oom(what, sz);   /* old stays valid, but we exit anyway */
+    return p;
+}
+
 /* State space size: g_ncells * (g_ncells+1)^nb * 2^nh (as int64_t to detect overflow) */
 static int64_t state_space_size(int nb, int nh) {
     int64_t s = g_ncells;
@@ -216,7 +245,9 @@ static int64_t state_space_size(int nb, int nh) {
  * 8M states = 16 MB visited array — fits well within realistic working sets.
  * Above this, the original hash table approach is used.
  */
+#ifndef DIRECT_LIMIT
 #define DIRECT_LIMIT (1 << 23)   /* 8 M states */
+#endif
 
 /* ========================================================================
  * DIRECT-INDEXED SOLVER  (small state spaces, nb <= ~3)
@@ -238,16 +269,16 @@ static _Thread_local DirectState *ds_tls;
 
 static DirectState *ds_get(int state_space) {
     if (!ds_tls) {
-        ds_tls = calloc(1, sizeof(DirectState));
+        ds_tls = sok_xcalloc(1, sizeof(DirectState), "direct solver state");
         ds_tls->gen = 1;
     }
     if (state_space > ds_tls->vis_cap) {
         free(ds_tls->visited);
         free(ds_tls->qs);
         free(ds_tls->qused);
-        ds_tls->visited = calloc(state_space, sizeof(uint16_t));
-        ds_tls->qs      = malloc(state_space * sizeof(uint32_t));
-        ds_tls->qused   = malloc(state_space * sizeof(uint32_t));
+        ds_tls->visited = sok_xcalloc(state_space, sizeof(uint16_t), "direct solver visited");
+        ds_tls->qs      = sok_xmalloc(state_space * sizeof(uint32_t), "direct solver queue");
+        ds_tls->qused   = sok_xmalloc(state_space * sizeof(uint32_t), "direct solver queue");
         ds_tls->vis_cap = state_space;
     }
     return ds_tls;
@@ -414,9 +445,17 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
  * Still benefits from adj table and merged blocked mask.
  * ======================================================================== */
 
+/* Every table-size macro below can be overridden with -D for a test build
+ * ("knob build").  build_pgo.sh folds such overrides into SRC_HASH (KNOBS=...),
+ * and `--version` prints the effective values (KNOBS line), so a knob build can
+ * never pass for the release binary. */
+#ifndef HT_SIZE
 #define HT_SIZE  (1 << 24)          /* 16 M slots   */
+#endif
 #define HT_MASK  (HT_SIZE - 1)
+#ifndef QSZ
 #define QSZ      (1 << 24)          /* 16 M entries */
+#endif
 
 /* Linear-probing scan depth for the dedup hash tables.  Bumped from the
  * original 128 after observing depth over-counts caused by silent state-
@@ -428,7 +467,9 @@ static int solve_direct(const Puzzle *pz, uint8_t *used_dirs, int ss_size) {
  * is now flagged via HashState*::probe_failed and propagated as -3, so
  * even if a future puzzle exceeds this limit the answer can never be
  * silently wrong — the solver bails instead. */
+#ifndef HT_PROBE_LIMIT
 #define HT_PROBE_LIMIT 65536
+#endif
 
 typedef struct {
     uint64_t htk   [HT_SIZE];   /* stored keys        — 128 MB */
@@ -441,7 +482,7 @@ typedef struct {
 static _Thread_local HashState *hs_tls;
 
 static HashState *hs_get(void) {
-    if (!hs_tls) { hs_tls = calloc(1, sizeof *hs_tls); hs_tls->ht_seq = 1; }
+    if (!hs_tls) { hs_tls = sok_xcalloc(1, sizeof *hs_tls, "hash solver state"); hs_tls->ht_seq = 1; }
     return hs_tls;
 }
 
@@ -929,23 +970,30 @@ static inline int mand_dead_ctx(const Puzzle *pz, const MandCtx *mc,
  * ~256 MB per thread, allocated on first use.
  * ======================================================================== */
 
+#ifndef HTP_SIZE
 #define HTP_SIZE  (1 << 24)    /* 16 M hash-table slots.  Doubled from 8M
                                  * after probe-saturation was observed on
                                  * 11-block 6x6 boards even at 65K-probe
                                  * limit — load factor was still high
                                  * enough for clusters to exceed the cap.
-                                 * 16M halves the load factor again. */
+                                 * 16M halves the load factor again.
+                                 * Filling it to 85% ends a solve with -5
+                                 * (SOK_TABLE_FULL: undecided, never a prune). */
+#endif
 #define HTP_MASK  (HTP_SIZE - 1)
-#define HP64_SIZE (1 << 20)    /* pending-entry cap (-2 on overflow)  */
+#ifndef HP64_SIZE
+#define HP64_SIZE (1 << 20)    /* pending-entry cap (-2 on overflow: undecided) */
+#endif
 
 #define PQ64_NBUCKETS 256      /* power of two > max f-step (2 x max edge weight, edge <= 64) */
 #define PQ64_BMASK    (PQ64_NBUCKETS - 1)
 
+/* No per-entry used-direction bits any more: no caller asks for used_dirs (they
+ * all pass NULL), and the old 32-bit mask overflowed (UB) for blocks >= 8. */
 typedef struct {
     int      prio;        /* bucket priority: g, or f = g + h in the cutoff solver */
     int      g;           /* exact cost so far (walks + pushes)      */
     int      player_pos;  /* exact player cell (not in state key)   */
-    uint32_t used;        /* accumulated used-direction bits         */
     uint32_t slot;        /* hash-table slot holding this state      */
     uint64_t state;       /* pack5 state (always kept for unpacking) */
 #ifdef USE_ZOBRIST
@@ -977,7 +1025,9 @@ typedef struct {
  * re-runs on the BIG table; the wasted work is bounded by that threshold
  * and the case is rare, so probe saturation (-3) becomes unreachable in
  * practice. */
+#ifndef HTP_SMALL_LG2
 #define HTP_SMALL_LG2 16
+#endif
 #define HTP_SMALL_SIZE (1u << HTP_SMALL_LG2)
 
 typedef struct {
@@ -993,6 +1043,7 @@ typedef struct {
     int      pq_count;           /* pending entries across buckets */
     int      probe_failed;       /* set when probe limit hit */
     void    *ms_lab;             /* multi-start label vectors, one per SMALL slot (lazy) */
+    size_t   ms_lab_bytes;       /* its size, for the generation-wrap clear in hsp64_clear */
     uint32_t *touched;           /* slots inserted this solve (small table only) */
     uint32_t  ntouched;
     int       last_exhaustive;   /* last cutoff solve on the small table ran to completion with no win */
@@ -1004,10 +1055,10 @@ static _Thread_local HashStatePush64 *hsp64_tls;
 
 static HashStatePush64 *hsp64_get(void) {
     if (!hsp64_tls) {
-        hsp64_tls = calloc(1, sizeof *hsp64_tls);
+        hsp64_tls = sok_xcalloc(1, sizeof *hsp64_tls, "push-solver state");
         hsp64_tls->ht_seq = 1;
-        hsp64_tls->slot_small = calloc(HTP_SMALL_SIZE, sizeof(HSlot64));
-        hsp64_tls->touched = malloc(HTP_SMALL_SIZE * sizeof(uint32_t));
+        hsp64_tls->slot_small = sok_xcalloc(HTP_SMALL_SIZE, sizeof(HSlot64), "small push table");
+        hsp64_tls->touched = sok_xmalloc(HTP_SMALL_SIZE * sizeof(uint32_t), "small push table index");
     }
     return hsp64_tls;
 }
@@ -1015,7 +1066,7 @@ static HashStatePush64 *hsp64_get(void) {
 /* Select the active table.  big=0 -> small L2 table; big=1 -> 16M table. */
 static void hsp64_select(HashStatePush64 *hs, int big) {
     if (big) {
-        if (!hs->slot_big) hs->slot_big = calloc(HTP_SIZE, sizeof(HSlot64));
+        if (!hs->slot_big) hs->slot_big = sok_xcalloc(HTP_SIZE, sizeof(HSlot64), "big push table");
         hs->slot = hs->slot_big;   hs->ht_mask = HTP_MASK;
         hs->ht_limit = (uint32_t)(HTP_SIZE * 0.85);
     } else {
@@ -1026,8 +1077,11 @@ static void hsp64_select(HashStatePush64 *hs, int big) {
 
 static void hsp64_clear(HashStatePush64 *hs) {
     if (++hs->ht_seq == 0) {
+        /* Generation wrap: every table keyed by ht_seq must forget its stamps,
+         * the multi-start labels included (they share the counter). */
         memset(hs->slot_small, 0, HTP_SMALL_SIZE * sizeof(HSlot64));
         if (hs->slot_big) memset(hs->slot_big, 0, (size_t)HTP_SIZE * sizeof(HSlot64));
+        if (hs->ms_lab) memset(hs->ms_lab, 0, hs->ms_lab_bytes);
         hs->ht_seq = 1;
     }
     for (int i = 0; i < PQ64_NBUCKETS; i++) hs->bq[i].len = 0;
@@ -1076,15 +1130,20 @@ typedef struct {
     uint64_t key;
     int16_t  pfr;     /* push-from cell — needs wdist[pfr] >= 0  */
     int16_t  bpos;    /* block's old cell == player landing cell */
-    uint8_t  dirbit;  /* bi*4 + d, for used-direction tracking   */
 } PushCand;
+
+/* used_dirs is no longer tracked (see HeapEntry64).  A caller that still passes
+ * a buffer gets the conservative superset "every direction may be used". */
+static inline void fill_used_dirs(uint8_t *used_dirs, int nb) {
+    if (used_dirs) for (int i = 0; i < nb; i++) used_dirs[i] = 0xF;
+}
 
 /* Bucket queue: push entry into its priority's bucket. */
 static inline void bq64_push(HashStatePush64 *hs, const HeapEntry64 *e) {
     Bucket64 *b = &hs->bq[e->prio & PQ64_BMASK];
     if (b->len == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 1024;
-        b->items = realloc(b->items, (size_t)b->cap * sizeof(HeapEntry64));
+        b->items = sok_xrealloc(b->items, (size_t)b->cap * sizeof(HeapEntry64), "push-solver bucket");
     }
     b->items[b->len++] = *e;
     hs->pq_count++;
@@ -1122,7 +1181,7 @@ retry:
     {
         HeapEntry64 e0;
         e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
-        e0.used = 0; e0.state = init_st;
+        e0.state = init_st;
 #ifdef USE_ZOBRIST
         e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh, pz->hole_pos);
 #endif
@@ -1131,7 +1190,6 @@ retry:
     }
 
     int      best_win  = INT_MAX;
-    uint32_t best_used = 0;
 
     int pq_min = 0;
     while (hs->pq_count > 0) {
@@ -1217,7 +1275,6 @@ retry:
                 cand[ncand].key   = nk;
                 cand[ncand].pfr   = (int16_t)pfr;
                 cand[ncand].bpos  = (int16_t)bpos;
-                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
                 ncand++;
             }
         }
@@ -1231,7 +1288,7 @@ retry:
         /* Win check: can player walk to exit? */
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
-            if (wc < best_win) { best_win = wc; best_used = e.used; }
+            if (wc < best_win) best_win = wc;
         }
 
         /* Pass 2: keep candidates whose push-from cell is reachable. */
@@ -1244,11 +1301,10 @@ retry:
             if (slot >= 0) {
                 if (hs->pq_count >= HP64_SIZE) {
                     if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
-                    return -2;
+                    return SOK_PENDING_CAP;
                 }
                 HeapEntry64 ne;
                 ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
-                ne.used = e.used | (1u << cand[ci].dirbit);
                 ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
                 ne.key = nk;
@@ -1257,10 +1313,16 @@ retry:
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
                 if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                    return -3;
+                    return SOK_PROBE_LIMIT;
                 }
             } else if (hs->overflow) {
-                /* Small table saturated: rerun this solve on the big one. */
+                /* Table saturated.  The small one: rerun this solve once on the
+                 * big one.  The big one: the identical rerun would overflow at
+                 * the same insert forever, so the solve is undecided (-5). */
+                if (use_big) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return SOK_TABLE_FULL;
+                }
                 use_big = 1;
                 goto retry;
             }
@@ -1268,11 +1330,9 @@ retry:
     }
 
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-    if (hs->probe_failed) return -3;
+    if (hs->probe_failed) return SOK_PROBE_LIMIT;
     if (best_win == INT_MAX) return -1;
-    if (used_dirs)
-        for (int i = 0; i < nb; i++)
-            used_dirs[i] = (uint8_t)((best_used >> (i * 4)) & 0xF);
+    fill_used_dirs(used_dirs, nb);
     return best_win;
 }
 
@@ -1376,7 +1436,9 @@ static inline int hb_bound(const Puzzle *pz, int p, const int *bp, int nb, int h
  * covered is skipped.  Keys are Zobrist over (player, blocks+masks, holes)
  * and independent of the walls, so a lookup is direct.
  * ======================================================================== */
+#ifndef REF_LG2
 #define REF_LG2 16
+#endif
 static _Thread_local uint64_t *g_ref_keys;   /* REF_SIZE slots, 0 = empty */
 static _Thread_local int32_t  *g_ref_cost;
 static _Thread_local int       g_ref_n = 0;   /* live entries (0 = no reference) */
@@ -1407,7 +1469,7 @@ void sokoban_clear_reference(void) {
 }
 int sokoban_ref_build(const uint64_t *keys, const int32_t *costs, int n, SokRefTable *t) {
     uint32_t sz = 256; while (sz < 2u * (uint32_t)n) sz <<= 1;
-    if (t->cap < sz) { free(t->hk); free(t->hc); t->hk = malloc(sz * sizeof(uint64_t)); t->hc = malloc(sz * sizeof(int32_t)); t->cap = sz; }
+    if (t->cap < sz) { free(t->hk); free(t->hc); t->hk = sok_xmalloc(sz * sizeof(uint64_t), "reference table keys"); t->hc = sok_xmalloc(sz * sizeof(int32_t), "reference table costs"); t->cap = sz; }
     memset(t->hk, 0, sz * sizeof(uint64_t));
     t->mask = sz - 1; t->n = 0;
     g_refstat[4]++; g_refstat[5] += n;
@@ -1505,6 +1567,7 @@ int sokoban_export_settled(uint64_t *keys, int32_t *costs, int max) {
         keys[n] = sl->key; costs[n] = sl->cost; n++;
     }
     if (hs->last_ref_used) {
+        if (!g_ref_keys) return -1;      /* the reference was cleared since: its entries are gone */
         if (n + g_ref_n >= max) return -1;
         for (uint32_t h = 0; h <= g_ref_mask; h++) if (g_ref_keys[h]) { keys[n] = g_ref_keys[h] ^ g_ref_xor; costs[n] = g_ref_cost[h] + g_ref_k; n++; }
     }
@@ -1513,6 +1576,10 @@ int sokoban_export_settled(uint64_t *keys, int32_t *costs, int max) {
 
 static int solve_push64_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     if (max_cost < 0) {
+        /* No table is built: whatever the previous solve left must not be
+         * exported as this state's parent table (the dispatcher already
+         * cleared last_exhaustive; kept here for direct callers). */
+        hsp64_get()->last_exhaustive = 0;
         if (prof) { prof->peak_heap_sz = 1; prof->states_popped = 0; bfs_tail_reset(prof, max_cost); }
         return -1;
     }
@@ -1570,7 +1637,7 @@ retry:
 #else
         e0.prio = 0;
 #endif
-        e0.used = 0; e0.state = init_st;
+        e0.state = init_st;
 #ifdef USE_ZOBRIST
         e0.key = zpack64(pz->player_start, ib, pz->block_pushable, nb, ihm, nh, pz->hole_pos);
 #endif
@@ -1579,7 +1646,6 @@ retry:
     }
 
     int      best_win  = INT_MAX;
-    uint32_t best_used = 0;
 
 #ifdef FWPROF
     g_fwp[FWP_SETUP] += mach_absolute_time() - _ts;
@@ -1604,7 +1670,7 @@ retry:
             /* No push child can cost <= max_cost, and a walk-win needs
              * wdist[exit] == 0, i.e. the player already stands on the exit. */
             if (e.player_pos == exit_pos && e.g < best_win) {
-                best_win = e.g; best_used = e.used;
+                best_win = e.g;
                 if (g_decision_only) goto done;
             }
             continue;
@@ -1684,7 +1750,6 @@ retry:
                 cand[ncand].key   = nk;
                 cand[ncand].pfr   = (int16_t)pfr;
                 cand[ncand].bpos  = (int16_t)bpos;
-                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
                 ncand++;
             }
         }
@@ -1698,7 +1763,7 @@ retry:
         if (wdist[exit_pos] >= 0) {
             int wc = e.g + (int)wdist[exit_pos];
             if (wc <= max_cost && wc < best_win) {
-                best_win = wc; best_used = e.used;
+                best_win = wc;
                 if (g_decision_only) goto done;   /* any solution within the cutoff decides the check */
             }
         }
@@ -1733,11 +1798,10 @@ retry:
                 if (g_ref_on && ref_prunes_at(nk, nc, cand[ci].bpos, max_cost)) continue;
                 if (hs->pq_count >= HP64_SIZE) {
                     if (prof) { prof->peak_heap_sz = HP64_SIZE; prof->states_popped = n_popped; }
-                    return -2;
+                    return SOK_PENDING_CAP;
                 }
                 HeapEntry64 ne;
                 ne.prio = nprio; ne.g = nc; ne.player_pos = cand[ci].bpos;
-                ne.used = e.used | (1u << cand[ci].dirbit);
                 ne.slot = (uint32_t)slot; ne.state = cand[ci].state;
 #ifdef USE_ZOBRIST
                 ne.key = nk;
@@ -1746,10 +1810,15 @@ retry:
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
                 if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                    return -3;
+                    return SOK_PROBE_LIMIT;
                 }
             } else if (hs->overflow) {
-                /* Small table saturated: rerun this solve on the big one. */
+                /* Small table saturated: rerun this solve once on the big one.
+                 * The big one saturated: undecided (-5), never a retry loop. */
+                if (use_big) {
+                    if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                    return SOK_TABLE_FULL;
+                }
                 use_big = 1;
                 goto retry;
             }
@@ -1759,11 +1828,11 @@ retry:
 
 done:
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-    if (hs->probe_failed) return -3;
+    /* A dropped state (probe limit) makes "no solution" unproven, but a solution
+     * that was found is real: in decision mode it still decides the check. */
+    if (hs->probe_failed && !(g_decision_only && best_win != INT_MAX)) return SOK_PROBE_LIMIT;
     if (best_win == INT_MAX) { hs->last_exhaustive = 1; hs->last_ref_used = g_ref_on; hs->last_maxcost = max_cost; return -1; }
-    if (used_dirs)
-        for (int i = 0; i < nb; i++)
-            used_dirs[i] = (uint8_t)((best_used >> (i * 4)) & 0xF);
+    fill_used_dirs(used_dirs, nb);
     return best_win;
 }
 
@@ -1803,12 +1872,16 @@ done:
  * adjacent ancestor (k = 1) this means i only explores states it reaches
  * STRICTLY cheaper than its predecessor.
  * ======================================================================== */
-#define MS_MAX   24
+#define MS_MAX   24                        /* starts per solve: bitmask-bound (uint32 alive/done), not a knob */
 #define MS_INF   255
+#ifndef MS_LG2
 #define MS_LG2   16
+#endif
 #define MS_SIZE  (1u << MS_LG2)
 #define MS_MASK  (MS_SIZE - 1)
+#ifndef MS_ARENA
 #define MS_ARENA (1u << 20)                 /* cached successors per solve, 24 MB */
+#endif
 typedef struct { uint64_t state, key; int32_t slot; int8_t bpos, w, hd, pad; } MSSucc;   /* 24 B; slot: table index once known, else -1 */
 typedef struct {
     uint64_t key; uint32_t gen; uint32_t done;
@@ -1841,12 +1914,11 @@ int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *c
     if (n <= 0 || n > MS_MAX) return -2;
     if (g_bits_per_cell * (1 + nb) + nh > 64) return -2;
     HashStatePush64 *hs = hsp64_get();
-    if (!hs->ms_lab) hs->ms_lab = calloc(MS_SIZE, sizeof(MSLab));
-    if (!ms_arena_tls) ms_arena_tls = malloc((size_t)MS_ARENA * sizeof(MSSucc));
+    if (!hs->ms_lab) { hs->ms_lab = sok_xcalloc(MS_SIZE, sizeof(MSLab), "multi-start labels"); hs->ms_lab_bytes = (size_t)MS_SIZE * sizeof(MSLab); }
+    if (!ms_arena_tls) ms_arena_tls = sok_xmalloc((size_t)MS_ARENA * sizeof(MSSucc), "multi-start arena");
     MSLab *L = (MSLab *)hs->ms_lab; MSSucc *AR = ms_arena_tls; uint32_t arena_n = 0;
     hsp64_select(hs, 0);
-    hsp64_clear(hs);
-    if (hs->ht_seq == 1) memset(L, 0, MS_SIZE * sizeof(MSLab));
+    hsp64_clear(hs);   /* a generation wrap clears L too (see hsp64_clear) */
     mand_setup(pz);
 
     const int      exit_pos = pz->exit_pos;
@@ -1949,7 +2021,7 @@ int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *c
                 if (nc < L[slot].lab[i]) L[slot].lab[i] = (uint8_t)nc;
                 if (nc < 64 && (seen >> nc & 1)) continue;
                 if (nc < 64) seen |= 1ULL << nc;
-                HeapEntry64 e; e.prio = nc; e.g = nc; e.player_pos = bpos; e.used = 0; e.slot = (uint32_t)slot; e.state = ns;
+                HeapEntry64 e; e.prio = nc; e.g = nc; e.player_pos = bpos; e.slot = (uint32_t)slot; e.state = ns;
 #ifdef USE_ZOBRIST
                 e.key = nk;
 #endif
@@ -2058,7 +2130,7 @@ int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *c
             }
             if (slot < 0 || !improved) continue;
             if (hs->pq_count >= HP64_SIZE || (g_heap_cap > 0 && hs->pq_count > g_heap_cap)) return -2;
-            HeapEntry64 ne; ne.prio = nc; ne.g = nc; ne.player_pos = sc->bpos; ne.used = 0; ne.slot = (uint32_t)slot; ne.state = sc->state;
+            HeapEntry64 ne; ne.prio = nc; ne.g = nc; ne.player_pos = sc->bpos; ne.slot = (uint32_t)slot; ne.state = sc->state;
 #ifdef USE_ZOBRIST
             ne.key = sc->key;
 #endif
@@ -2082,9 +2154,13 @@ finish:
  * 208 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HT128_SIZE  (1 << 24)  /* 16 M slots — see HTP_SIZE rationale. */
+#ifndef HT128_SIZE
+#define HT128_SIZE  (1 << 24)  /* 16 M slots — see HTP_SIZE rationale; filling 85% of it ends a solve with -5 */
+#endif
 #define HT128_MASK  (HT128_SIZE - 1)
+#ifndef QSZ128
 #define QSZ128      (1 << 22)
+#endif
 
 typedef struct {
     __uint128_t htk   [HT128_SIZE];   /* stored keys       —  64 MB */
@@ -2097,7 +2173,7 @@ typedef struct {
 static _Thread_local HashState128 *hs128_tls;
 
 static HashState128 *hs128_get(void) {
-    if (!hs128_tls) { hs128_tls = calloc(1, sizeof *hs128_tls); hs128_tls->ht_seq = 1; }
+    if (!hs128_tls) { hs128_tls = sok_xcalloc(1, sizeof *hs128_tls, "128-bit hash solver state"); hs128_tls->ht_seq = 1; }
     return hs128_tls;
 }
 
@@ -2261,16 +2337,17 @@ static int solve_hash128(const Puzzle *pz, uint8_t *used_dirs) {
  * ~144 MB per thread, allocated on first use.
  * ======================================================================== */
 
-#define HP128_SIZE (1 << 20)   /* pending-entry cap (-2 on overflow) */
+#ifndef HP128_SIZE
+#define HP128_SIZE (1 << 20)   /* pending-entry cap (-2 on overflow: undecided) */
+#endif
 
 typedef struct {
     __uint128_t state;
-    __uint128_t used;
     int         prio;
     int         g;        /* == prio here (the 128-bit solvers use plain Dijkstra order) */
     int         player_pos;
     uint32_t    slot;     /* hash-table slot holding this state */
-} HeapEntry128;   /* ~48 bytes with alignment */
+} HeapEntry128;   /* 32 bytes (no used-direction bits: see HeapEntry64) */
 
 typedef struct {
     HeapEntry128 *items;
@@ -2285,14 +2362,17 @@ typedef struct {
     Bucket128    bq[PQ64_NBUCKETS];    /* Dial bucket queue (lazy alloc) */
     int          pq_count;             /* pending entries across buckets */
     int          probe_failed;         /* set when probe limit hit */
+    uint32_t     ht_count, ht_limit;   /* inserts this solve / cap (85% of the slots) */
+    int          overflow;             /* set when ht_count reached ht_limit: the solve ends with -5 */
 } HashStatePush128;
 
 static _Thread_local HashStatePush128 *hsp128_tls;
 
 static HashStatePush128 *hsp128_get(void) {
     if (!hsp128_tls) {
-        hsp128_tls = calloc(1, sizeof *hsp128_tls);
+        hsp128_tls = sok_xcalloc(1, sizeof *hsp128_tls, "128-bit push table");
         hsp128_tls->ht_seq = 1;
+        hsp128_tls->ht_limit = (uint32_t)(HT128_SIZE * 0.85);
     }
     return hsp128_tls;
 }
@@ -2305,15 +2385,21 @@ static void hsp128_clear(HashStatePush128 *hs) {
     for (int i = 0; i < PQ64_NBUCKETS; i++) hs->bq[i].len = 0;
     hs->pq_count = 0;
     hs->probe_failed = 0;
+    hs->ht_count = 0;
+    hs->overflow = 0;
 }
 
 /* Returns the slot index if new_cost improves the stored cost (caller
- * should enqueue), or -1 otherwise. */
+ * should enqueue), or -1 otherwise.  Sets hs->overflow (and returns -1) once
+ * the table holds ht_limit states: the caller ends the solve with -5, so the
+ * table never creeps to 100% load with 65K-slot probe chains. */
 static inline int hsp128_update(HashStatePush128 *hs, __uint128_t k, int new_cost) {
     uint64_t h = h128(k) & HT128_MASK;
     for (int i = 0; i < HT_PROBE_LIMIT; i++) {
         uint32_t idx = (uint32_t)((h + i) & HT128_MASK);
         if (hs->ht_gen[idx] != hs->ht_seq) {
+            if (hs->ht_count >= hs->ht_limit) { hs->overflow = 1; return -1; }
+            hs->ht_count++;
             hs->ht_gen[idx]  = hs->ht_seq;
             hs->htk[idx]     = k;
             hs->ht_cost[idx] = new_cost;
@@ -2333,7 +2419,7 @@ static inline void bq128_push(HashStatePush128 *hs, const HeapEntry128 *e) {
     Bucket128 *b = &hs->bq[e->prio & PQ64_BMASK];
     if (b->len == b->cap) {
         b->cap = b->cap ? b->cap * 2 : 1024;
-        b->items = realloc(b->items, (size_t)b->cap * sizeof(HeapEntry128));
+        b->items = sok_xrealloc(b->items, (size_t)b->cap * sizeof(HeapEntry128), "128-bit push-solver bucket");
     }
     b->items[b->len++] = *e;
     hs->pq_count++;
@@ -2344,7 +2430,6 @@ typedef struct {
     __uint128_t state;
     int16_t     pfr;
     int16_t     bpos;
-    uint8_t     dirbit;
 } PushCand128;
 
 static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
@@ -2366,14 +2451,13 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
     __uint128_t init_st = pack128(pz->player_start, ib, nb, ihm);
     {
         HeapEntry128 e0;
-        e0.state = init_st; e0.used = 0;
+        e0.state = init_st;
         e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
         e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
         bq128_push(hs, &e0);
     }
 
     int         best_win  = INT_MAX;
-    __uint128_t best_used = 0;
 
     int pq_min = 0;
     while (hs->pq_count > 0) {
@@ -2444,7 +2528,6 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
                 cand[ncand].state = ns;
                 cand[ncand].pfr   = (int16_t)pfr;
                 cand[ncand].bpos  = (int16_t)bpos;
-                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
                 ncand++;
             }
         }
@@ -2455,7 +2538,7 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
-            if (wc < best_win) { best_win = wc; best_used = e.used; }
+            if (wc < best_win) best_win = wc;
         }
 
         /* Pass 2: keep candidates whose push-from cell is reachable. */
@@ -2469,29 +2552,29 @@ static int solve_push128(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof)
             if (slot >= 0) {
                 if (hs->pq_count >= HP128_SIZE) {
                     if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
-                    return -2;
+                    return SOK_PENDING_CAP;
                 }
                 HeapEntry128 ne;
                 ne.state = ns;
-                ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
                 ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.slot = (uint32_t)slot;
                 bq128_push(hs, &ne);
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
                 if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                    return -3;
+                    return SOK_PROBE_LIMIT;
                 }
+            } else if (hs->overflow) {
+                if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                return SOK_TABLE_FULL;
             }
         }
     }
 
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-    if (hs->probe_failed) return -3;
+    if (hs->probe_failed) return SOK_PROBE_LIMIT;
     if (best_win == INT_MAX) return -1;
-    if (used_dirs)
-        for (int i = 0; i < nb; i++)
-            used_dirs[i] = (uint8_t)((best_used >> (i * 4)) & 0xF);
+    fill_used_dirs(used_dirs, nb);
     return best_win;
 }
 
@@ -2524,14 +2607,13 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
     __uint128_t init_st = pack128(pz->player_start, ib, nb, ihm);
     {
         HeapEntry128 e0;
-        e0.state = init_st; e0.used = 0;
+        e0.state = init_st;
         e0.prio = 0; e0.g = 0; e0.player_pos = pz->player_start;
         e0.slot = (uint32_t)hsp128_update(hs, init_st, 0);
         bq128_push(hs, &e0);
     }
 
     int         best_win  = INT_MAX;
-    __uint128_t best_used = 0;
 
     int pq_min = 0;
     while (hs->pq_count > 0) {
@@ -2565,9 +2647,7 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
 
         if (wdist[exit_pos] >= 0) {
             int wc = e.prio + (int)wdist[exit_pos];
-            if (wc <= max_cost && wc < best_win) {
-                best_win = wc; best_used = e.used;
-            }
+            if (wc <= max_cost && wc < best_win) best_win = wc;
         }
 
         /* Pass 1: candidates + slot prefetch (see solve_push64).  Note the
@@ -2622,7 +2702,6 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
                 cand[ncand].state = ns;
                 cand[ncand].pfr   = (int16_t)pfr;
                 cand[ncand].bpos  = (int16_t)bpos;
-                cand[ncand].dirbit = (uint8_t)(bi * 4 + d);
                 ncand++;
             }
         }
@@ -2639,29 +2718,29 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
             if (slot >= 0) {
                 if (hs->pq_count >= HP128_SIZE) {
                     if (prof) { prof->peak_heap_sz = HP128_SIZE; prof->states_popped = n_popped; }
-                    return -2;
+                    return SOK_PENDING_CAP;
                 }
                 HeapEntry128 ne;
                 ne.state = ns;
-                ne.used = e.used | ((__uint128_t)1 << cand[ci].dirbit);
                 ne.prio = nc; ne.g = nc; ne.player_pos = cand[ci].bpos;
                 ne.slot = (uint32_t)slot;
                 bq128_push(hs, &ne);
                 if (hs->pq_count > peak_heap) peak_heap = hs->pq_count;
                 if (g_heap_cap > 0 && hs->pq_count > g_heap_cap) {
                     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-                    return -3;
+                    return SOK_PROBE_LIMIT;
                 }
+            } else if (hs->overflow) {
+                if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
+                return SOK_TABLE_FULL;
             }
         }
     }
 
     if (prof) { prof->peak_heap_sz = peak_heap; prof->states_popped = n_popped; }
-    if (hs->probe_failed) return -3;
+    if (hs->probe_failed && !(g_decision_only && best_win != INT_MAX)) return SOK_PROBE_LIMIT;   /* see solve_push64_cutoff */
     if (best_win == INT_MAX) return -1;
-    if (used_dirs)
-        for (int i = 0; i < nb; i++)
-            used_dirs[i] = (uint8_t)((best_used >> (i * 4)) & 0xF);
+    fill_used_dirs(used_dirs, nb);
     return best_win;
 }
 
@@ -2669,8 +2748,19 @@ static int solve_push128_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile
  * DISPATCHER
  * ======================================================================== */
 
+/* A state must fit the widest packing: player + nb blocks at g_bits_per_cell
+ * bits each + an nh-bit hole mask in 128 bits (and the int hole masks need
+ * nh <= 30).  A state that does not fit is SOK_NO_FIT: never solved on a
+ * truncated key, never a prune; the caller must end the run with an error. */
+static inline int sok_fits(int nb, int nh) {
+    return nb >= 0 && nb <= MAX_BLOCKS && nh >= 0 && nh <= 30 && g_bits_per_cell * (1 + nb) + nh <= SOK_STATE_BITS_MAX;
+}
+int sokoban_state_bits_max(void) { return SOK_STATE_BITS_MAX; }
+
 int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
     int nb = pz->num_blocks, nh = pz->num_holes;
+    hsp64_get()->last_exhaustive = 0;          /* a full solve never leaves an exportable cutoff table behind */
+    if (!sok_fits(nb, nh)) return SOK_NO_FIT;
     if (g_bits_per_cell * (1 + nb) + nh > 64)
         return solve_push128(pz, used_dirs, prof);
     return solve_push64(pz, used_dirs, prof);
@@ -2678,9 +2768,47 @@ int sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof) {
 
 int sokoban_solve_cutoff(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof, int max_cost) {
     int nb = pz->num_blocks, nh = pz->num_holes;
-    if (g_bits_per_cell * (1 + nb) + nh > 64) {
-        hsp64_get()->last_exhaustive = 0;      /* the 128-bit solver has no exportable table; never export the previous 64-bit one */
+    /* Only an exhaustive small-table 64-bit solve made by THIS call may be
+     * exported afterwards (sokoban_export_settled): clear the flag first, so no
+     * early return (max_cost < 0, 128-bit width, no fit) can leave the previous
+     * solve's table looking exportable. */
+    hsp64_get()->last_exhaustive = 0;
+    if (!sok_fits(nb, nh)) return SOK_NO_FIT;
+    if (g_bits_per_cell * (1 + nb) + nh > 64)
         return solve_push128_cutoff(pz, used_dirs, prof, max_cost);
-    }
     return solve_push64_cutoff(pz, used_dirs, prof, max_cost);
+}
+
+/* Effective table-size knobs of this build, as a JSON object body (for the
+ * worker's --version KNOBS line). */
+const char *sokoban_knobs_json(void) {
+    static char buf[768];
+    snprintf(buf, sizeof buf,
+             "\"HTP_SIZE\":%lld,\"HTP_SMALL_LG2\":%d,\"HP64_SIZE\":%lld,\"HT_PROBE_LIMIT\":%lld,"
+             "\"HT128_SIZE\":%lld,\"HP128_SIZE\":%lld,\"REF_LG2\":%d,\"MS_LG2\":%d,\"MS_ARENA\":%lld,"
+             "\"SOK_STATE_BITS_MAX\":%d,\"solver_defs\":\"%s\"",
+             (long long)(HTP_SIZE), (int)(HTP_SMALL_LG2), (long long)(HP64_SIZE), (long long)(HT_PROBE_LIMIT),
+             (long long)(HT128_SIZE), (long long)(HP128_SIZE), (int)(REF_LG2), (int)(MS_LG2), (long long)(MS_ARENA),
+             (int)(SOK_STATE_BITS_MAX),
+             ""
+#ifdef NO_ASTAR
+             "NO_ASTAR "
+#endif
+#ifdef HOLEBOUND
+             "HOLEBOUND "
+#endif
+#ifdef MS_NO_DOM
+             "MS_NO_DOM "
+#endif
+#ifdef MAND_OLD
+             "MAND_OLD "
+#endif
+#ifdef MAND_ASSERT
+             "MAND_ASSERT "
+#endif
+#ifdef FWPROF
+             "FWPROF "
+#endif
+             );
+    return buf;
 }
