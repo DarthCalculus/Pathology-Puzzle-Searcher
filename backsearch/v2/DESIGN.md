@@ -346,3 +346,17 @@ Rules: the page never talks to workers or to the campaign server directly;
 it only reads `/state` and posts to the client's control endpoints. Client
 fetches `/api/v2/status` at most every 30 s for the campaign table; `me` and
 `exits` arrive with each heartbeat. All text from the server is escaped.
+
+## 9. Work stealing (added 2026-09-24)
+
+Leases are advisory; coverage is decided by reports (first report wins). When
+a lease request finds the pool empty, the server re-leases jobs held by other
+clients: from the client holding the most, newest lease first, preferring jobs
+the holder's last heartbeat did not list in `running` (zero progress lost); a
+running job is taken only when no queued job exists anywhere, at most one per
+request, and first-report-wins settles it. The previous holder sees the ids in
+`drop` on its next heartbeat and removes them (killing the worker if it was
+running one). Counters `empty_leases` and `stolen` are in `/api/v2/status`
+totals. The client sends `running` (running job ids) alongside `holding`.
+No held cap is needed: hoarding is harmless while the pool is deep and is
+undone automatically the moment it would idle someone.

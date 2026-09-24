@@ -1159,10 +1159,13 @@ class Volunteer:
 
     def heartbeat(self):
         with self.lock:
-            holding = [s.job["id"] for s in self.slots if s.job] + [j["id"] for j in self.queue]
+            running = [s.job["id"] for s in self.slots if s.job]
+            holding = running + [j["id"] for j in self.queue]
         # `holding` lets the server renew exactly what we hold, hand back a job whose lease lapsed
         # while we slept if nobody took it, and tell us to drop one that someone else now holds
-        body = {"token": self.token, "workers": self.workers, "paused": self.paused, "boards": self.boards(), "holding": holding}
+        # `running` lets the server prefer our still-queued jobs (no progress lost) when it has to
+        # hand work to an idle client because the pool is empty
+        body = {"token": self.token, "workers": self.workers, "paused": self.paused, "boards": self.boards(), "holding": holding, "running": running}
         try:
             res = self.api.post("/api/v2/heartbeat", body, timeout=20)
         except ApiError as e:
