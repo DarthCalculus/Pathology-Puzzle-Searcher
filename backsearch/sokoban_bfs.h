@@ -205,7 +205,9 @@ void sokoban_ref_suspend(int suspend);                                     /* RE
 int  sokoban_ref_active(void);
 
 int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *cut, const uint32_t *pred,
-                        const uint8_t *refk, int n, uint8_t *out, BfsProfile *prof);   /* refk: per-start chain offset for an installed reference, or NULL */
+                        const uint8_t *refk, int n, uint8_t *out, BfsProfile *prof);   /* refk: per-start chain offset for an installed reference, or NULL.
+                                                                                        * The true offsets must be passed: a capped k would prune more than
+                                                                                        * proven, so a caller whose offset exceeds 250 passes NULL instead. */
 
 /*
  * sokoban_set_forced_mandatory(cell_mask)

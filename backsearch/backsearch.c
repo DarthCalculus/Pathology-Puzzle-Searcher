@@ -2175,7 +2175,7 @@ static int apply_seed_step(BState *s, int D, int variant) {
         s->player_pos      = (int8_t)C;
         s->committed_empty = new_E;
         s->depth          += 1;
-        s->seg_len        += 1;
+        if (s->seg_len < 127) s->seg_len += 1;   /* int8, clamped like bulk_generate's (a clamp only weakens the walk-segment prune) */
         s->wh              = wh_after_walk(s->wh, D ^ 2);
         s->bulk_walk       = 0;
         path_push(s, D, 1);
@@ -2772,7 +2772,7 @@ static void expand(const BState *s) {
                 ns->committed_empty = new_E;
                 ns->depth           = s->depth + 1;
                 ns->wh              = wh_after_walk(s->wh, w);
-                ns->seg_len         = (int8_t)(s->seg_len + 1);
+                ns->seg_len         = (int8_t)(s->seg_len < 127 ? s->seg_len + 1 : 127);   /* int8: clamped (only weakens the prune) */
                 d_var[d_n] = 1; d_n++;
             }
         }
@@ -5872,6 +5872,21 @@ int main(int argc, char **argv) {
             g_active_mask |= 1ULL << (r * g_cols + c);
 
     sokoban_init();
+    {   /* M45 interim guard: the solver packs a state into at most sokoban_state_bits_max() bits; a
+         * state that does not fit ends the run with status "error" (exit 5), never a silent prune. */
+        int bpc = 5; while ((1 << bpc) < g_ncells + 1) bpc++;
+        int worst = 0, worst_nh = 0;   /* blocks and holes sit on distinct cells, never on the player's */
+        for (int nh = 0; nh <= g_max_holes && nh <= g_ncells - 1; nh++) {
+            int nb = g_max_blocks < g_ncells - 1 - nh ? g_max_blocks : g_ncells - 1 - nh;
+            if (bpc * (1 + nb) + nh > worst) { worst = bpc * (1 + nb) + nh; worst_nh = nh; }
+        }
+        if (!g_protocol_mode && worst > sokoban_state_bits_max()) {
+            int fit = (sokoban_state_bits_max() - worst_nh) / bpc - 1;
+            fprintf(stderr, "note: on %dx%d with %d holes only states with <= %d blocks fit the %d-bit solver packing; "
+                            "reaching a bigger one ends the run with status error (exit 5)\n",
+                    g_grid_rows, g_grid_cols, worst_nh, fit, sokoban_state_bits_max());
+        }
+    }
     sokoban_set_hole_prune(g_mandatory_holes);
     sokoban_set_forced_mandatory(g_forced_mand_cells);
 
@@ -6023,7 +6038,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         BState seed;
-        if (!build_seed_path_seed(&seed)) return 1;
+        /* A malformed or overlong seed is no longer fatal at parse time (a search
+         * reports it as bad_seed): never print the key of the parsed prefix. */
+        if (g_seed_parse_error || !build_seed_path_seed(&seed)) return 1;
         printf("depth %d canonical_key %llu state_key %llu\n",
                seed.depth,
                (unsigned long long)canonical_state_key(&seed),
