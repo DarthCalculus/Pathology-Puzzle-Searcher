@@ -131,7 +131,7 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
     try:
         t0 = time.time()
         ref = TS.run_job(worker, grid, exit_, flags, '', tmp, timeout, max_levels=max_levels, keep_paths=True)
-        TS.check_run(worker, ref, split_expected=False)
+        TS.check_run(worker, ref, split_expected=False, grid=grid, exit_=exit_, extra=flags)
         if ref.summary['status'] != 'exhausted':
             raise Fail(f'monolithic run did not exhaust: {ref.summary}')
         full = {}
@@ -156,13 +156,14 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
                 out(f'  layer {k}: FAIL {e}')
                 fails.append(f'{name}-K{k}')
                 continue
-            union, extras, statuses, states = {}, [], {}, 0
+            union, extras, statuses, states, unknown = {}, [], {}, 0, ref.summary.get('unknown', 0)
             for _, path, _ in roots:
                 r = TS.run_job(worker, grid, exit_, flags, path, tmp, timeout, max_levels=max_levels, keep_paths=True)
-                TS.check_run(worker, r, split_expected=False)
+                TS.check_run(worker, r, split_expected=False, grid=grid, exit_=exit_, extra=flags)
                 st = r.summary['status']
                 statuses[st] = statuses.get(st, 0) + 1
                 states += r.summary.get('states', 0)
+                unknown += r.summary.get('unknown', 0)
                 for d, code, p in r.levels:
                     key = (d, canon(code))
                     if key not in full and key not in union and len(extras) < 5:
@@ -172,10 +173,11 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
             above = sum(1 for key in full if key[0] < k and key not in union)
             extra_n = sum(1 for key in union if key not in full)
             ubest = max((d for d, _ in union), default=0)
-            ok = not lost and not extra_n and (ubest == fbest or fbest < k)
+            ok = not lost and not extra_n and (ubest == fbest or fbest < k) and not unknown
             out(f'  layer {k}: {len(roots)} roots ({"; ".join(notes)}), statuses {statuses}, {states} states, union '
                 f'{len(union)}; lost at depth >= {k}: {len(lost)}, extra {extra_n}, best {ubest} vs {fbest} '
-                f'({above} levels above the layer) ({time.time() - t1:.0f}s){"" if ok else "  FAIL"}')
+                f'({above} levels above the layer){f"; {unknown} capacity results (sets not comparable)" if unknown else ""} '
+                f'({time.time() - t1:.0f}s){"" if ok else "  FAIL"}')
             for d, c in lost[:3]:
                 out(f'    lost depth {d} {c}  monolithic path {full[(d, c)]}')
             for (d, c), root, p in extras[:3]:
