@@ -19,25 +19,37 @@ Run (leave it running; it fetches its own work):
 python3 v2/volunteer.py --name "Your name" --workers 4
 ```
 
-* `--workers` = how many search processes to run. Default is your core count
-  minus one; each uses about 200 MB of RAM. You can change it while running.
+* `--workers` = how many search processes to run. Default is half your core
+  count; each uses up to about 0.5 GB of RAM. You can change it while running.
 * A page opens at http://127.0.0.1:8765/ showing, for each worker, the node it
   is expanding, the best level of its current job and the best level found in
-  the last second, plus totals. Closing the page does not stop the search
-  unless you press **Stop**.
+  the last second, plus totals. Closing the page stops the client like **Stop**
+  (add `--no-stop-on-close` to keep it running without the page).
 * **Pause** freezes the workers instantly (memory stays allocated) and keeps
   your jobs reserved for up to 12 hours. **Resume** continues where they were.
-* **Stop** (or Ctrl-C once) lets each worker print the exact remaining work of
-  its job, reports it to the server, and exits. Nothing is lost; the remaining
-  pieces become new jobs for anyone. A second Ctrl-C kills the workers and
-  leaves the jobs to expire (they are re-issued after an hour).
+* **Stop** (or Ctrl-C once, or closing the terminal) lets each worker print the
+  exact remaining work of its job, reports it to the server, and exits. Nothing
+  is lost; the remaining pieces become new jobs for anyone. A second Ctrl-C kills
+  the workers and exits at once: finished reports stay in the outbox for the next
+  start, and the running jobs are re-issued after their lease expires.
+* **When the campaign is complete** the client stops by itself: it delivers its
+  last reports, prints a closing summary (your jobs and CPU-hours, and the result
+  per exit) and exits 0. Add `--keep-going` to wait for the next campaign and
+  join it instead. With no campaign running, the client says so and exits 0.
 * Laptop sleep is fine: on wake the client checks which jobs it still holds.
 * If the server is unreachable, finished reports queue in `volunteer_outbox/`
   and are delivered later; work continues on the jobs already leased.
-* When the worker code changes you will be told to `git pull && ./build_pgo.sh`
-  (the server accepts only whitelisted worker versions).
+* When the worker code changes you will be told to run
+  `git pull && ./build_pgo.sh -o backsearch_worker_nt --no-torch` in the
+  backsearch directory (the server accepts only whitelisted worker versions);
+  stop the client before you rebuild. When the client itself is too old, it
+  prints the server's update instructions and exits 2.
 * Headless machines: add `--no-ui`. Several clients on one machine: give each
-  its own `--outbox DIR` and `--port`.
+  its own `--outbox DIR` and `--port`. Each outbox has its own registration (a
+  second client on the same outbox refuses to start), so two clients never
+  share a token.
+* The worker gets a clean environment: `BS_*` debug variables are not passed on
+  (set `VOLUNTEER_ALLOW_DIRTY=1` only for development).
 
 ## Owners
 

@@ -29,10 +29,11 @@ cd Pathology-Puzzle-Searcher/backsearch
 ```
 
 The build takes a minute (it runs a short profiling search and rebuilds).
-If it fails, the plain build works too:
+If it fails, a plain build works too (slower, but it carries the source hash
+the client checks; without `-DSRC_HASH_STR` the client refuses the binary):
 
 ```bash
-cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
+cc -O3 -DSRC_HASH_STR="\"$(./build_pgo.sh --print-hash)\"" -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ```
 
 Check it: `./backsearch_worker_nt --grid 4x5 --exit 0 --max-depth 16 --time 20`

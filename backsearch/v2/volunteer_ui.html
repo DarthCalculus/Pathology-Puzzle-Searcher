@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="volunteer-secret" content="__VOLUNTEER_SECRET__">
 <title>Pathology volunteer</title>
 <style>
   /* palette and tile rules copied from PathologyRecords/server/public/style.css */
@@ -39,6 +40,8 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .banner { background: var(--panel2); border-left: 4px solid var(--warn); padding: 8px 12px; border-radius: 6px; margin-top: 10px; }
   .banner.bad { border-left-color: var(--bad); }
+  .banner.good { border-left-color: var(--good); }
+  .banner pre { white-space: pre-wrap; margin: 6px 0 0; font: 13px/1.45 Consolas, Menlo, monospace; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 16px; }
   .tile-k { color: var(--muted); font-size: 12px; }
   .tile-v { font-size: 18px; font-weight: 600; word-break: break-word; }
@@ -178,6 +181,9 @@ function renderLevel(code, moves, scale = 30) {
 }
 
 const $ = id => document.getElementById(id);
+/* Every POST carries this page's per-session secret: the client refuses control requests without it
+   (a page from another site never sees it), and answers only for Host 127.0.0.1/localhost. */
+const SECRET = (document.querySelector('meta[name="volunteer-secret"]') || {}).content || '';
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const SCALE = window.innerWidth < 480 ? 16 : 20;
 function boardText(code) {
@@ -220,7 +226,7 @@ function boardEl(caption, b, opts = {}) {
 
 async function post(path, body) {
   try {
-    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Volunteer': '1' }, body: JSON.stringify(body || {}) });
+    const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Volunteer': SECRET }, body: JSON.stringify(body || {}) });
     return await r.json();
   } catch (e) { return { error: String(e) }; }
 }
@@ -262,7 +268,15 @@ function render(st) {
   renderExitSelector(st);
 
   const banner = $('banner');
-  if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + '.'; }
+  const done = st.completion && Array.isArray(st.completion.lines) ? st.completion : null;
+  if (done && (st.waiting_next || st.draining || st.stopping || st.end_reason === 'complete' || done.fatal)) {
+    banner.hidden = false; banner.className = done.fatal ? 'banner bad' : 'banner good';
+    banner.innerHTML = `<b>${done.fatal ? 'The client refused to run' : 'Campaign complete'}</b>` +
+      (st.waiting_next ? ' · waiting for the next campaign (--keep-going)' : '') + `<pre>${esc(done.lines.join('\n'))}</pre>`;
+  }
+  else if (st.waiting_next) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Waiting for the next campaign (--keep-going).'; }
+  else if (st.draining) { banner.hidden = false; banner.className = 'banner good'; banner.textContent = 'The campaign is complete: finishing and delivering the last reports, then the client exits.'; }
+  else if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + '.'; }
   else if (st.paused) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Paused. Workers are frozen and still hold their memory; their jobs stay reserved for you.'; }
   else banner.hidden = true;
 
@@ -347,14 +361,25 @@ function render(st) {
   $('log').textContent = (st.log || []).join('\n');
 }
 
-let failures = 0;
+let failures = 0, lastState = null;
 async function poll() {
-  try { const r = await fetch('/state', { cache: 'no-store' }); render(await r.json()); failures = 0; }
-  catch (e) { if (++failures === 8) { const b = $('banner'); b.hidden = false; b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). You can close this tab.'; } }
+  try { const r = await fetch('/state', { cache: 'no-store' }); const st = await r.json(); render(st); lastState = st; failures = 0; }
+  catch (e) {
+    if (++failures === 8) {
+      const b = $('banner'); b.hidden = false;
+      const done = lastState && lastState.completion && Array.isArray(lastState.completion.lines) ? lastState.completion : null;
+      if (done) {
+        b.className = done.fatal ? 'banner bad' : 'banner good';
+        b.innerHTML = `<b>${done.fatal ? 'The client refused to run and exited' : 'Campaign complete: the client has exited'}</b><pre>${esc(done.lines.join('\n'))}</pre>You can close this tab.`;
+      } else if (lastState && lastState.stopping) {
+        b.className = 'banner'; b.textContent = 'The client stopped (' + (lastState.stop_reason || 'stop') + ') and exited. You can close this tab.';
+      } else { b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). You can close this tab.'; }
+    }
+  }
 }
 setInterval(poll, 250); poll();
 /* Window close = Stop (DESIGN 4). The client waits 3 s for a new /state poll (a reload) before stopping. */
-window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': '1' }, body: '{}' }); } catch (e) {} });
+window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': SECRET }, body: '{}' }); } catch (e) {} });
 </script>
 </body>
 </html>
