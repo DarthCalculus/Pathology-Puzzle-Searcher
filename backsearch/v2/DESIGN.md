@@ -360,3 +360,9 @@ running one). Counters `empty_leases` and `stolen` are in `/api/v2/status`
 totals. The client sends `running` (running job ids) alongside `holding`.
 No held cap is needed: hoarding is harmless while the pool is deep and is
 undone automatically the moment it would idle someone.
+
+Release by omission (2026-09-24): when a heartbeat carries `holding`, every
+other lease on that token older than 120 s is returned to the pool
+(`released` in the response). A restarted client reuses its token but not its
+old queue; without this its abandoned queue was renewed forever. Re-issued
+duplicate jobs are stealable like any other job.
