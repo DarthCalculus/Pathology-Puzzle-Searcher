@@ -1708,6 +1708,7 @@ static inline int classify(int x) {
     return SC_ERROR;
 }
 static long long g_unknown = 0, g_unknown_pq = 0, g_unknown_probe = 0, g_unknown_big = 0;   /* inconclusive checks, by cause */
+static long long g_max_pops = 0, g_max_pending = 0;   /* largest single check (states popped, pending entries): capacity headroom */
 static const char *unknown_cause(int x) { return x == SOK_PENDING_CAP ? "pq" : x == SOK_PROBE_LIMIT ? "probe" : "big"; }
 static void count_unknown(int x) {
     g_unknown++;
@@ -1915,6 +1916,8 @@ static int shortcut_check(const BState *s) {
     int rc = sokoban_solve_cutoff(&pz, NULL, &prof, max_cost);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (g_timers_on) timer_tick(t1);   /* reuses this clock reading: split/status checks inside long expansions */
+    if (prof.states_popped > g_max_pops) g_max_pops = prof.states_popped;
+    if (prof.peak_heap_sz > g_max_pending) g_max_pending = prof.peak_heap_sz;
     /* Branching signal stamped into BState.branch_factor.  Default: states_popped
      * (total unique expanded states) — grows with how much work the forward
      * solver did.  With --beam-score-tailwidth: a deep-weighted sum of the
@@ -4351,6 +4354,10 @@ static void run_estimate(void) {
         LayerNode *t = layer; layer = next; next = t; size_t tc = lcap; lcap = ncap; ncap = tc; ln = nn;
         if (ln == 0) break;
     }
+    if (g_path_overflow) {   /* a layer node's path was truncated: its LAYER line would name another node */
+        fprintf(stderr, "error: a depth-%d layer node needs more than PATH_TOK_MAX=%d path tokens\n", K, PATH_TOK_MAX);
+        exit(4);
+    }
     long long layer_checked = g_states_checked, layer_calls = g_solver_calls;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double t_layer = elapsed_s(t0, t1);
@@ -4598,6 +4605,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_dedup_full     = 0;
     g_skipped_dedup  = 0;
     g_unknown = g_unknown_pq = g_unknown_probe = g_unknown_big = 0;
+    g_max_pops = g_max_pending = 0;
     cands_reset();
 
     /* Bulk walk-back generation only fits the plain DFS (children at depth+k
@@ -5161,12 +5169,12 @@ static void print_summary(const char *st, double elapsed, int verify, const char
     printf("\",\"exit\":%d,\"states\":%lld,\"accepted\":%lld,\"valid\":%lld,\"best\":%d,"
            "\"verify\":%d,\"evict_shallow\":%lld,\"evict_recent\":%lld,\"elapsed\":%.3f,\"solver_calls\":%lld,\"src_hash\":\"%s\","
            "\"protocol\":3,\"cpu_s\":%.3f,\"unknown\":%lld,\"unknown_pq\":%lld,\"unknown_probe\":%lld,\"unknown_big\":%lld,"
-           "\"unresolved\":%d,\"unresolved_dropped_max\":%d,"
+           "\"unresolved\":%d,\"unresolved_dropped_max\":%d,\"max_pops\":%lld,\"max_pending\":%lld,"
            "\"flags\":{\"grid\":\"%dx%d\",\"exit\":%d,\"transit\":%d,\"block_on_exit\":%d,\"max_holes\":%d,\"max_blocks\":%d,\"min_walls\":%d,\"bulk_walk\":%d}",
            g_exit_pos, g_states_checked, accepted, g_accepted_valid, g_best_depth,
            verify, g_two_tables ? g_evictions_shallow : 0LL, g_two_tables ? g_evictions_recent : 0LL, elapsed, g_solver_calls, SRC_HASH_STR,
            cpu_seconds(), g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big,
-           g_last_unresolved_printed, g_cand_dropped_max,
+           g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending,
            g_grid_rows, g_grid_cols, g_exit_pos, g_allow_exit_transit, g_allow_block_on_exit, g_max_holes, g_max_blocks, g_min_walls, bulk_eff);
     if (err) { printf(",\"error\":\""); json_str(stdout, err); printf("\""); }
     printf("}\n");
