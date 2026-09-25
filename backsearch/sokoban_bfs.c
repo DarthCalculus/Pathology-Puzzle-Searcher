@@ -1478,7 +1478,7 @@ int sokoban_export_settled(uint64_t *keys, int32_t *costs, int max) {
 #define MS_SIZE  (1u << MS_LG2)
 #define MS_MASK  (MS_SIZE - 1)
 #ifndef MS_ARENA
-#define MS_ARENA (1u << 20)                 /* cached successors per solve (w1 24 MB, w2 40 MB, w4 56 MB; touched lazily) */
+#define MS_ARENA (1u << 20)                 /* cached successors per solve (w1 32 MB, w2 48 MB, w4 64 MB, one arena per width in use; touched lazily) */
 #endif
 typedef struct {
     uint64_t key; uint32_t gen; uint32_t done;

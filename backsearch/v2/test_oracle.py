@@ -30,11 +30,14 @@ each config and exit the test asserts:
      identical, on the configs small enough for bf;
   6. the oracle's judge agrees with the site's solver6 (PathologyRecords/solver/solver6.c, --batch) on
      every T level and on a seeded random sample of arbitrary levels (solvable or not);
-  7. wide6 (review M89 fix 3): on real 6x6 0-hole subtrees, every traced level with >= 10 blocks (a
-     state wider than 64 bits: its checks ran the 128-bit solver, 93% of campaign #2's solver time at
-     exit 14) is re-solved by solver6 and must take exactly its depth.  The oracle cannot enumerate
-     6x6; the wide path's completeness (no false shortcut) is checked on the small grids with
-     --narrow-bits (below).
+  7. wide6 (review M89 fix 3): on real 6x6 0-hole subtrees, every traced level with at least
+     wide_blocks(worker) blocks is re-solved by solver6 and must take exactly its depth.  Such a level is
+     a state wider than one 64-bit word, so its own shortcut check ran the wide solver path: since W3
+     (6 bits per cell, one word iff 6 * blocks <= 64) that is 11 blocks and the 16-block-byte instance;
+     for older workers 10 blocks and the separate 128-bit solver (6 * (1 + blocks) > 64), which took 93%
+     of campaign #2's solver time at exit 14.  With --solver-profile (W3 and later) the run must also
+     report wide checks.  The oracle cannot enumerate 6x6; the wide path's completeness (no false
+     shortcut) is checked on the small grids with --narrow-bits (below).
 The full run also runs the review's mode matrix on bigger configs (4x4 exit 0 <=3 holes, 5x5 exit 7
 <=3 blocks, 6x6 exit 14 0 holes <=2 blocks; skip with --no-matrix): worker vs worker, the canonical
 valid-level sets must be identical across all modes.
@@ -45,10 +48,14 @@ valid-level sets must be identical across all modes.
            --only matrix-6x6; a filter that selects nothing fails), --no-matrix, --no-modes, --no-cross,
            --no-wide6, --timeout S
   test builds (TEST-ONLY binaries from --src, which must be WORKER's source: its SRC_HASH is checked):
-    --narrow-bits N   states wider than N bits take the 128-bit solver instead of the 64-bit one, so
-                      the oracle checks the wide path exactly on grids it enumerates (0 = every solve
-                      wide; 20 = 4x5 states with >= 4 blocks); uses the worker's SOK_NARROW_BITS_MAX
-                      knob if it has one, else a patched copy of sokoban_bfs.c in the temp dir
+    --narrow-bits N   (0..64) states wider than N bits take the wide solver path instead of the 64-bit
+                      one, so the oracle checks the wide path exactly on grids it enumerates.  Since W3
+                      the build gets -DSOK_W1_BITS=N: a state with bits_per_cell*blocks + holes > N (5
+                      bits per cell on every oracle grid) is packed in the 16-block-byte instance (0 =
+                      every solve with a block is wide; 15 = 4x5 0-hole states with >= 4 blocks); add
+                      --build-knobs SOK_W2_BLOCKS=0 to use the 32-byte instance instead.  Older workers:
+                      the 128-bit solver, through a patched copy of sokoban_bfs.c in the temp dir (there
+                      the measure counts a player field: bits_per_cell*(1 + blocks) + holes > N)
     --build-knobs "K=V ..."   macro definitions (the -D is optional), e.g. "SHALLOW_LG2=10 RECENT_LG2=10"
                       (B1), "MS_LG2=4" (B4); knobs that cause capacity (UNKNOWN) results make the sets
                       incomparable and fail by design
@@ -230,18 +237,31 @@ def random_levels(R, C, n, rng, max_holes):
     return out
 
 
-# 6x6 0-hole subtrees (campaign #2's flags) whose levels mostly have >= 10 blocks: 6 bits per cell, so
-# 6 * (1 + blocks) > 64 and every check of such a level runs the 128-bit ("wide") solver.  The worker's
-# traced levels with >= 10 blocks are all re-solved forward by solver6 (review M89 fix 3): each must be
-# solvable in exactly its depth.  (name, exit, seed, in --quick)
+# 6x6 0-hole subtrees (campaign #2's flags) with many levels of 10 and 11 blocks.  The worker's traced
+# levels with >= wide_blocks(worker) blocks (states wider than one 64-bit word, whose own checks ran the
+# wide solver path) are all re-solved forward by solver6 (review M89 fix 3): each must be solvable in
+# exactly its depth.  (name, exit, seed, in --quick)
 _T23 = 'U2,U1,U1,R1,R1,D1,D1,D1,D1,L1,L1,R2,R1,U1,U1,U1,U1,L1,L1,D1,D1,L1,D1'
 WIDE6 = [
-    # 40 tokens down the path of e14-t23's best level: 51k states, best 120, ~2k levels with >= 10 blocks (~2 s)
+    # 40 tokens down the path of e14-t23's best level: 51k states, best 120, 2,828 levels, 754 with 11 blocks
+    # (2,047 with >= 10), 2,100 checks at the 16-byte width (W3 worker; ~2 s)
     ('wide6-e14-t40', 14, _T23 + ',D1,U2,U1,R2,U1,U1,R1,R1,D1,D1,D1,D1,L1,D1,L1,L1,L1', True),
     # test_split_exact's 66-e14-t23: 1.5M states, best 120, ~16k levels with >= 10 blocks (~35 s + ~30 s)
     ('wide6-e14-t23', 14, _T23, False),
 ]
-WIDE_BLOCKS = 10
+WIDE_MIN_LEVELS = 100      # fewer wide traced levels than this: the row does not exercise the wide path
+
+
+def wide_blocks(worker):
+    """The fewest blocks at which the worker packs a 6x6 0-hole state wider than one 64-bit word (6 bits
+    per cell): workers since W3 print SOK_W1_BITS in KNOBS and use one word iff 6 * blocks <= SOK_W1_BITS
+    and 6 * blocks < 64 (production 64: 11 blocks); older workers took the 128-bit solver when
+    6 * (1 + blocks) > 64 (10 blocks).  Never below 10: a narrow-bits build, whose every check is wide,
+    still re-solves only the deep levels."""
+    k = worker.knobs()
+    if 'SOK_W1_BITS' not in k:
+        return 10
+    return max(10, min(int(k['SOK_W1_BITS']) // 6 + 1, 11))
 
 
 def nblocks(code):
@@ -252,17 +272,24 @@ def wide6(worker, s6, tmp, timeout, rows, out):
     """Forward-verify the worker's wide-path levels on real 6x6 subtrees with solver6.  Returns failures."""
     fails = []
     flags = ['--allow-exit-transit', '--num-holes', '0']
+    wb = wide_blocks(worker)
+    prof = ['--solver-profile'] if 'SOK_W1_BITS' in worker.knobs() and worker.supports('--solver-profile') else []
     for name, e, seed, _ in rows:
         t0 = time.time()
-        r = TS.run_job(worker, '6x6', e, flags, seed, tmp, timeout)
+        r = TS.run_job(worker, '6x6', e, flags, seed, tmp, timeout, argv_extra=prof)
         TS.check_run(worker, r, split_expected=False, grid='6x6', exit_=e, extra=flags)
         if r.summary['status'] != 'exhausted' or r.summary.get('unknown', 0):
             out(f'FAIL {name}: status {r.summary["status"]}, unknown {r.summary.get("unknown", 0)}')
             fails.append(name)
             continue
-        wide = sorted(((d, c) for d, c, _ in r.levels if nblocks(c) >= WIDE_BLOCKS), reverse=True)
-        if len(wide) < 100:
-            out(f'FAIL {name}: only {len(wide)} traced levels with >= {WIDE_BLOCKS} blocks: the wide path is not exercised')
+        wide = sorted(((d, c) for d, c, _ in r.levels if nblocks(c) >= wb), reverse=True)
+        if len(wide) < WIDE_MIN_LEVELS:
+            out(f'FAIL {name}: only {len(wide)} traced levels with >= {wb} blocks: the wide path is not exercised')
+            fails.append(name)
+            continue
+        wide_checks = r.widths.get('16-byte', 0) + r.widths.get('32-byte', 0)
+        if prof and not wide_checks:
+            out(f'FAIL {name}: --solver-profile reports no check wider than 64 bits ({r.widths or "no width lines"})')
             fails.append(name)
             continue
         inp = ''.join(c.replace('/', '|') + '\n' for _, c in wide)
@@ -274,8 +301,10 @@ def wide6(worker, s6, tmp, timeout, rows, out):
         for d, c, j in bad[:5]:
             out(f'    {name}: level {c} traced at depth {d}, solver6 says {j}')
         out(f'  {"FAIL " if bad else ""}{name}: {r.summary["states"]} states, best {r.summary["best"]}, '
-            f'{len(r.levels)} levels, {len(wide)} with >= {WIDE_BLOCKS} blocks (deepest {wide[0][0]}, '
-            f'{max(nblocks(c) for _, c in wide)} blocks): solver6 disagrees on {len(bad)} ({time.time() - t0:.0f}s)')
+            f'{len(r.levels)} levels, {len(wide)} with >= {wb} blocks (deepest {wide[0][0]}, '
+            f'{max(nblocks(c) for _, c in wide)} blocks'
+            f'{f", {wide_checks} wide checks" if prof else ""}): solver6 disagrees on {len(bad)} '
+            f'({time.time() - t0:.0f}s)')
         if bad:
             fails.append(name)
     return fails
@@ -352,7 +381,8 @@ def main():
     ap.add_argument('--judge-sample', type=int, default=3000, help='oracle levels per config for the judge check')
     ap.add_argument('--no-wide6', action='store_true', help='skip the 6x6 wide-path forward verification')
     ap.add_argument('--narrow-bits', type=int, help='test a TEST-ONLY build of --src whose states wider than N bits '
-                    'take the 128-bit solver (production: 64); 0 = every solve is wide')
+                    '(0..64; production: 64) take the wide solver path: the 16-block-byte instance since W3 '
+                    '(-DSOK_W1_BITS=N), the 128-bit solver before; 0 = every solve is wide')
     ap.add_argument('--build-knobs', default='', help='test a TEST-ONLY build of --src with these knobs, e.g. '
                     '"MS_LG2=4" or --build-knobs="-DMS_LG2=4" (review builds B1/B4); capacity knobs that cause '
                     'UNKNOWN results fail by design')

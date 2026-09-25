@@ -175,6 +175,13 @@ class Worker:
             except (ValueError, KeyError, TypeError):
                 raise Fail(f'unparsable LIMITS line: {self.version["LIMITS"]}')
 
+    def knobs(self):
+        """The --version KNOBS line as a dict ({} for a worker that prints none)."""
+        try:
+            return json.loads(self.version.get('KNOBS', '{}'))
+        except ValueError:
+            raise Fail(f'unparsable KNOBS line from {self.path}')
+
     def supports(self, *flag_and_args):
         """True if the worker accepts these arguments (a trivial 2x3 run with them exits 0)."""
         if flag_and_args not in self._flags:
@@ -270,7 +277,11 @@ def split_cfg(cfg):
 class Run:
     """The parsed result of one worker run."""
     __slots__ = ('seed', 'rc', 'summary', 'remaining', 'levels', 'nlines', 'bad', 'trunc', 'visits', 'unresolved',
-                 'tail', 'wall', 'level_lines')
+                 'tail', 'wall', 'level_lines', 'widths')
+
+
+# --solver-profile's single checks by packed-state width (workers since W3): '    16-byte   123 calls ...'
+PROFILE_WIDTH_RE = re.compile(r'^\s+(64-bit|16-byte|32-byte)\s+(\d+) calls\b')
 
 
 def toks(p):
@@ -323,10 +334,13 @@ def run_job(worker, grid, exit_, extra, seed, tmp, timeout, split_s=0.0, split_n
         raise
     r = Run()
     r.seed, r.rc, r.wall = seed, p.returncode, time.time() - t0
-    r.summary, r.remaining, r.unresolved, r.level_lines = None, [], [], []
+    r.summary, r.remaining, r.unresolved, r.level_lines, r.widths = None, [], [], [], {}
     r.tail = out[-600:] + '\n[stderr] ' + err[-600:]
     for line in out.split('\n'):
-        if line.startswith('SUMMARY\t'):
+        m = PROFILE_WIDTH_RE.match(line)
+        if m:                           # only with --solver-profile in argv_extra
+            r.widths[m.group(1)] = int(m.group(2))
+        elif line.startswith('SUMMARY\t'):
             try:
                 r.summary = json.loads(line[8:])
             except ValueError:
@@ -751,8 +765,13 @@ def build_suites(worker=None):
 
 
 WORKER_SOURCES = ('backsearch.c', 'sokoban_bfs.c', 'sokoban_bfs.h')
-# the three width-dispatch sites in sokoban_bfs.c (64-bit vs 128-bit solver); a narrow-bits test build
-# lowers this threshold so small grids take the wide path (see build_worker)
+# Narrow-bits test builds (see build_worker) lower the worker's width threshold so small grids take the
+# wide solver path.  Workers since W3 (ac82704) have one solver template instantiated for three packed
+# widths and a knob for it: a state is packed in one 64-bit word iff bits_per_cell*nb + nh <= SOK_W1_BITS
+# (default 64), else in the 16-block-byte (nb <= 16) or 32-block-byte instance.  Older workers had a
+# separate 128-bit solver chosen at three dispatch sites by the literal test below (it counted a player
+# field: bits_per_cell*(1 + nb) + nh), rewritten in a patched copy.
+WIDTH_KNOB = 'SOK_W1_BITS'
 WIDTH_TEST = 'g_bits_per_cell * (1 + nb) + nh > 64'
 WIDTH_SITES = 3
 
@@ -804,11 +823,13 @@ def build_worker(src, out_dir, knobs, name, narrow_bits=None):
     """Build a TEST-ONLY worker from src with -D knobs (plain -O2, no PGO) into out_dir.  Its SRC_HASH_STR
     is 'TEST-BUILD-<knobs>' so it can never be mistaken for (or whitelisted as) a volunteer binary.
 
-    narrow_bits=N: states wider than N bits take the 128-bit ("wide") solver instead of the 64-bit one
-    (production: 64), so the oracle can check the wide path on grids it can enumerate.  Uses the
-    worker's own -DSOK_NARROW_BITS_MAX knob when the source has one; otherwise a patched COPY of
-    sokoban_bfs.c in out_dir with its WIDTH_SITES width tests rewritten (the repo is never touched; a
-    changed site count fails loudly)."""
+    narrow_bits=N (0..64): states wider than N bits take the wide solver path instead of the 64-bit one
+    (production: 64), so the oracle can check the wide path on grids it can enumerate.  A worker with the
+    WIDTH_KNOB (W3 and later) gets -DSOK_W1_BITS=N: a state with bits_per_cell*nb + nh > N is packed in
+    the 16-block-byte instance (nb <= 16; add the knob SOK_W2_BLOCKS=0 for the 32-byte one).  An older
+    worker gets a patched COPY of sokoban_bfs.c in out_dir with its WIDTH_SITES width tests rewritten
+    (there the measure counted a player field: bits_per_cell*(1 + nb) + nh > N; the repo is never
+    touched; a changed site count fails loudly)."""
     out = os.path.join(out_dir, name)
     stub = os.path.join(out_dir, 'nn_stub.c')
     with open(stub, 'w') as f:
@@ -821,10 +842,15 @@ def build_worker(src, out_dir, knobs, name, narrow_bits=None):
     tag = 'TEST-BUILD-' + '-'.join([k[2:] for k in knobs] + ([f'NARROW_BITS={int(narrow_bits)}']
                                                           if narrow_bits is not None else []))
     if narrow_bits is not None:
+        if not 0 <= int(narrow_bits) <= 64:
+            raise Fail(f'narrow-bits build: N must be 0..64 (states wider than N bits go wide), got {narrow_bits}')
         with open(srcs[1]) as f:
             text = f.read()
-        if 'SOK_NARROW_BITS_MAX' in text:
-            knobs.append(f'-DSOK_NARROW_BITS_MAX={int(narrow_bits)}')
+        width_knob = bool(re.search(r'^#ifndef\s+%s\b' % WIDTH_KNOB, text, re.M))
+        if width_knob:
+            if any(k.startswith(f'-D{WIDTH_KNOB}=') for k in knobs):
+                raise Fail(f'narrow-bits build: -D{WIDTH_KNOB} given twice (knobs and narrow_bits)')
+            knobs.append(f'-D{WIDTH_KNOB}={int(narrow_bits)}')
         else:
             n = text.count(WIDTH_TEST)
             if n != WIDTH_SITES:
@@ -840,6 +866,10 @@ def build_worker(src, out_dir, knobs, name, narrow_bits=None):
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
         raise Fail(f'build failed: {" ".join(cmd)}\n{p.stderr[-2000:]}')
+    if narrow_bits is not None and width_knob:
+        got = Worker(out).knobs().get(WIDTH_KNOB)
+        if got != int(narrow_bits):     # the knob must really have reached the solver
+            raise Fail(f'narrow-bits build {out}: --version KNOBS says {WIDTH_KNOB} {got}, not {int(narrow_bits)}')
     return out
 
 
