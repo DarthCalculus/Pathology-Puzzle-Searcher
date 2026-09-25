@@ -2786,10 +2786,10 @@ const char *sokoban_knobs_json(void) {
     snprintf(buf, sizeof buf,
              "\"HTP_SIZE\":%lld,\"HTP_SMALL_LG2\":%d,\"HP64_SIZE\":%lld,\"HT_PROBE_LIMIT\":%lld,"
              "\"HT128_SIZE\":%lld,\"HP128_SIZE\":%lld,\"REF_LG2\":%d,\"MS_LG2\":%d,\"MS_ARENA\":%lld,"
-             "\"SOK_STATE_BITS_MAX\":%d,\"solver_defs\":\"%s\"",
+             "\"SOK_STATE_BITS_MAX\":%d,\"DIRECT_LIMIT\":%lld,\"HT_SIZE\":%lld,\"QSZ\":%lld,\"QSZ128\":%lld,\"solver_defs\":\"%s\"",
              (long long)(HTP_SIZE), (int)(HTP_SMALL_LG2), (long long)(HP64_SIZE), (long long)(HT_PROBE_LIMIT),
              (long long)(HT128_SIZE), (long long)(HP128_SIZE), (int)(REF_LG2), (int)(MS_LG2), (long long)(MS_ARENA),
-             (int)(SOK_STATE_BITS_MAX),
+             (int)(SOK_STATE_BITS_MAX), (long long)(DIRECT_LIMIT), (long long)(HT_SIZE), (long long)(QSZ), (long long)(QSZ128),
              ""
 #ifdef NO_ASTAR
              "NO_ASTAR "

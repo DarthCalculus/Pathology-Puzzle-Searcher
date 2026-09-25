@@ -453,6 +453,8 @@ typedef struct {
     int8_t   block_pos [MAX_BLOCKS];
     uint8_t  block_mask[MAX_BLOCKS];
     int8_t   hole_pos  [MAX_HOLES];      /* sorted ascending; all active     */
+    uint8_t  unk_run;                    /* UNKNOWN chain: consecutive inconclusive checks ending at this node (itself included;
+                                          * 0 = its own check was decided), saturating at 255.  See the chain guard. */
     uint64_t committed_empty;            /* bit i: cell i is known not-wall */
     int32_t  depth;
     int32_t  state_id;                   /* analysis only; -1 when --trace-csv off */
@@ -470,6 +472,8 @@ typedef struct {
     int32_t  ptab1;                      /* 1 + index in g_ptab of the settled-label table of the nearest ancestor A (or of this
                                           * state itself) whose forward puzzle is identical to this one; 0 = none */
     int16_t  ptab_k;                     /* depth(this) - depth(A): the table prunes a check of a depth+j descendant at nc > g_A + k + j - 2 */
+    uint16_t unk_head;                   /* unk_run > 0: plen of the chain head, the shallowest node of this node's UNKNOWN run
+                                          * (its path is this node's path cut to unk_head tokens) */
     uint64_t ptab_delta;                 /* cells floor here but wall in A's puzzle (A's table still bounds continuations avoiding them) */
     uint64_t ptab_xor;                   /* key translation this -> A (see sokoban_ref_set_xor); 0 for an identical puzzle */
     uint8_t  rflags;                     /* range descent: 1 = true ancestor of --from, 2 = true ancestor of --until (set on the child
@@ -544,6 +548,37 @@ static double g_split_after_s   = 0;     /* 0 = never */
 static int    g_protocol_mode   = 0;
 static int    g_seed_error      = 0;     /* --seed-path did not replay: status bad_seed, exit 3 */
 static int    g_debug_stop      = 0;     /* BS_DUMP_SEED stopped the run: status "debug" (never coverage) */
+/* UNKNOWN-chain guard (protocol mode only; review of W1, "UNKNOWN exploration
+ * cascades").  The children of a state whose check hit a capacity limit have
+ * larger cutoffs and hit it too, so below the first UNKNOWN state P (the chain
+ * head) shortcut pruning mostly stops and every check costs a full cap.  Left
+ * alone such a subtree dives to path_overflow, and every split hands its pieces
+ * out as new jobs that each restart the dive.  The guard confines it to ONE job:
+ *  - a split lists every REMAINING entry that is two or more steps into an
+ *    UNKNOWN run (unk_run >= 2) as its chain head instead (the head's subtree
+ *    covers it; overlap is allowed, loss is not), so the cascade becomes the
+ *    head's own job;
+ *  - in the head's own job the head is the root, which a split cannot hand back:
+ *    the split is deferred, and the run ends with status "unknown_chain" (void,
+ *    exit 6) once it has been deferred for max(UNKNOWN_DEFER_S, --split-after)
+ *    seconds (or --split-after-nodes expansions);
+ *  - a run of UNKNOWN_CHAIN_MAX consecutive UNKNOWN states forces that split at
+ *    once (or ends the run as unknown_chain when the head is the root).
+ * Runs without two consecutive UNKNOWN states behave exactly as before.  The
+ * voided head job is retried and quarantined by the server: the exit then
+ * stays not exact until that subtree is resolved offline (e.g. by a build with
+ * larger solver caps).  -DUNKNOWN_CHAIN_MAX=0 turns the guard off. */
+#ifndef UNKNOWN_CHAIN_MAX
+#define UNKNOWN_CHAIN_MAX 8
+#endif
+#ifndef UNKNOWN_DEFER_S
+#define UNKNOWN_DEFER_S 60
+#endif
+static int    g_chain_guard     = 0;     /* protocol mode && UNKNOWN_CHAIN_MAX > 0 */
+static int    g_chain_hit       = 0;     /* a node reached unk_run >= UNKNOWN_CHAIN_MAX in this run */
+static int    g_chain_void      = 0;     /* the run ended as status unknown_chain */
+static int    g_chain_max_depth = 0, g_chain_max_run = 0;   /* for the message: depth and run length of the deepest chain node seen */
+static int    g_root_plen       = 0;     /* plen of this run's root (the seed; 0 for an exit-root run) */
 static const char *bs_getenv(const char *name) {
     if (g_protocol_mode) { const char *a = getenv("BS_ALLOW_DEBUG"); if (!a || strcmp(a, "1") != 0) return NULL; }
     return getenv(name);
@@ -596,6 +631,16 @@ static void *xrealloc(void *old, size_t sz, const char *what) {
 static void *xcalloc(size_t n, size_t sz, const char *what) {
     void *p = calloc(n, sz);
     if (!p && n && sz) oom_fatal(what, n * sz);
+    return p;
+}
+static void *xmalloc(size_t sz, const char *what) {
+    void *p = malloc(sz);
+    if (!p && sz) oom_fatal(what, sz);
+    return p;
+}
+static char *xstrdup(const char *t, const char *what) {
+    char *p = strdup(t);
+    if (!p) oom_fatal(what, strlen(t) + 1);
     return p;
 }
 static long long g_ptab_saved = 0, g_ptab_used = 0, g_ptab_live = 0, g_ptab_live_peak = 0, g_ptab_live_slots = 0, g_ptab_live_slots_peak = 0;
@@ -1305,8 +1350,7 @@ static void   flush_surrogate_pending(void);
 static void beam_push_to_next(const BState *s) {
     if (g_beam_next_n == g_beam_next_cap) {
         g_beam_next_cap = g_beam_next_cap ? g_beam_next_cap * 2 : 65536;
-        g_beam_next = realloc(g_beam_next, (size_t)g_beam_next_cap * sizeof(BState));
-        if (!g_beam_next) { perror("realloc beam_next"); exit(1); }
+        g_beam_next = xrealloc(g_beam_next, (size_t)g_beam_next_cap * sizeof(BState), "beam level");
     }
     g_beam_next[g_beam_next_n] = *s;
     /* Cache 1-ply child-count for beam ranking. */
@@ -1368,8 +1412,7 @@ static void rescore_branching_mid(void) {
     if (g_beam_next_n <= 0) return;
     if (g_branching_tmp_cap < g_beam_next_n) {
         g_branching_tmp_cap = g_beam_next_n;
-        g_branching_tmp = realloc(g_branching_tmp, (size_t)g_branching_tmp_cap * sizeof(int32_t));
-        if (!g_branching_tmp) { perror("realloc branching_tmp"); exit(1); }
+        g_branching_tmp = xrealloc(g_branching_tmp, (size_t)g_branching_tmp_cap * sizeof(int32_t), "beam branching scratch");
     }
     for (int i = 0; i < g_beam_next_n; i++)
         g_branching_tmp[i] = g_beam_next[i].branch_factor;
@@ -1402,14 +1445,12 @@ static void compute_batch_scores(BState *arr, int n) {
     size_t needed_feats = (size_t)n * (size_t)stride;
     if ((size_t)g_batch_features_cap < needed_feats) {
         free(g_batch_features);
-        g_batch_features = malloc(needed_feats * sizeof(float));
-        if (!g_batch_features) { perror("malloc batch features"); exit(1); }
+        g_batch_features = xmalloc(needed_feats * sizeof(float), "NN batch features");
         g_batch_features_cap = (int)needed_feats;
     }
     if (g_batch_scores_cap < n) {
         free(g_batch_scores);
-        g_batch_scores = malloc((size_t)n * sizeof(float));
-        if (!g_batch_scores) { perror("malloc batch scores"); exit(1); }
+        g_batch_scores = xmalloc((size_t)n * sizeof(float), "NN batch scores");
         g_batch_scores_cap = n;
     }
     for (int i = 0; i < n; i++) {
@@ -1989,9 +2030,8 @@ static int    g_surrogate_batch_scores_cap    = 0;
 static void surrogate_pending_push(const BState *s, long long sid, long long parent_id) {
     if (g_surrogate_pending_n == g_surrogate_pending_cap) {
         g_surrogate_pending_cap = g_surrogate_pending_cap ? g_surrogate_pending_cap * 2 : 4096;
-        g_surrogate_pending = realloc(g_surrogate_pending,
-                                      (size_t)g_surrogate_pending_cap * sizeof(SurrogatePending));
-        if (!g_surrogate_pending) { perror("realloc surrogate_pending"); exit(1); }
+        g_surrogate_pending = xrealloc(g_surrogate_pending,
+                                       (size_t)g_surrogate_pending_cap * sizeof(SurrogatePending), "NN surrogate pending");
     }
     g_surrogate_pending[g_surrogate_pending_n].state     = *s;
     g_surrogate_pending[g_surrogate_pending_n].sid       = sid;
@@ -2008,14 +2048,12 @@ static void flush_surrogate_pending(void) {
     size_t needed_feats = (size_t)n * (size_t)stride;
     if ((size_t)g_surrogate_batch_features_cap < needed_feats) {
         free(g_surrogate_batch_features);
-        g_surrogate_batch_features = malloc(needed_feats * sizeof(float));
-        if (!g_surrogate_batch_features) { perror("malloc surrogate batch features"); exit(1); }
+        g_surrogate_batch_features = xmalloc(needed_feats * sizeof(float), "NN surrogate batch features");
         g_surrogate_batch_features_cap = (int)needed_feats;
     }
     if (g_surrogate_batch_scores_cap < n) {
         free(g_surrogate_batch_scores);
-        g_surrogate_batch_scores = malloc((size_t)n * sizeof(float));
-        if (!g_surrogate_batch_scores) { perror("malloc surrogate batch scores"); exit(1); }
+        g_surrogate_batch_scores = xmalloc((size_t)n * sizeof(float), "NN surrogate batch scores");
         g_surrogate_batch_scores_cap = n;
     }
 
@@ -2471,6 +2509,13 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
     ns.adjflags = adjflags;   /* the record of shortcut moments, extended by this state's own */
     ns.rflags = 0;            /* only range_filter() marks a child as an ancestor of a cut point */
     if (g_emit_D >= 0) path_push(&ns, g_emit_D, g_emit_V);   /* single-step edge; bulk children (g_emit_D < 0) carry their walk already */
+    /* UNKNOWN run (s carries the parent's unk_run / unk_head: every child is built as a copy of its parent) */
+    if (unknown) {
+        if (s->unk_run == 0) { ns.unk_run = 1; ns.unk_head = ns.plen; }   /* a new chain head: this node */
+        else ns.unk_run = (uint8_t)(s->unk_run < 255 ? s->unk_run + 1 : 255);   /* unk_head: the parent's */
+        if (ns.unk_run > g_chain_max_run) { g_chain_max_run = ns.unk_run; g_chain_max_depth = ns.depth; }
+        if (g_chain_guard && ns.unk_run >= UNKNOWN_CHAIN_MAX) g_chain_hit = 1;
+    } else { ns.unk_run = 0; ns.unk_head = 0; }
     { int bx = 0; for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) { bx = 1; break; }
       if (!bx && !unknown) { g_accepted_valid++; if (g_status_every_ms && s->depth > g_win_depth) { g_win_depth = s->depth; g_win_state = *s; }
                  if (g_trace_valid) { char pb[PATH_TEXT_CAP], code[128]; path_text(ns.path, ns.plen, pb, sizeof pb); level_code_text(s, g_exit_pos, '1', code, sizeof code); fprintf(g_trace_valid, "%s\t%d\t%s\n", pb, s->depth, code); } }
@@ -3551,14 +3596,14 @@ static int load_bf_target(const char *path, int smooth_w) {
     FILE *f = fopen(path, "r");
     if (!f) { perror("fopen --rollout-bf-target"); return 0; }
     int cap = 256, maxd = -1;
-    int32_t *raw = calloc(cap, sizeof(int32_t));
+    int32_t *raw = xcalloc(cap, sizeof(int32_t), "rollout bf target");
     char line[256];
     while (fgets(line, sizeof line, f)) {
         int d; long bf;
         if (sscanf(line, "%d,%ld", &d, &bf) != 2) continue;  /* header/blank */
         if (d < 0) continue;
         if (d >= cap) { int nc = cap; while (d >= nc) nc *= 2;
-                        raw = realloc(raw, (size_t)nc * sizeof(int32_t));
+                        raw = xrealloc(raw, (size_t)nc * sizeof(int32_t), "rollout bf target");
                         for (int k = cap; k < nc; k++) raw[k] = 0; cap = nc; }
         raw[d] = (int32_t)bf;
         if (d > maxd) maxd = d;
@@ -3567,7 +3612,7 @@ static int load_bf_target(const char *path, int smooth_w) {
     if (maxd < 0) { fprintf(stderr, "error: --rollout-bf-target %s: no depth,bf rows\n", path);
                     free(raw); return 0; }
     if (smooth_w > 0) {
-        int32_t *sm = malloc((size_t)(maxd + 1) * sizeof(int32_t));
+        int32_t *sm = xmalloc((size_t)(maxd + 1) * sizeof(int32_t), "rollout bf target");
         for (int d = 0; d <= maxd; d++) {
             long sum = 0; int n = 0;
             for (int k = d - smooth_w; k <= d + smooth_w; k++)
@@ -3835,9 +3880,8 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
     if (g_have_seed_path) build_seed_path_seed(&root);
 
     int M = g_rollout_pop, C = g_rollout_child;
-    BState   *pop  = malloc((size_t)M * sizeof(BState));
-    RollCand *cand = malloc((size_t)M * (size_t)C * sizeof(RollCand));
-    if (!pop || !cand) { perror("malloc rollout population"); exit(1); }
+    BState   *pop  = xmalloc((size_t)M * sizeof(BState), "rollout population");
+    RollCand *cand = xmalloc((size_t)M * (size_t)C * sizeof(RollCand), "rollout candidates");
     int pop_n = seed_rollout_pop(&root, pop);
 
     /* Memo table for the flow allocator: sized to comfortably exceed the distinct
@@ -3847,8 +3891,7 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
         size_t want = (size_t)M * (size_t)C * (size_t)(g_rollout_steps + 1) * 2;
         size_t sz = 1u << 16;
         while (sz < want && sz < (1u << 24)) sz <<= 1;
-        g_htab = calloc(sz, sizeof(HEnt));
-        if (!g_htab) { perror("malloc rollout memo"); exit(1); }
+        g_htab = xcalloc(sz, sizeof(HEnt), "rollout memo");
         g_hmask = sz - 1;
         g_hstamp = 0;   /* calloc zeroed stamps; first bump -> 1 != 0 entries */
     }
@@ -4062,7 +4105,7 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
                 static int32_t *bfscratch = NULL;
                 static size_t   bfscratch_cap = 0;
                 if (uniq > bfscratch_cap) {
-                    bfscratch = realloc(bfscratch, uniq * sizeof(int32_t));
+                    bfscratch = xrealloc(bfscratch, uniq * sizeof(int32_t), "rollout scratch");
                     bfscratch_cap = uniq;
                 }
                 for (size_t i = 0; i < uniq; i++) bfscratch[i] = cand[i].bf;
@@ -4560,14 +4603,40 @@ static void print_cursor(const BState *s) {
     fflush(stdout);
 }
 
-/* v2: the complete remaining work as seed paths -- the node being expanded
- * (its subtree is re-run from scratch), then every pending stack entry from
- * the top down.  These subtrees are disjoint and cover exactly what is left. */
+/* v2: the remaining work as seed paths -- the node just expanded (the cursor;
+ * its subtree is re-run from scratch, so it overlaps its own children on the
+ * stack: never missing, see review M5), then every pending stack entry from the
+ * top down.  Splits happen only after the second expansion, so the cursor is
+ * never the run's root and every line strictly extends the seed.  Chain guard:
+ * an entry two or more steps into an UNKNOWN run is listed as its chain head
+ * (a prefix of its path, printed once); split_blocked() keeps that head from
+ * being the root. */
+#define REM_HEADS_MAX 256
 static void print_remaining(const BState *s) {
-    char buf[PATH_TEXT_CAP]; path_text(s->path, s->plen, buf, sizeof buf);
-    printf("REMAINING\t%s\n", buf);
-    for (long long i = g_q_tail - 1; i >= 0; i--) { path_text(g_queue[i].path, g_queue[i].plen, buf, sizeof buf); printf("REMAINING\t%s\n", buf); }
+    char buf[PATH_TEXT_CAP];
+    const uint8_t *hp[REM_HEADS_MAX]; int hl[REM_HEADS_MAX], nh = 0;   /* chain heads listed so far (a missed duplicate is harmless) */
+    for (long long i = g_q_tail; i >= 0; i--) {
+        const BState *e = (i == g_q_tail) ? s : &g_queue[i];
+        int n = e->plen;
+        if (g_chain_guard && e->unk_run >= 1) {
+            if (e->unk_run >= 2) n = e->unk_head;
+            int k = 0;
+            while (k < nh && !(hl[k] == n && !memcmp(hp[k], e->path, (size_t)n))) k++;
+            if (k < nh) continue;   /* this head is listed already */
+            if (nh < REM_HEADS_MAX) { hp[nh] = e->path; hl[nh] = n; nh++; }
+        }
+        path_text(e->path, n, buf, sizeof buf); printf("REMAINING\t%s\n", buf);
+    }
     fflush(stdout);
+}
+/* Chain guard: 1 if a split now would have to list the run's root as a chain
+ * head (an entry two or more steps into an UNKNOWN run that starts at the root). */
+static int split_blocked(const BState *s) {
+    if (!g_chain_guard) return 0;
+    if (s->unk_run >= 2 && s->unk_head <= g_root_plen) return 1;
+    for (long long i = 0; i < g_q_tail; i++)
+        if (g_queue[i].unk_run >= 2 && g_queue[i].unk_head <= g_root_plen) return 1;
+    return 0;
 }
 static void print_status(const BState *s) {
     char cur[128], win[128];
@@ -4620,6 +4689,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     g_range_unmatched = 0; g_range_root_pending = 1;
     g_split_fired = 0; g_win_depth = 0;
     g_path_overflow = 0; g_tick_flag = 0; g_cur_node = NULL;
+    g_chain_hit = 0; g_chain_void = 0; g_chain_max_run = 0; g_chain_max_depth = 0; g_root_plen = 0;
 
     if (g_have_seed_path) {
         /* Seed-path mode: start from the standard root and replay the
@@ -4646,6 +4716,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
             if (out_exhausted) *out_exhausted = 0; if (out_dedup_full) *out_dedup_full = 0; return 0.0;
         }
         g_best_state = seed;
+        g_root_plen = seed.plen;   /* chain guard: a chain head this short is the root itself */
         try_successor(&seed);   /* an UNKNOWN root is explored like any other UNKNOWN state */
     } else if (g_task_seeds && g_task_seed_count > 0) {
         /* Task mode: skip default depth-0 roots; feed each seed through
@@ -4844,8 +4915,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
                     for (int i = 0; i < n_save; i++) {
                         if ((size_t)g_q_tail == g_q_cap) {
                             g_q_cap = g_q_cap ? g_q_cap * 2 : 65536;
-                            g_queue = realloc(g_queue, g_q_cap * sizeof(BState));
-                            if (!g_queue) { perror("realloc q for tail save"); exit(1); }
+                            g_queue = xrealloc(g_queue, g_q_cap * sizeof(BState), "DFS stack (beam tail)");
                         }
                         g_queue[g_q_tail++] = g_beam_next[g_beam_width + i];
                     }
@@ -4881,6 +4951,8 @@ beam_done:
             }
         }
     } else {
+        int split_due = 0;                          /* see the split decision below */
+        long long defer_iter0 = -1; double defer_t0 = -1;   /* chain guard: when the due split was first deferred */
         while (1) {
             BState s;
             if (g_path_overflow) { exhausted = 0; break; }   /* a node needed more than PATH_TOK_MAX tokens: no REMAINING can name it */
@@ -4900,17 +4972,39 @@ beam_done:
             if (g_path_overflow) { exhausted = 0; break; }   /* status path_overflow: never print REMAINING (a truncated path names another node) */
             if (g_dedup_full) { exhausted = 0; break; }
             if (g_stop_requested) { print_cursor(&s); print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }   /* checkpoint: resume with --from, or re-run the REMAINING subtrees */
-            /* --split-after-nodes: deterministic split after exactly N expansions (tests) */
-            if (g_split_after_nodes > 0 && iter >= g_split_after_nodes && g_q_tail > 0) { print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
-            /* Clock checks every 64 expansions, and right after any expansion
-             * during which a solver-side tick came due (long expansions). */
-            if (g_timers_on && ((iter & 63) == 0 || g_tick_flag)) {
+            /* Split decision.  due: 1 = --split-after-nodes (deterministic, tests), 2 = --split-after,
+             * 4 = the chain guard (a run of UNKNOWN_CHAIN_MAX UNKNOWN states).  A due split waits
+             *  - while the stack is empty: the subtree is finished, the next pop ends the run exhausted;
+             *  - until the second expansion: after the first one the cursor is the run's root, and
+             *    REMAINING must strictly extend the seed (PROTOCOL3 §3; a root expansion longer than
+             *    the window used to print REMAINING <seed>, which the client voids as no_progress);
+             *  - while split_blocked() (chain guard), for at most max(UNKNOWN_DEFER_S, --split-after)
+             *    seconds or --split-after-nodes expansions: then the run ends as unknown_chain. */
+            if (g_split_after_nodes > 0 && iter >= g_split_after_nodes) split_due |= 1;
+            if (g_chain_hit) split_due |= 4;
+            /* Clock checks every 64 expansions, right after any expansion during which a
+             * solver-side tick came due (long expansions), and after every expansion while a
+             * split is due. */
+            double el = -1;
+            if (g_timers_on && ((iter & 63) == 0 || g_tick_flag || split_due)) {
                 g_tick_flag = 0;
                 clock_gettime(CLOCK_MONOTONIC, &t_now);
-                double el = elapsed_s(t0, t_now);
+                el = elapsed_s(t0, t_now);
                 if (!unlimited && el >= remaining_s) { print_cursor(&s); print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
-                if (g_split_after_s > 0 && el >= g_split_after_s) { print_remaining(&s); g_split_fired = 1; exhausted = 0; break; }
+                if (g_split_after_s > 0 && el >= g_split_after_s) split_due |= 2;
                 if (g_status_every_ms > 0 && el - g_last_status_s >= g_status_every_ms / 1000.0) { print_status(&s); g_last_status_s = el; }
+            }
+            if (split_due && g_q_tail > 0 && iter >= 2) {
+                if (!(g_split_after_s > 0 || g_split_after_nodes > 0)) { g_chain_void = 1; exhausted = 0; break; }   /* chain guard, no split configured */
+                if (split_blocked(&s)) {
+                    if (split_due & 4) { g_chain_void = 1; exhausted = 0; break; }
+                    if (defer_iter0 < 0) { defer_iter0 = iter; defer_t0 = el; }
+                    double budget_s = g_split_after_s > UNKNOWN_DEFER_S ? g_split_after_s : UNKNOWN_DEFER_S;
+                    if (((split_due & 2) && el >= 0 && defer_t0 >= 0 && el - defer_t0 > budget_s) ||
+                        ((split_due & 1) && iter - defer_iter0 > g_split_after_nodes)) { g_chain_void = 1; exhausted = 0; break; }
+                    continue;   /* deferred: the cascade under the root goes on (the guard's budget bounds it) */
+                }
+                print_remaining(&s); g_split_fired = 1; exhausted = 0; break;
             }
         }
     }
@@ -5036,6 +5130,7 @@ static void print_usage(const char *prog) {
         "                          The search prevents these cells from being walked on or used\n"
         "                          for blocks/holes.  Default: none.\n"
         "  --num-walls N         require at least N cells of the active region to remain walls\n"
+        "  --min-walls N         the same (the name the v2 protocol uses)\n"
         "  --single-axis-blocks  allow at most one block pushed along both axes; others single-axis\n"
         "  --single-axis-strict  implies --single-axis-blocks; shortcut check treats each block as\n"
         "                        pushable both ways on any axis it was pulled along\n"
@@ -5130,8 +5225,10 @@ static void print_version(void) {
     printf("PROTOCOL\t3\n");
     printf("LIMITS\t{\"path_tok_max\":%d,\"max_ncells\":%d,\"max_blocks\":%d,\"state_bits\":%d}\n",
            PATH_TOK_MAX, MAX_NCELLS, MAX_BLOCKS, sokoban_state_bits_max());
-    printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"UNRESOLVED_MAX\":%d,%s,\"defs\":\"%s\"}\n",
-           (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (int)UNRESOLVED_MAX, sokoban_knobs_json(),
+    printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"UNRESOLVED_MAX\":%d,"
+           "\"UNKNOWN_CHAIN_MAX\":%d,\"UNKNOWN_DEFER_S\":%d,%s,\"defs\":\"%s\"}\n",
+           (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (int)UNRESOLVED_MAX,
+           (int)UNKNOWN_CHAIN_MAX, (int)UNKNOWN_DEFER_S, sokoban_knobs_json(),
            ""
 #ifdef REF_CHECK
            "REF_CHECK "
@@ -5176,7 +5273,7 @@ static void print_summary(const char *st, double elapsed, int verify, const char
            cpu_seconds(), g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big,
            g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending,
            g_grid_rows, g_grid_cols, g_exit_pos, g_allow_exit_transit, g_allow_block_on_exit, g_max_holes, g_max_blocks, g_min_walls, bulk_eff);
-    if (err) { printf(",\"error\":\""); json_str(stdout, err); printf("\""); }
+    if (err) { printf(",\"%s\":\"", strcmp(st, "error") ? "detail" : "error"); json_str(stdout, err); printf("\""); }
     printf("}\n");
     fflush(stdout);
 }
@@ -5222,7 +5319,7 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--argfile") != 0) continue;
         int cap = argc + 64, n = 0;
-        char **av = malloc((size_t)cap * sizeof *av);
+        char **av = xmalloc((size_t)cap * sizeof *av, "--argfile");
         av[n++] = argv[0];
         for (int j = 1; j < argc; j++) {
             if (strcmp(argv[j], "--argfile") == 0 && j + 1 < argc) {
@@ -5236,12 +5333,12 @@ int main(int argc, char **argv) {
                     char *e = s + strlen(s);
                     while (e > s && (e[-1]=='\n'||e[-1]=='\r'||e[-1]==' '||e[-1]=='\t')) *--e = '\0';
                     if (*s == '\0' || *s == '#') continue;
-                    if (n + 1 >= cap) { cap *= 2; av = realloc(av, (size_t)cap * sizeof *av); }
-                    av[n++] = strdup(s);
+                    if (n + 1 >= cap) { cap *= 2; av = xrealloc(av, (size_t)cap * sizeof *av, "--argfile"); }
+                    av[n++] = xstrdup(s, "--argfile");
                 }
                 fclose(f);
             } else {
-                if (n + 1 >= cap) { cap *= 2; av = realloc(av, (size_t)cap * sizeof *av); }
+                if (n + 1 >= cap) { cap *= 2; av = xrealloc(av, (size_t)cap * sizeof *av, "--argfile"); }
                 av[n++] = argv[j];
             }
         }
@@ -5608,10 +5705,10 @@ int main(int argc, char **argv) {
             if (++i >= argc) { fprintf(stderr, "error: --task-id requires N\n"); return 1; }
             g_only_task = atoi(argv[i]);
             if (g_only_task < 0) { fprintf(stderr, "error: --task-id must be >= 0\n"); return 1; }
-        } else if (strcmp(argv[i], "--num-walls") == 0) {
-            if (++i >= argc) { fprintf(stderr, "error: --num-walls requires N\n"); return 1; }
+        } else if (strcmp(argv[i], "--num-walls") == 0 || strcmp(argv[i], "--min-walls") == 0) {   /* --min-walls: the protocol's name */
+            if (++i >= argc) { fprintf(stderr, "error: %s requires N\n", argv[i - 1]); return 1; }
             int n = atoi(argv[i]);
-            if (n < 0) { fprintf(stderr, "error: --num-walls must be >= 0\n"); return 1; }
+            if (n < 0) { fprintf(stderr, "error: %s must be >= 0\n", argv[i - 1]); return 1; }
             g_min_walls = n;
         } else if (strcmp(argv[i], "--single-axis-blocks") == 0) {
             g_single_axis_blocks = 1;
@@ -5771,6 +5868,7 @@ int main(int argc, char **argv) {
         const char *bad = g_shortcut_state_cap > 0 ? "--shortcut-state-cap" : g_nn_surrogate_model_path ? "--nn-surrogate-model"
                         : g_beam_width > 0 ? "--beam" : g_rollout_steps > 0 ? "--rollout" : NULL;
         if (bad) { fprintf(stderr, "error: %s is not allowed in protocol mode (--status-every): v2 jobs must be exhaustive\n", bad); return 2; }
+        g_chain_guard = UNKNOWN_CHAIN_MAX > 0;   /* the UNKNOWN-chain guard (see g_chain_guard) */
     }
     /* Debug traces (one file per process: <name>.<pid>, so parallel workers do not
      * clobber each other).  Ignored in protocol mode unless BS_ALLOW_DEBUG=1. */
@@ -6061,8 +6159,7 @@ int main(int argc, char **argv) {
         /* Heap-allocate: a TaskGroup is large (~120 KB with MAX_BLOCKS/HOLES
          * bumped for 8x8), and the array of 32 of them would overflow the
          * main-thread stack. */
-        TaskGroup *tasks = calloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup));
-        if (!tasks) { perror("calloc tasks"); return 1; }
+        TaskGroup *tasks = xcalloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup), "task list");
         for (int ei = 0; ei < n_exits; ei++) {
             int n = enumerate_tasks_for_exit(exits[ei], tasks, MAX_TASKS_PER_EXIT);
             printf("exit %d: %d task%s\n", exits[ei], n, n == 1 ? "" : "s");
@@ -6086,8 +6183,7 @@ int main(int argc, char **argv) {
     TaskGroup task_target = {0};
     if (g_only_task >= 0) {
         int idx = 0;
-        TaskGroup *tasks = calloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup));
-        if (!tasks) { perror("calloc tasks"); return 1; }
+        TaskGroup *tasks = xcalloc(MAX_TASKS_PER_EXIT, sizeof(TaskGroup), "task list");
         for (int ei = 0; ei < n_exits; ei++) {
             int n = enumerate_tasks_for_exit(exits[ei], tasks, MAX_TASKS_PER_EXIT);
             if (g_only_task < idx + n) {
@@ -6112,7 +6208,7 @@ int main(int argc, char **argv) {
      * solver stop at the first win unless exact lengths are being recorded. */
     sokoban_set_decision_only(!HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump);
     int unlimited = (g_time_cap_s == 0);
-    int run_rc = 0;   /* process exit code: 0 exhausted/split, 3 bad_seed, 4 path_overflow (5 error exits directly) */
+    int run_rc = 0;   /* process exit code: 0 exhausted/split, 3 bad_seed, 4 path_overflow, 6 unknown_chain (5 error exits directly) */
     for (int ei = 0; ei < n_exits; ei++) {
         /* In --task-id mode, skip exits that don't host the target task. */
         if (g_only_task >= 0 && exits[ei] != task_target_exit) continue;
@@ -6150,12 +6246,21 @@ int main(int argc, char **argv) {
         flush_pending_new_best(session_elapsed());
 
         /* Status of this exit's run (v2/PROTOCOL3.md §2.3).  The void ones
-         * (bad_seed, path_overflow, debug) carry no LEVEL / UNRESOLVED lines. */
+         * (bad_seed, path_overflow, unknown_chain, debug) carry no LEVEL / UNRESOLVED lines. */
         const char *st = g_path_overflow ? "path_overflow" : g_seed_error ? "bad_seed" : g_debug_stop ? "debug"
+                       : g_chain_void ? "unknown_chain"
                        : dedup_full ? "dedup_full" : exhausted ? "exhausted" : g_split_fired ? "split" : "time_cap";
-        int void_run = g_path_overflow || g_seed_error || g_debug_stop;
+        int void_run = g_path_overflow || g_seed_error || g_debug_stop || g_chain_void;
         if (g_path_overflow && run_rc < 4) run_rc = 4;
         if (g_seed_error && run_rc < 3) run_rc = 3;
+        if (g_chain_void && run_rc < 6) run_rc = 6;
+        char chain_msg[256] = "";
+        if (g_chain_void) {
+            snprintf(chain_msg, sizeof chain_msg, "UNKNOWN chain: a run of %d consecutive inconclusive solver checks (capacity limits) "
+                     "reached depth %d; that subtree needs larger solver caps (resolve it offline)",
+                     g_chain_max_run, g_chain_max_depth);
+            fprintf(stderr, "unknown_chain: %s\n", chain_msg);
+        }
 
         /* Verify this exit's best: a cutoff solve at best-2 with no reference
          * table (bounded by the solver's table limits: it can never hang), i.e.
@@ -6174,7 +6279,7 @@ int main(int argc, char **argv) {
 
         printf("--- Exit %d (%s) ---\n", g_exit_pos,
                g_path_overflow ? "path overflow" : g_seed_error ? "bad seed" : g_debug_stop ? "debug stop" :
-               dedup_full ? "dedup table full"
+               g_chain_void ? "UNKNOWN chain" : dedup_full ? "dedup table full"
                           : (exhausted ? "exhausted" : g_stop_requested ? "interrupted" : g_split_fired && (g_split_after_s > 0 || g_split_after_nodes > 0) ? "split" : "time cap"));
         if (g_from_n || g_until_n) printf("  range:          %s%s (%lld cut points not found in this run, placed by edge order)\n",
                                           g_from_n ? "from given" : "from start", g_until_n ? ", until given" : ", to end", g_range_unmatched);
@@ -6240,7 +6345,7 @@ int main(int argc, char **argv) {
                 if (g_best_depth > 0) { char code[128]; level_code_text(&g_best_state, g_exit_pos, '1', code, sizeof code); printf("LEVEL\t%d\t%s\n", g_best_depth, code); }
                 g_last_unresolved_printed = print_unresolved(g_best_depth);
             }
-            print_summary(st, exit_elapsed, verify, NULL);
+            print_summary(st, exit_elapsed, verify, g_chain_void ? chain_msg : NULL);
         }
 
         total_states       += g_states_checked;
