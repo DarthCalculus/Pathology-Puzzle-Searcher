@@ -402,6 +402,10 @@ class Store:
         self.log("lease %s n=%d exit=%s -> %s (split_after_s %g%s)" % (c["name"], n, pref, [g["id"] for g in granted], sa,
                                                                         ", fallback" if fallback else ""))
         res = {"ok": True, "jobs": granted, "reclaimed": reclaimed, "split_after_s": sa, "campaign_state": self.state_of(camp)}
+        if self.opts.lease_absorb_total_s is not None:
+            # like jobs.js windowFor (M109): the lease's own absorption budget, 0 in the endgame
+            res["absorb_total_s"] = self.opts.lease_absorb_total_s
+            res["window_mode"] = "endgame" if self.opts.lease_absorb_total_s == 0 else "full"
         if fallback:
             res["exit_fallback"] = True
         return 200, res
@@ -894,6 +898,8 @@ def main():
     ap.add_argument("--lease-ahead-s", type=float, default=300)
     ap.add_argument("--absorb-total-s", type=float, default=120)
     ap.add_argument("--absorb-probe-s", type=float, default=10)
+    ap.add_argument("--lease-absorb-total-s", type=float, default=None,
+                    help="send this absorb_total_s (and window_mode) in every lease response, like jobs.js")
     ap.add_argument("--lease-cap", type=int, default=200)
     ap.add_argument("--heartbeat-s", type=float, default=30)
     ap.add_argument("--grid", default="5x5")

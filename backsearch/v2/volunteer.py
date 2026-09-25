@@ -77,6 +77,9 @@ BATCH_COUNT_MAX = 500        # reports per batch (server BATCH_MAX 1000)
 STOP_GRACE_S = 90.0          # after SIGINT, how long a worker may take to print SUMMARY
 WATCHDOG_SLACK_S = 60.0      # watchdog: silent for 3 x status interval + this after the split time = hung
 WAKE_HEARTBEAT_RETRY_S = 120.0
+MAIN_TICK_S = 0.5            # the main loop's supervision tick
+CLOCK_GAP_S = 5.0            # a tick this late means the client did not run (sleep, frozen, starved):
+                             # the watchdog and the stop grace count only time the client was awake
 MAX_LINE = 20000
 BOARD_CAP = 200
 UNRESOLVED_MAX = 1000        # the worker prints at most 1000 candidates per run (server CAND_MAX_PER_NODE)
@@ -187,6 +190,17 @@ def parse_unresolved(parts, seed, tok_max):
     if d >= 1 and CODE_RE.match(code) and ptoks is not None and len(ptoks) == d and cause in CAND_CAUSES:
         return {"depth": d, "code": code, "path": path, "cause": cause}
     return None
+
+
+def nonneg_float(v):
+    """A finite number >= 0 from a server field, else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if 0.0 <= f < 1e9 else None
 
 
 def parse_extra(extra):
@@ -483,6 +497,8 @@ class Slot:
         self.killed_by_client = False
         self.drop_requested = False
         self.watchdog_fired = False
+        self.watchdog_why = ""        # what the watchdog saw (the failure detail)
+        self.grace_killed = False     # SIGKILLed after Stop's grace: this run's node stays open
         self.cur = None               # {"depth", "code"} node being expanded ('?' = unknown)
         self.best = None              # best accepted state this job
         self.win_hist = collections.deque()  # (t, depth, code) from STATUS win_* fields
@@ -1400,6 +1416,10 @@ class Volunteer:
             resp_sa = float(res.get("split_after_s")) if res.get("split_after_s") is not None else None
         except (TypeError, ValueError):
             resp_sa = None
+        # the absorption budget of this lease (jobs.js windowFor, M109): 0 in the endgame, so that
+        # small windows hand their children back to idle clients; absent = the campaign's absorb_total_s
+        resp_abs = nonneg_float(res.get("absorb_total_s"))
+        mode = res.get("window_mode") if isinstance(res.get("window_mode"), str) else None
         good, bad_seed = [], []
         for j in jobs or []:
             if not isinstance(j, dict):
@@ -1419,7 +1439,9 @@ class Volunteer:
                 sa = resp_sa
             if sa is None:
                 sa = self.fparam("split_after_s", 1800)
+            ab = nonneg_float(j.get("absorb_total_s"))
             good.append({"id": jid, "exit": ex, "seed": seed, "split_after_s": max(1.0, sa),
+                         "absorb_total_s": ab if ab is not None else resp_abs, "window_mode": mode,
                          "leased_at": time.time()})
         for j in bad_seed:
             self.log("!!! job %d has a seed this client cannot run (%d chars); reporting it as a failure"
@@ -1546,8 +1568,10 @@ class Volunteer:
             slot.nodes_done = 0
             slot.phase = "window"
             slot.killed_by_client = False
-        self.log("worker %d: job %d exit %d window %.0f s seed %s"
-                 % (slot.idx, job["id"], job["exit"], job["split_after_s"], job["seed"] or "(exit root)"))
+        self.log("worker %d: job %d exit %d window %.0f s%s seed %s"
+                 % (slot.idx, job["id"], job["exit"], job["split_after_s"],
+                    " (%s)" % job["window_mode"] if job.get("window_mode") not in (None, "full") else "",
+                    job["seed"] or "(exit root)"))
         first = True
         while stack and not self.stopping:
             now = time.time()
@@ -1617,16 +1641,21 @@ class Volunteer:
             return "none"
         # absorption pass: probe every still-open local seed briefly
         open_seeds = [n["seed"] for n in nodes if n["status"] == "open"]
-        if open_seeds and not self.stopping:
+        absorb_total = job.get("absorb_total_s")
+        if absorb_total is None:
+            absorb_total = self.fparam("absorb_total_s", 120)
+        if open_seeds and not self.stopping and absorb_total > 0:
             probe = max(0.5, self.fparam("absorb_probe_s", 10))
-            absorb_end = time.time() + self.fparam("absorb_total_s", 120)
+            absorb_end = time.time() + absorb_total
             with self.lock:
                 slot.phase = "absorb"
                 slot.window_end = absorb_end
             for seed in reversed(open_seeds):     # most recent (deepest) first
-                if self.stopping or time.time() >= absorb_end or slot.drop_requested:
+                left = absorb_end - time.time()
+                if self.stopping or left < 0.5 or slot.drop_requested:
                     break
-                res = self.run_worker(slot, job, seed, probe, probe_run=True)
+                # spend up to absorb_total_s (PROTOCOL3 section 3): the last probe gets what is left
+                res = self.run_worker(slot, job, seed, min(probe, left), probe_run=True)
                 if res.kind != "ok":
                     if slot.killed_by_client:
                         break
@@ -1774,6 +1803,8 @@ class Volunteer:
             slot.saw_output = False
             slot.stop_pending = False
             slot.watchdog_fired = False
+            slot.watchdog_why = ""
+            slot.grace_killed = False
             slot.stderr_tail.clear()
             slot.state = "running"
         pg = {"process_group": 0} if sys.version_info >= (3, 11) else {"preexec_fn": os.setpgrp}
@@ -1885,7 +1916,9 @@ class Volunteer:
             slot.proc = None
             slot.state = "idle"
             self._write_pidfile()
-            killed = slot.killed_by_client
+            # 'client': killed on purpose (drop, lease lost), nothing of this window is reported;
+            # 'grace': Stop's grace ran out, only this run is lost (its node stays open)
+            killed = "client" if slot.killed_by_client else "grace" if slot.grace_killed else None
             watchdog = slot.watchdog_fired
             stopped = slot.stop_sent_at > 0 and not watchdog   # we sent SIGINT (Stop)
             tail = " | ".join(list(slot.stderr_tail)[-3:])
@@ -1904,11 +1937,12 @@ class Volunteer:
                              failure=failure, run_hash=run_hash)
 
         if killed:
-            return RunResult("none", "killed")
+            return RunResult("none", "killed" if killed == "client" else "stop_grace")
         if watchdog:
             with self.lock:
                 self.stats["watchdog"] += 1
-            return void("hang", "no output for %.0f s after the split time" % (3 * STATUS_EVERY_MS / 1000.0 + self.args.watchdog_slack_s))
+                why = slot.watchdog_why or "no output after the split time"
+            return void("hang", why)
         if hash_mismatch:
             self.fatal_stop(2, "The worker binary changed while the client was running (SRC_HASH %s, expected %s). "
                             "Restart the client." % (run_hash, self.src_hash))
@@ -2079,12 +2113,10 @@ class Volunteer:
         chunks = self.chunk_reports(batch)
         for i, chunk in enumerate(chunks):
             path = self.outbox_write(chunk, attempts=0, next_try=0.0)
-            r = self.deliver(chunk, path)      # path None (disk full): straight from memory
-            if r == "done":
+            r = self.deliver(chunk, path)      # path None (disk full): straight from memory, and
+            if r == "done":                    # deliver() puts back in `pending` what it could not send
                 continue
             with self.lock:
-                if path is None:
-                    self.pending[0:0] = chunk    # keep it in memory for the next try
                 for later in chunks[i + 1:]:
                     if self.outbox_write(later, attempts=0, next_try=time.time() + 2.0) is None:
                         self.pending.extend(later)
@@ -2140,13 +2172,17 @@ class Volunteer:
     def deliver(self, reports, path):
         """Deliver one batch (from its outbox file when `path` is set). Returns 'done' when
         the server answered for every report (the file is gone), 'retry' (kept for later) or
-        'halt' (the campaign or the token ended; nothing more can be sent now)."""
+        'halt' (the campaign or the token ended; nothing more can be sent now). Without a file
+        (the disk refused it), what is kept for later goes back to `pending`, exactly once."""
         cid = self.campaign.get("id")
         meta = self.outbox_meta.get(path) if path else None
         if meta and cid is not None and meta.get("campaign_id") not in (None, cid):
             self.retire_file(path, "it belongs to campaign %s" % meta.get("campaign_id"))
             return "done"
         if not self.token:
+            if not path:
+                with self.lock:
+                    self.pending[0:0] = reports
             return "retry"
         kind, info = self.post_batch(reports)
         if kind == "ok":
@@ -2167,10 +2203,10 @@ class Volunteer:
             result = "done"
             for p, pp in zip(parts, paths):
                 if result == "done":
-                    result = self.deliver(p, pp)
+                    result = self.deliver(p, pp)      # a part without a file requeues itself on retry
                 elif pp is None:
                     with self.lock:
-                        self.pending.extend(p)
+                        self.pending.extend(p)        # not tried: kept in memory (a part with a file stays on disk)
             return result
         if kind == "retry":
             if path:
@@ -2178,6 +2214,9 @@ class Volunteer:
                 self.outbox_write(reports, attempts=attempts, next_try=time.time() + min(300.0, 2.0 ** attempts),
                                   path=path)
                 self.log("batch of %d report(s) kept in the outbox (%s): %s" % (len(reports), os.path.basename(path), info))
+            else:
+                with self.lock:
+                    self.pending[0:0] = reports    # keep it in memory for the next try
             return "retry"
         if kind == "closed":
             if path:
@@ -2188,13 +2227,13 @@ class Volunteer:
             return "halt"
         if kind == "reregister":
             if not path:
-                self.outbox_write(reports, attempts=1, next_try=time.time() + 5)
+                self.keep_on_disk(reports)
             self.end_campaign("reregister", "the server does not know this client's token any more (%s); "
                               "registering again" % info)
             return "halt"
         if kind in ("revoked", "too_old"):
             if not path:
-                self.outbox_write(reports, attempts=1, next_try=time.time() + 5)
+                self.keep_on_disk(reports)
             if kind == "revoked":
                 self.fatal_stop(2, "This client's token was revoked by the server.", no_send=True)
             else:
@@ -2206,6 +2245,12 @@ class Volunteer:
             self.reject(r, info.status if info else 400, info.body if info else {})
         self.outbox_remove(path)
         return "done"
+
+    def keep_on_disk(self, reports):
+        """Reports that cannot be sent under this token: to the outbox, else back to memory."""
+        if self.outbox_write(reports, attempts=1, next_try=time.time() + 5) is None:
+            with self.lock:
+                self.pending[0:0] = reports
 
     def reject(self, report, status, body):
         with self.lock:
@@ -2650,6 +2695,28 @@ class Volunteer:
             p["stop"] = "waiting for the next campaign…"
         return p
 
+    def shift_baselines(self, lost, now):
+        """The main loop did not run for `lost` seconds: a system sleep (the laptop lid), a frozen
+        client (Ctrl-Z, a debugger) or a starved machine. The watchdog and the stop grace must count
+        only time the client was awake to read the workers' output, so a sleep that spans a split
+        time is not a hang: the silence baseline moves to now, and the split time, the overrun limit
+        and the stop grace move by the lost time (a Linux worker's own split timer, CLOCK_MONOTONIC,
+        also stops during suspend and splits that much later)."""
+        n = 0
+        with self.lock:
+            for s in self.slots:
+                if not s.proc:
+                    continue
+                n += 1
+                s.last_line_at = max(s.last_line_at, now)
+                s.split_at += lost
+                s.run_started_at += lost
+                if s.stop_sent_at:
+                    s.stop_sent_at += lost
+        if n and lost >= 30:
+            self.log("the client did not run for %.0f s (sleep?); the watchdog and the stop grace of %d running "
+                     "worker(s) count from now" % (lost, n))
+
     def handle_wake(self, gap):
         self.log("clock jumped %.0f s (sleep?). Re-validating leases before the workers continue." % gap)
         with self.lock:
@@ -2892,6 +2959,7 @@ class Volunteer:
             self.phase_name = "running"
             self.ever_ran = True
             self.sigint_count = 0
+            self.completion = None    # an earlier campaign's closing summary (--keep-going) is not this one's
             end = self.run()
             if end == "complete":
                 cid = self.campaign.get("id")
@@ -2962,11 +3030,15 @@ class Volunteer:
         slack = 3 * STATUS_EVERY_MS / 1000.0 + float(self.args.watchdog_slack_s)
         grace = float(self.args.stop_grace_s)
         while True:
-            time.sleep(0.5)
+            time.sleep(MAIN_TICK_S)
             try:
                 now = time.time()
                 gap = now - self.last_tick
                 self.last_tick = now
+                if gap > CLOCK_GAP_S:
+                    # before any watchdog check: the silence and the overrun it measures happened
+                    # while the client could not look (or the whole machine was asleep)
+                    self.shift_baselines(gap - MAIN_TICK_S, now)
                 if gap > 2 * self.lease_s() and not self.stopping:
                     self.handle_wake(gap)
                 token_ok = self.end_reason not in ("closed", "reregister")
@@ -3037,12 +3109,12 @@ class Volunteer:
                     quiet_since = max(s.last_line_at, s.split_at)
                     overrun = now > s.split_at + max(600.0, s.split_after_s)
                     if now - quiet_since > slack or overrun:
+                        why = ("no output for %.0f s after its split time" % (now - quiet_since) if not overrun
+                               else "still running %.0f s after its split time" % (now - s.split_at))
                         self.log("!!! worker %d (job %s): %s; sending SIGINT, then SIGKILL after %.0f s. "
-                                 "The run is void (hang)."
-                                 % (s.idx, s.job and s.job["id"],
-                                    "no output for %.0f s after its split time" % (now - quiet_since) if not overrun
-                                    else "still running %.0f s after its split time" % (now - s.split_at), grace))
+                                 "The run is void (hang)." % (s.idx, s.job and s.job["id"], why, grace))
                         s.watchdog_fired = True
+                        s.watchdog_why = "watchdog: " + why
                         self._signal(s, signal.SIGCONT)
                         self._signal(s, signal.SIGINT)
                         s.state = "finishing"
@@ -3051,9 +3123,14 @@ class Volunteer:
                     if s.watchdog_fired:
                         self.log("!!! worker %d did not exit within %.0f s of SIGINT; killing it" % (s.idx, grace))
                     else:
-                        self.log("!!! worker %d did not print SUMMARY within %.0f s of SIGINT; killing it. "
-                                 "Job %s is left untouched." % (s.idx, grace, s.job and s.job["id"]))
-                        s.killed_by_client = True
+                        # only this run is lost: its node goes back open, the rest of the window is
+                        # reported (J's own run has nothing to report: the job is left untouched)
+                        own = s.job is not None and s.cur_seed == s.job["seed"]
+                        self.log("!!! worker %d did not print SUMMARY within %.0f s of SIGINT; killing it. %s"
+                                 % (s.idx, grace, "Job %s is left untouched." % (s.job and s.job["id"]) if own or s.job is None
+                                    else "Node %s of job %d stays open; the rest of the window is reported."
+                                    % (s.cur_seed or "(exit root)", s.job["id"])))
+                        s.grace_killed = True
                     self._signal(s, signal.SIGCONT)
                     self._signal(s, signal.SIGKILL)
                     s.stop_sent_at = 0.0

@@ -38,6 +38,10 @@
 # u  outbox        reports written while the server is down are delivered after a restart.
 # v  complete_410  a complete campaign's token gets 410 once a newer campaign is open: at startup
 #                  the client joins the new campaign; while running it ends with the summary, exit 0.
+# w  sleep         client and worker frozen across the split time (a closed lid): a normal split, no
+#                  'hang'; frozen after Stop: the stop grace does not count the sleep.
+# x  grace_kill    an absorption probe killed after Stop's grace leaves its node open and the window
+#                  is still reported; a lease with absorb_total_s 0 (endgame) runs no probes.
 #
 # Ports: TEST_SERVER_PORT (default 19131) and TEST_UI_PORT (default 19166, +1 for a second
 # client); the script refuses to run when one is already taken. FAKE_SEED seeds the fake
@@ -72,6 +76,9 @@ cleanup() {
   for p in $(pgrep -f "$WPAT" 2>/dev/null); do kill -CONT "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
   wait 2>/dev/null
 }
+# after every test: a test that gave up early (return) must not leave its server, clients or
+# workers behind for the next one (its port would be taken)
+end_test_procs() { cleanup; SERVER_PID=""; CLIENT_PID=""; CLIENT2_PID=""; EXTRA_PIDS=""; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
@@ -384,11 +391,17 @@ test_h() {
 test_i() {
   say "test i: keep_going (join the next campaign)"
   start_server 3 30 4 --heartbeat-s 2 --batch-interval-s 1 --absorb-total-s 2 --absorb-probe-s 1 || return
-  FAKE_MIN_S=0.2 FAKE_MAX_S=0.6 start_client i.log --workers 2 --no-ui --keep-going || return
+  FAKE_MIN_S=0.2 FAKE_MAX_S=0.6 start_client i.log --workers 2 --no-browser --keep-going || return
   wait_log i.log "waiting for the next campaign" 45 && ok "campaign 1 complete: the client waits for the next one" || bad "no wait: $(tail -3 "$TMP/i.log")"
   kill -0 "$CLIENT_PID" 2>/dev/null && ok "still running (--keep-going)" || bad "client exited"
-  admin '{"op": "open", "roots": 3, "split_after_s": 4}'
+  [ "$(state_field "(s.get('completion') or {}).get('campaign_id')")" = 1 ] && ok "the panel shows campaign 1's closing summary while waiting" \
+    || bad "panel completion while waiting: $(state_field "s.get('completion')")"
+  admin '{"op": "open", "roots": 40, "split_after_s": 4}'
   wait_log i.log "for campaign 2" 15 && ok "it registered into campaign 2" || bad "did not join campaign 2"
+  wait_log i.log "campaign 2: grid" 5
+  wait_true 1 eval '[ "$(state_field "(s.get(\"completion\") or {}).get(\"campaign_id\", 0) != 1")" = True ]' \
+    && ok "campaign 1's summary is gone from the panel once campaign 2 runs" \
+    || bad "the panel still shows campaign 1's summary during campaign 2: $(state_field "s.get('completion')")"
   wait_true 45 eval '[ "$(grep -c "is complete" "$TMP/i.log")" -ge 2 ]' && ok "and completed it too" || bad "campaign 2 not completed: $(audit 2 | cut -c1-200)"
   wait_log i.log "waiting for the next campaign.*" 10
   kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 10; rc=$RC; CLIENT_PID=""
@@ -570,7 +583,7 @@ test_r() {
 
 test_s() {
   say "test s: units (allowlist, env, classification)"
-  "$PY" - "$HERE" "$TMP" <<'EOF' 2>"$TMP/s.err" && ok "parse_extra / worker_env / classify / valid_seed / parse_unresolved / run judging behave as specified" \
+  "$PY" - "$HERE" "$TMP" <<'EOF' 2>"$TMP/s.err" && ok "parse_extra / worker_env / classify / valid_seed / parse_unresolved / run judging / wake baselines / 413 requeue behave as specified" \
     || { bad "unit checks failed"; tail -5 "$TMP/s.err"; }
 import sys; sys.path.insert(0, sys.argv[1]); import volunteer as v
 ok = lambda x: v.parse_extra(x)[1] is None
@@ -621,6 +634,46 @@ r = judge(dict(base, status="split"), [cand], ["U1,R1"]); assert r.kind == "ok" 
 r = judge(dict(base, status="split"), [cand]); assert (r.kind, r.reason) == ("void", "bad_remaining"), r.reason
 r = judge(dict(base, status="path_overflow"), [], rc=4); assert (r.kind, r.reason, r.failure) == ("void", "path_overflow", True)
 r = judge(None, [], rc=-11); assert (r.kind, r.reason) == ("void", "crash")
+# Stop's grace ran out (SIGKILL): only this run is lost, no failure; a drop/lease-loss kill is 'killed'
+r = vol._judge(slot, job, "U1", False, -9, "grace", False, True, "", None, False, None, False, [], False, 0, [], [], None)
+assert (r.kind, r.reason) == ("none", "stop_grace"), (r.kind, r.reason)
+r = vol._judge(slot, job, "U1", False, -9, "client", False, False, "", None, False, None, False, [], False, 0, [], [], None)
+assert (r.kind, r.reason) == ("none", "killed")
+slot.watchdog_why = "watchdog: no output for 75 s after its split time"
+r = vol._judge(slot, job, "U1", False, 0, None, True, False, "", vol.src_hash, False, dict(base, status="split"), False, [], False, 0, ["U1,R1"], [cand], None)
+assert (r.kind, r.reason) == ("void", "hang") and "no output for 75 s" in r.detail, r.detail
+# a sleep across the split time (the main loop did not run): the watchdog and the stop grace count from the wake
+import time as _t
+class P:
+    pid = None
+    def poll(self): return 0
+def fresh(now):
+    s = v.Slot(0); s.proc = P(); s.state = "running"; s.job = job
+    s.split_after_s = 6.0; s.split_at = now - 20.0; s.last_line_at = now - 25.0; s.run_started_at = now - 26.0
+    return s
+now = _t.time()
+vol.slots = [fresh(now)]; vol._supervise(now, 2.75, 90.0)
+assert vol.slots[0].watchdog_fired and "no output for 20 s" in vol.slots[0].watchdog_why, vol.slots[0].watchdog_why
+vol.slots = [fresh(now)]; vol.shift_baselines(29.5, now); vol._supervise(now + 1.0, 2.75, 90.0)
+s0 = vol.slots[0]
+assert not s0.watchdog_fired and s0.last_line_at == now and abs(s0.split_at - (now + 9.5)) < 1e-6, (s0.watchdog_fired, s0.split_at - now)
+s0.state = "finishing"; s0.stop_sent_at = now - 95.0; vol.shift_baselines(60.0, now); vol._supervise(now, 2.75, 90.0)
+assert not s0.grace_killed and s0.stop_sent_at == now - 35.0
+vol._supervise(now + 56.0, 2.75, 90.0); assert s0.grace_killed and not s0.killed_by_client
+vol.slots = []
+# 413 halving with no outbox file (the disk refused it): the delivered half is not queued again
+vol.token = "t"; vol.campaign = {"id": 1}
+vol.outbox_write = lambda *a, **k: None
+sent = []
+def post(reports):
+    if len(reports) > 2: return "too_large", E(413, {}, False)
+    sent.append([r["job_id"] for r in reports])
+    return ("ok", None) if len(sent) == 1 else ("retry", E(503, {}, True))
+vol.post_batch = post
+vol.pending = [{"job_id": i, "nodes": []} for i in range(4)]
+assert vol.send_pending() is False
+assert sent == [[0, 1], [2, 3]] and [r["job_id"] for r in vol.pending] == [2, 3], (sent, vol.pending)
+assert v.nonneg_float(0) == 0.0 and v.nonneg_float("12.5") == 12.5 and v.nonneg_float(-1) is None and v.nonneg_float(True) is None
 EOF
   done_test
 }
@@ -680,12 +733,76 @@ test_v() {
   stop_server; done_test 100
 }
 
-ALL="a b c d e f g h i j k l m n o p q r s t u v"
+test_w() {
+  say "test w: sleep (a system sleep across the split time is not a hang; neither is one across the stop grace)"
+  # 6 s windows. Part 1: the client and its worker are frozen with SIGSTOP (like a closed lid) for 9 s
+  # across the split time; the client wakes first and the worker 1.5 s later. With a watchdog slack
+  # of 2 s the watchdog fired at once on wake before the fix (a void run and a 'hang' failure).
+  # Part 2: Stop, then a 7 s freeze while the worker takes 3 s to answer SIGINT (grace 4 s).
+  start_server 1 60 6 --batch-interval-s 1 --exits 0 --heartbeat-s 2 --absorb-total-s 0 || return
+  FAKE_SIGINT_DELAY_S=3 FAKE_MIN_S=40 FAKE_MAX_S=50 start_client w1.log --workers 1 --no-ui \
+      --watchdog-slack-s 2 --stop-grace-s 4 || return
+  wait_true 15 eval '[ "$(fake_workers_alive)" = 1 ]' || { bad "no worker started"; return; }
+  local wp wp2; wp=$(pgrep -f "$WPAT" | head -1)
+  sleep 2
+  kill -STOP "$CLIENT_PID" "$wp"; sleep 9
+  kill -CONT "$CLIENT_PID"; sleep 1.5; kill -CONT "$wp"
+  wait_log w1.log "job [0-9]+ split in" 15 && ok "the window whose split time passed during the sleep was reported as a split" \
+    || bad "no split after the wake: $(grep -E 'void|SIGINT' "$TMP/w1.log" | head -2)"
+  grep -Eq "sending SIGINT|run void" "$TMP/w1.log" && bad "the watchdog fired after the wake: $(grep -E 'sending SIGINT|run void' "$TMP/w1.log" | head -2)" \
+    || ok "no watchdog and no void run after the wake"
+  wait_true 10 eval '[ "$(stat split_nodes)" -ge 1 ]' && [ "$(aq "a['failure_reasons'].get('hang', 0)")" = 0 ] \
+    && ok "the server got the split and no 'hang' failure" || bad "splits $(stat split_nodes), failures $(aq "a['failure_reasons']")"
+  wait_true 15 eval 'wp2=$(pgrep -f "$WPAT" | head -1); [ -n "$wp2" ] && [ "$wp2" != "$wp" ]' || { bad "no second window"; return; }
+  sleep 1
+  kill -INT "$CLIENT_PID"
+  wait_log w1.log "stopping:" 5 || bad "no stop logged"
+  kill -STOP "$CLIENT_PID" "$wp2"; sleep 7
+  kill -CONT "$CLIENT_PID"; sleep 1; kill -CONT "$wp2"
+  wait_rc "$CLIENT_PID" 20; rc=$RC; CLIENT_PID=""
+  grep -q "did not print SUMMARY" "$TMP/w1.log" && bad "the stop grace killed the worker after the sleep" \
+    || ok "the stop grace did not count the sleep"
+  [ "$rc" = 0 ] && [ "$(stat split_nodes)" -ge 2 ] && ok "the stopped window was reported as a split; exit 0" \
+    || bad "exit $rc, splits $(stat split_nodes)"
+  [ "$(fake_workers_alive)" = 0 ] && ok "no worker left behind" || bad "workers left"
+  stop_server; done_test
+}
+
+test_x() {
+  say "test x: grace_kill and endgame (a probe killed after Stop's grace keeps the window; absorb_total_s 0 per lease)"
+  # J (8 tokens, 40-50 s) splits at its 3 s window into 2 children of 24-30 s; the first 5 s absorption
+  # probe ignores SIGINT and is killed after the 2 s grace: its node stays open, J's split is reported.
+  start_server 1 60 3 --absorb-total-s 30 --absorb-probe-s 5 --batch-interval-s 1 --exits 0 --heartbeat-s 2 || return
+  FAKE_SIGINT_IGNORE=1 FAKE_REMAINING_N=2 FAKE_MIN_S=40 FAKE_MAX_S=50 start_client x1.log --workers 1 --no-ui \
+      --stop-grace-s 2 || return
+  wait_true 20 pgrep -f "$WPAT.*--split-after 5\.0" >/dev/null || { bad "no absorption probe started"; return; }
+  sleep 0.5
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 20; rc=$RC; CLIENT_PID=""
+  grep -q "stays open; the rest of the window is reported" "$TMP/x1.log" && ok "the probe was killed after the grace: $(grep -o 'Node [^;]*stays open' "$TMP/x1.log" | head -1)" \
+    || bad "no grace kill of the probe: $(grep -E 'SUMMARY|abandoned' "$TMP/x1.log" | head -2)"
+  ! grep -q "abandoned" "$TMP/x1.log" && [ "$rc" = 0 ] && [ "$(stat split_nodes)" = 1 ] && [ "$(aq "a['counts']['open']")" = 2 ] \
+    && ok "the window was reported (J split, both children open), not abandoned; exit 0" \
+    || bad "exit $rc, splits $(stat split_nodes), open $(aq "a['counts']['open']"), $(grep abandoned "$TMP/x1.log" | head -1)"
+  [ "$(aq "len(a['failure_reasons'])")" = 0 ] && ok "no failure reported for the killed probe" || bad "failures $(aq "a['failure_reasons']")"
+  [ "$(fake_workers_alive)" = 0 ] && ok "no worker left behind" || bad "workers left"
+  stop_server
+  # the lease says absorb_total_s 0 (jobs.js endgame): no probe runs although the campaign's budget is 30 s
+  start_server 2 60 2 --lease-absorb-total-s 0 --absorb-total-s 30 --absorb-probe-s 5 --batch-interval-s 1 --exits 0 --heartbeat-s 2 || return
+  FAKE_MIN_S=2.5 FAKE_MAX_S=3 start_client x2.log --workers 1 --no-ui || return
+  wait_rc "$CLIENT_PID" 45; rc=$RC; CLIENT_PID=""
+  [ "$rc" = 0 ] && audit_clean && ok "the campaign completed (exit 0)" || bad "exit $rc; audit $(audit | cut -c1-200)"
+  [ "$(stat split_nodes)" -ge 1 ] && [ "$(stat absorbed_done)" = 0 ] && grep -q "(endgame)" "$TMP/x2.log" \
+    && ok "$(stat split_nodes) split(s), no child absorbed: the per-lease budget 0 skipped the absorption pass" \
+    || bad "splits $(stat split_nodes), absorbed $(stat absorbed_done), endgame logged: $(grep -c '(endgame)' "$TMP/x2.log")"
+  stop_server; done_test
+}
+
+ALL="a b c d e f g h i j k l m n o p q r s t u v w x"
 which="${*:-all}"
 [ "$which" = all ] && which="$ALL"
 start=$(date +%s)
 for t in $which; do
-  case " $ALL " in *" $t "*) rm -rf "$TMP/outbox" "$TMP/outbox_"* "$HOME/.pathology_volunteer.json"; "test_$t";;
+  case " $ALL " in *" $t "*) rm -rf "$TMP/outbox" "$TMP/outbox_"* "$HOME/.pathology_volunteer.json"; "test_$t"; end_test_procs;;
     *) echo "usage: $0 [$ALL|all]"; exit 2;; esac
 done
 echo
