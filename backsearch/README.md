@@ -50,7 +50,9 @@ cd backsearch
   prints the effective values in its KNOBS line. Compiler flags smuggled in through `CC` are refused.
 
 Plain build, any C11 compiler (clang or gcc), no PGO. For the collective search it must embed the
-source hash, or the client refuses the binary:
+source hash, or the client refuses the binary. Add no other `-D` flag: the embedded hash is the one
+of the default tables, and nothing checks the KNOBS line against it (knob overrides go through
+`KNOBS=` above, which changes the hash; v2/DESIGN.md §1.6):
 
 ```bash
 cc -O3 -DSRC_HASH_STR="\"$(./build_pgo.sh --print-hash)\"" -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm

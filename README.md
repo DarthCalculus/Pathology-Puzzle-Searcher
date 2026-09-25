@@ -64,7 +64,12 @@ The 149 is davidspencer6174's *Capital C* (7 blocks, 2 holes); it is proven
 longest among all 5x5 levels with at most 2 holes, and, by the first collective
 campaign (September 2026: 597 CPU-hours from volunteers, published under
 "Collective"), among all 5x5 levels with at most 3 holes (per exit 127, 149, 112,
-138, 115 and 80; the 3-hole column's 149s for 7 and 8 blocks follow from it).
+138, 115 and 80; the 3-hole column's 149s for 7 and 8 blocks follow from it). One
+caveat from the campaign's review: nothing found shows a published maximum is wrong,
+but exhaustiveness is not fully proven, because that worker could silently prune a
+state whose shortcut check hit the solver's queue cap (a spot check of the heaviest
+jobs stayed about 20x below the cap; see
+[`backsearch/v2/DESIGN.md`](backsearch/v2/DESIGN.md) §6.2).
 The second campaign, 6x6 with no holes (best known 165 moves), is running: see
 [`backsearch/VOLUNTEERS.md`](backsearch/VOLUNTEERS.md) to help, and
 [`backsearch/v2/DESIGN.md`](backsearch/v2/DESIGN.md) for how it works.  4x5 is fully enumerated

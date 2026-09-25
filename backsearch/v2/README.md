@@ -70,23 +70,38 @@ recipe, backups and deploys are in `server/ops/README.md` there); the root listi
 worker, in `backsearch/`. Proofs from a campaign are attributed "Collective"; the owner's own
 proofs "Panacea".
 
+**Campaign #2 (6x6, no holes, layer 4) is already seeded and running** (since 2026-09-24).
+Never re-seed a running campaign: `v2_seed.js --close-others` would close it and start again
+from zero. A new worker is rolled out with `v2_hashes.js add` beside the old hash, which stays
+whitelisted until the campaign is finished and published (DESIGN §6.3). The recipe below is
+for the next campaign; with the release worker it reproduces campaign #2's 1,368 roots exactly.
+
 List the roots with the release worker (built by `./build_pgo.sh -o backsearch_worker_nt
 --no-torch`, whose hash the campaign whitelists), for exactly the campaign's flags, and keep
-the WHOLE stdout. For campaign #2 (6x6, no holes, layer 4):
+the WHOLE stdout. For campaign #2's roots:
 
 ```
+rm -f dump.tsv                               # the worker appends to it; v2_seed refuses repeated rows
 ./backsearch_worker_nt --grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --time 0 \
     --estimate 30000 --estimate-depth 4 --estimate-dump dump.tsv > roots.tsv
 grep -c '^LAYER[[:space:]]' roots.tsv        # 1,368 roots: exits 0/1/2/7/8/14 = 17/116/158/188/513/376
 ```
 
 (`--list-layer 4` gives the same roots without the estimate; the estimate dump gives every root
-its `est_s`, which the server leases largest first.) Then:
+its `est_s`, which the server leases largest first.) Then, for a NEW campaign only:
 
 ```
 node tools/v2_seed.js --campaign-file plan.json --layer-file roots.tsv --estimate-file dump.tsv --dry
 node tools/v2_seed.js --campaign-file plan.json --layer-file roots.tsv --estimate-file dump.tsv [--close-others]
-node tools/v2_hashes.js list | add <src-hash> | remove <hash> [--reissue]   # --reissue only after a correctness fix
+```
+
+Running a campaign:
+
+```
+node tools/v2_hashes.js list | add <src-hash>   # add a new worker's hash beside the old ones
+node tools/v2_hashes.js remove <hash> --reissue
+    # remove un-covers every job finished under that hash (the exit stays unclean until it is
+    # added back); use it only with --reissue, after a correctness fix: that work is searched again
 node tools/v2_jobs.js quarantined | mismatches | candidates | release ...    # what blocks an exit
 node tools/v2_resolve.js        # solve the open unresolved candidates deeper than each exit's best
 node tools/v2_verify.js         # re-solve champions the server has not confirmed yet

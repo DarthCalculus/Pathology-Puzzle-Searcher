@@ -44,17 +44,22 @@ Owner rules, enforced by every component:
    published.
 5. **Every report carries the worker's compiled-in source hash**, and the server whitelists hashes.
    SRC_HASH = sha256 over `backsearch.c` + `sokoban_bfs.c` + `sokoban_bfs.h`, plus the sorted list of `-D`
-   knob overrides when there are any (§2.1). A worker fix means re-issuing only the jobs done under the old
-   hash (§3.8).
+   knob overrides when there are any (§2.1). A correctness fix in the worker means re-issuing only the jobs done
+   under the old hash (§3.8); any other new worker is added beside the old hash, which stays whitelisted
+   (§6.3).
 6. **Fingerprints.** A job's `(states, valid, best)` is a deterministic function of `(seed, SRC_HASH)`.
    - The dedup tables DO evict (correcting the old premise "jobs are kept small so the dedup tables never
      evict", review M10). With SHALLOW_LG2 = RECENT_LG2 = 22 the two-table dedup starts evicting at 80 % fill,
      about 3.36M inserts. In campaign #1, 1,675 of 54,409 reports evicted, and they held 63 % of the CPU-hours
      and 77 % of the states.
-   - Eviction is a deterministic function of the insert sequence and the compiled table sizes, and the table
-     sizes are in SRC_HASH (a `-D` override changes the hash, and `--version` prints them in KNOBS). So the
-     fingerprint holds: 1,009 of 1,009 campaign-#1 duplicate pairs matched, evicting jobs included. An
-     eviction costs only re-exploration, never a level.
+   - Eviction is a deterministic function of the insert sequence and the compiled table sizes. The table
+     sizes are part of SRC_HASH only for builds made by `build_pgo.sh`, which folds its `KNOBS="-D..."`
+     overrides into the hash (§2.1). A hand `cc` build that embeds `$(./build_pgo.sh --print-hash)` and adds
+     its own `-D` overrides carries the release hash with different tables: `--version` prints the effective
+     sizes in KNOBS, but neither the client nor the server checks that line (§10). So a plain build must add no
+     `-D` flag beyond `SRC_HASH_STR`. Within one hash and its tables the fingerprint holds: 1,009 of 1,009
+     campaign-#1 duplicate pairs matched, evicting jobs included. An eviction costs only re-exploration,
+     never a level.
    - About 2 % of done jobs are re-run as duplicates on another client and compared (§3.6). Fingerprints are
      compared within one hash only. Across worker versions they agree only for jobs with no UNKNOWN checks:
      solver changes that let a newer worker decide a state an older one left UNKNOWN change that job's valid
@@ -86,7 +91,8 @@ Owner rules, enforced by every component:
   - Knob builds: `KNOBS="-DX=Y ..." ./build_pgo.sh -o OUT` (every table-size macro has an `#ifndef`). The
     sorted overrides are folded into SRC_HASH, so a knob build can never be whitelisted by accident.
   - A plain `cc` build must pass `-DSRC_HASH_STR="\"$(./build_pgo.sh --print-hash)\""`; without it the worker
-    prints an empty hash, which every client refuses.
+    prints an empty hash, which every client refuses. It must pass no other `-D` flag: that hash is the one of
+    the default tables, and nothing checks KNOBS against it (§1.6, §10). Overrides go through `KNOBS=`.
 - **`--version`** prints, tab separated, one per line:
   ```
   SRC_HASH	<64 hex>
@@ -174,8 +180,12 @@ SUMMARY\t<json>                          the last protocol line
 | `time_cap` | 0 | the --time cap (never in protocol use) | void, failure |
 | `dedup_full` | 0 | the single dedup table filled (--no-two-tables only; the client always passes --two-tables) | void, failure |
 
-Any other end (a signal, a missing SUMMARY) is a crash. "Failure" means a failure report when the run is
-the window's own job (§4); a void child run just stays open in the tree.
+Two exit codes come before any output line and print no SUMMARY: 1 for an unknown or malformed argument, and
+2 when protocol mode (`--status-every`) refuses `--beam`, `--rollout`, `--shortcut-state-cap` or
+`--nn-surrogate-model` (a v2 job must be exhaustive), or a listing option is malformed (`--list-layer`,
+`--estimate-depth`, `--estimate-dump`, `--from` / `--until`, or `--estimate` with `--task-id`). The client never
+passes these. Any other end (a signal, a missing SUMMARY, exit codes 1 and 2 included) is a crash. "Failure"
+means a failure report when the run is the window's own job (§4); a void child run just stays open in the tree.
 
 ### 2.5 Solver capacity: UNKNOWN and candidates
 
@@ -313,7 +323,7 @@ names). Every POST body carries `client_version` and `protocol`; a client below 
 (which sends neither field) gets a code it already treats as fatal: 400 on register, 403 on heartbeat and
 lease.
 
-### 3.3 Routes (JSON; POST bodies ≤ 4 MB)
+### 3.3 Routes (JSON; POST bodies ≤ 4 MB for report and reports, ≤ 64 KB for register, heartbeat and lease)
 
 - `POST /api/v2/register {name, workers, client_version, protocol}` → `{token, campaign, campaign_state}`.
   503 with `queue_position` when `max_clients` are active; 404 `no_campaign` (with `last_campaign`) when none is
@@ -449,10 +459,16 @@ Per exit, from the job tree (computed off the request path, §3.7):
   exit, each with depth == tokens ≥ K (a deeper root ends in one walk run from token K on) and within the caps,
   no duplicates, no malformed or merged lines. `--dry` runs every check. A real run closes the open campaign
   (`--close-others`), creates the new one and inserts every root in one transaction.
-- `v2_hashes.js list | add HASH | remove HASH [--reissue]`. `--reissue` after a correctness fix: per exit only
-  the topmost finished rows under the removed hash are reset to open, everything below them becomes
-  `superseded` (their levels dropped), and duplicates of retired rows are retired. It prints the CPU-hours to
-  redo and the open candidates recorded on retired rows.
+- `v2_hashes.js list | add HASH | remove HASH [--reissue]`.
+  - `remove` alone only takes the hash off the whitelist. New reports under it are refused (409
+    `unknown_hash`), and every job finished under it stops counting as covered: the audit lists those jobs as
+    unknown-hash, and the exit stays unclean (§3.5), so the campaign cannot complete and v2_finish refuses to
+    publish, until the hash is added back or the jobs are re-issued. Never remove the hash of a worker whose
+    finished work the campaign still relies on (§6.3).
+  - `remove --reissue`, only after a correctness fix: per exit only the topmost finished rows under the removed
+    hash are reset to open, everything below them becomes `superseded` (their levels dropped), and duplicates of
+    retired rows are retired. That work is searched again. The tool prints the CPU-hours to redo and the open
+    candidates recorded on retired rows.
 - `v2_jobs.js quarantined | failures | release [--all] | mismatches | resolve | recheck | rerun JOB | drop-dup |
   candidates | candidate ID MOVES | solve-candidates`: what blocks an exit, and how to clear it.
 - `v2_resolve.js`: solves the open candidates deeper than each exit's best (and the contradicted ones) with
@@ -609,11 +625,21 @@ V_knob ⊆ V ⊆ V_knob ∪ U_knob; the equivalence configs match the baseline e
 - Title "6x6 with no holes: what is the longest level?"; grid 6x6; extra `--allow-exit-transit --num-holes 0`
   (any number of blocks: the worker's 32; the proof publishes as any block count, §3.8); exits 0, 1, 2, 7, 8,
   14. The best known level is 165 moves with 10 blocks, so levels are long and most states have 10+ blocks.
-- **Root layer 4**: 1,368 roots (exits 0/1/2/7/8/14 = 17/116/158/188/513/376), all at depth 4, `shallow_best`
-  3 on every exit. Layer 4 follows §7.1 (seed shallow): with the realistic 10 × 16 = 160 workers, 1,368 roots
-  are more than 3 × workers, so windows are full from the start; and no layer-4 root can be affected by the
-  old listing defect (§2.8). Roots carry `est_s` when seeded with the estimate dump (`--estimate-file`); the
-  lease order is then largest `est_s` first, else shallowest first.
+- **Root layer 4**: 1,368 roots (exits 0/1/2/7/8/14 = 17/116/158/188/513/376), all at depth 4. The release
+  candidate's listing of the same roots (byte-identical LAYER lines) reports `shallow_best` 3 on every exit.
+  The live campaign's header was written by hand, because 406e5500 predates LAYERINFO: it has `k`, `grid`,
+  `flags`, `src_hash`, `roots` and `made_by`, and no `seed` or `shallow_best` key. That is harmless, since a
+  level of at most 3 moves never decides a maximum. Layer 4 follows §7.1 (seed shallow): with the realistic
+  10 × 16 = 160 workers, 1,368 roots are more than 3 × workers, so windows are full from the start; and no
+  layer-4 root can be affected by the old listing defect (§2.8).
+- **Root estimates**: the launch set holds, beside the plan and the listing, the 406e5500 estimate dump of the
+  same 1,368 roots (`--estimate-depth 4`), and the launch record says the roots were seeded with it
+  (`--estimate-file`). So they carry `est_s` and the lease order is largest `est_s` first (without estimates it
+  would be shallowest first). To confirm on the server, as the service user (so any `-wal`/`-shm` file stays
+  the service's; `-readonly` fails on a WAL database without them):
+  `runuser -u pathology -- sqlite3 /opt/pathology/data/jobs.db "SELECT count(*), count(est_s) FROM jobs WHERE
+  parent_id IS NULL AND dup_of IS NULL AND campaign_id = (SELECT max(id) FROM campaigns WHERE status = 'open')"`
+  prints `1368|1368` when every root has one.
 - **Size**: the Knuth estimate (the live worker, `--estimate-depth 4`, about 30k probes per exit) gives a
   dedup-free lower bound of about 5,100 CPU-hours, about 3,600 with dedup: exit 7 about 4,700 h (SE 70 %),
   exit 14 290 h, exit 8 110 h, exit 1 22 h, exit 2 5 h, exit 0 0.1 h. The estimator ran 1-13x low before, so
@@ -635,6 +661,14 @@ grid 5x5; extra `--allow-exit-transit --num-holes 3`; exits 0, 1, 2, 6, 7, 12; l
 (ramp 120 s); lease 3600 s; paused_max 12 h; dup_fraction 0.02. Result per exit: 127/149/112/138/115/80, so
 **149 is the longest 5x5 level with at most 3 holes**; 597 CPU-hours, 166,733 jobs and 36.4 billion states (plus
 1,033 fingerprint re-runs, 4.8 CPU-hours), about 11 hours of wall clock. The proofs are attributed "Collective".
+Caveat (review 2026-09-24, §1 and C1): nothing found shows a published maximum is wrong, but exhaustiveness is
+not fully proven. The campaign-#1 worker pruned a state silently when a single shortcut check hit its
+1,048,576-entry pending cap (solver -2), with no counter in SUMMARY. In a spot check (the release candidate, 120 s
+on each of the 12 heaviest campaign-#1 seeds) the largest single check held at most 52,499 pending entries
+(§2.5), so such a prune is implausible but not ruled out. The review's two other residual risks are the 64-bit
+keys (§6.3) and prunes that were checked by argument rather than against an independent enumerator (M89;
+`v2/test_oracle.py` now does that for the current worker). The proofs stay published (published proofs are
+never revoked or edited).
 (This section first said layer 8. Campaign #1 was seeded at layer 4, and until worker 27443a8 a deeper layer
 lost subtrees, §2.8.)
 
@@ -650,15 +684,30 @@ error / unknown_chain statuses, the split fixes), but it:
 - prints no LAYERINFO header (the live roots were listed at layer 4 and given a hand-written header).
 
 The rollout (the owner decides and deploys; nothing here changes the live data):
-1. Deploy the server from `campaign2` (additive: 3.0.0 clients keep working).
-2. Build the release worker with `./build_pgo.sh -o backsearch_worker_nt --no-torch` and `v2_hashes add` its
-   hash (c3ee5d2b… for the current sources). Keep 406e5500 whitelisted while volunteers rebuild: its results
-   are exact, and fingerprints are compared within one hash only. Remove it later with `v2_hashes remove`;
-   `--reissue` would redo all of its work, which the review's risk estimate for 64-bit keys (about 0.01 false
-   dedup matches in a campaign-#1-sized search, about 1e-10 chance of touching a maximum) does not call for.
-3. After the rollout, `v2_jobs quarantined` and `release --all` for jobs that old workers quarantined with
-   status `error`.
-4. Client 3.1.0 arrives with the same `git pull`; `min_client_version` can stay 3.0.0.
+1. Back up `jobs.db`, then deploy the server from PathologyRecords `campaign2` (`server/ops/README.md`;
+   additive: 3.0.0 clients keep working).
+2. Publish the release sources. Volunteers clone and `git pull` the searcher repository's GitHub `main`, and
+   the client's update advice is `git pull && ./build_pgo.sh ...`. GitHub `main` is still 6991199 (the live
+   406e5500), an ancestor of project45 `campaign2`, so until the owner fast-forwards `main` to `campaign2` a
+   pull delivers neither the c3ee5d2b worker nor client 3.1.0. The PathologyRecords README's link to this file
+   (on `main`) also shows the pre-protocol-3 version until then.
+3. Build the release worker from that checkout with `./build_pgo.sh -o backsearch_worker_nt --no-torch`, check
+   its hash with `--version` (c3ee5d2b… for the current sources), and `v2_hashes add` it. Both hashes are then
+   accepted; fingerprints are compared within one hash only.
+4. **Keep 406e5500 whitelisted until campaign #2 is finished and published.** A done or split job counts as
+   covered only while its hash is whitelisted (§3.5), and every job of campaign #2 finished so far was finished
+   under 406e5500. `v2_hashes remove` at any time un-covers all of that work until the hash is added back: every
+   exit goes unclean, the campaign cannot turn complete, and v2_finish refuses to publish (§3.8). `remove
+   --reissue` would search it all again (thousands of CPU-hours). Neither is called for. 406e5500's finished
+   results are exact, and the review's risk estimate for its 64-bit keys (about 0.01 false dedup matches in a
+   campaign-#1-sized search, about 1e-10 chance of touching a maximum) does not justify a re-run.
+5. Once most clients run the new worker, clear the jobs the old one could not do. `v2_jobs quarantined` lists
+   each quarantined job with its last failures (reason and client version). Release with `v2_jobs release JOB`
+   only the jobs whose failures are status `error` from 406e5500 (states wider than 128 bits, which the new
+   worker packs). Look at any other reason first (`v2_jobs failures JOB`): a job quarantined for `bad_seed` or
+   `path_overflow` would fail the same way on the new worker (same replay, same 1,024-token limit), and one
+   quarantined for `unknown_chain` may. `release --all` reopens every quarantined job, whatever its reason.
+6. Client 3.1.0 arrives with the same `git pull`; `min_client_version` can stay 3.0.0.
 
 ## 7. Load rules (added 2026-09-23 after the load analysis; these override §3/§4 where they differ)
 
@@ -849,6 +898,11 @@ Known gaps (not done; none affects exactness):
   biased low (it is a minimum over symmetry images): harmless for ≤ 2 images (every 6x6 exit), a possible
   slowdown at a 5x5 centre exit; to be fixed with the next worker change.
 - The client's default worker count is not capped by RAM (plan 0.5 GB per worker).
+- Nothing checks the worker's KNOBS line. The client reads only PROTOCOL and LIMITS, and the server only the
+  hash. A hand `cc` build that embeds the release hash and adds `-D` table-size overrides would be accepted as
+  the release, although it is not the tested build: its fingerprints can differ from the release's (a false
+  mismatch), and so can its capacity and limits. The docs say to add no `-D` flag to a plain build (§1.6,
+  §2.1). A client check of KNOBS against the release defaults is a candidate for the next client.
 
 ## 11. History
 
