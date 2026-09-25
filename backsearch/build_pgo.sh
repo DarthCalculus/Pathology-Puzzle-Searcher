@@ -5,14 +5,18 @@
 # measurably faster (~10-20% on the solver replay benchmark) than plain -O3.
 # This script:
 #   1. builds an instrumented worker,
-#   2. runs it briefly on a representative search to collect a profile,
+#   2. runs it briefly on two representative searches to collect a profile: a
+#      5x5 run (the 64-bit solver instance) and a 6x6 0-hole subtree whose
+#      checks are about one third wider than 64 bits (the 16-block-byte
+#      instance), so neither instance is compiled as cold code,
 #   3. rebuilds with that profile.
 #
 # Usage:
 #   ./build_pgo.sh                 # -> ./backsearch_worker
 #   ./build_pgo.sh -o mybinary     # custom output path
 #   ./build_pgo.sh --no-torch      # force the no-NN stub even if libtorch is present
-#   ./build_pgo.sh --train "--grid 6x6 --exit 0 --time 6"   # custom training run
+#   ./build_pgo.sh --train "--grid 6x6 --exit 0 --time 6"   # custom first training run
+#   ./build_pgo.sh --train2 ""     # skip the second (6x6 wide-state) training run
 #   CC=gcc-13 ./build_pgo.sh   # pick the compiler (clang and GCC PGO are both handled)
 #   KNOBS="-DHP64_SIZE=(1<<9) -DPATH_TOK_MAX=16" ./build_pgo.sh -o /tmp/knob_worker
 #                              # a "knob build": compile-time table-size overrides (tests)
@@ -38,6 +42,7 @@ cd "$(dirname "$0")"
 
 OUT=./backsearch_worker
 TRAIN_ARGS="--grid 5x5 --exit 0 --time 4"
+TRAIN2_ARGS="--grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --exit 14 --seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R1 --time 4"
 USE_TORCH=auto
 PRINT_HASH=0
 while [ $# -gt 0 ]; do
@@ -46,6 +51,7 @@ while [ $# -gt 0 ]; do
     --no-torch) USE_TORCH=no; shift ;;
     --torch) USE_TORCH=yes; shift ;;
     --train) TRAIN_ARGS="$2"; shift 2 ;;
+    --train2) TRAIN2_ARGS="$2"; shift 2 ;;
     --print-hash) PRINT_HASH=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -143,11 +149,17 @@ $CC $CFLAGS $GEN -c backsearch.c  -o "$TMP/bs.o"
 $CC $CFLAGS $GEN -c sokoban_bfs.c -o "$TMP/sb.o"
 $CXX_LINK $GEN "$TMP/bs.o" "$TMP/sb.o" $NN_OBJ -o "$TMP/worker.gen" $LIBS $NN_LINK
 
-# --- 2. training run ---------------------------------------------------------
+# --- 2. training runs --------------------------------------------------------
 echo "[2/3] training run: $TRAIN_ARGS"
 # shellcheck disable=SC2086
-LLVM_PROFILE_FILE="$TMP/w.profraw" "$TMP/worker.gen" $TRAIN_ARGS >/dev/null 2>&1 || true
-if [ "$FAMILY" = clang ]; then $PROFDATA merge -output="$TMP/w.profdata" "$TMP/w.profraw"; fi   # gcc reads $TMP/*.gcda directly
+LLVM_PROFILE_FILE="$TMP/w1.profraw" "$TMP/worker.gen" $TRAIN_ARGS >/dev/null 2>&1 || true
+if [ -n "$TRAIN2_ARGS" ]; then
+  echo "      training run: $TRAIN2_ARGS"
+  # shellcheck disable=SC2086
+  LLVM_PROFILE_FILE="$TMP/w2.profraw" "$TMP/worker.gen" $TRAIN2_ARGS >/dev/null 2>&1 || true
+fi
+# clang merges the raw profiles; gcc accumulates both runs in $TMP/*.gcda and reads them directly
+if [ "$FAMILY" = clang ]; then $PROFDATA merge -output="$TMP/w.profdata" "$TMP"/w*.profraw; fi
 
 # --- 3. optimised build (same object paths as stage 1, see above) -------------
 echo "[3/3] optimised build -> $OUT"

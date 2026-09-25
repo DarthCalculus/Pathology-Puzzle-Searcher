@@ -23,7 +23,7 @@ Prints, one per line, tab-separated:
 SRC_HASH	<64 hex>
 GIT_SHA	<sha or empty>
 PROTOCOL	3
-LIMITS	{"path_tok_max":1024,"max_ncells":64,"max_blocks":32,"state_bits":<max supported>}
+LIMITS	{"path_tok_max":1024,"max_ncells":64,"max_blocks":32,"state_bits":<max supported: 261 from W3 on>}
 KNOBS	{"HASH_LG2":..,"SHALLOW_LG2":..,"RECENT_LG2":..,"HP64_SIZE":..,"HTP_SIZE":..,...}
 ```
 SRC_HASH = sha256 over backsearch.c + sokoban_bfs.c + sokoban_bfs.h **plus** the sorted list of
@@ -92,6 +92,14 @@ different hash and can never be whitelisted by accident). Every table-size macro
 - States wider than 64 bits use the same optimised solver (A*, reference tables, multi-start) as
   64-bit states; widths up to MAX_BLOCKS on every grid up to 64 cells are supported, and a state
   that does not fit is an `error`, never a silent prune.
+  As implemented (stage W3): the push solvers are written once and compiled for three packed-state
+  widths: one 64-bit word (bits_per_cell × nb + nh ≤ 64, so 6x6 with no holes up to 10 blocks), 16 block
+  bytes (nb ≤ 16) and 32 block bytes (nb ≤ 32). All widths share the 64-bit Zobrist-keyed tables, so
+  reference tables, their XOR translation and the multi-start solve work across widths. Only nb > 32
+  or nh > 30 is `SOK_NO_FIT` (status `error`). LIMITS `state_bits` is 261 = 7 × (1 + 32) + 30: the
+  widest state in the old bits_per_cell × (1 + nb) + nh measure, so every state fits. The multi-start
+  label table also checks a second, independent 64-bit key on every key match (review M7): a
+  collision ends that multi solve with -2, and its starts are then decided one by one.
 
 ## 3. Client (volunteer.py)
 

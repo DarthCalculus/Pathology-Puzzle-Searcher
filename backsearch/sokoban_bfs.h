@@ -57,14 +57,14 @@ void sokoban_set_grid(int rows, int cols);
  * Solver return codes.  x >= 0 is a solution length; -1 means "no solution
  * (within the cutoff)", proven by an exhaustive search.  Every other negative
  * value means the search did NOT finish, so neither answer is proven:
- *   SOK_PENDING_CAP  -2  the pending queue reached HP64_SIZE / HP128_SIZE
+ *   SOK_PENDING_CAP  -2  the pending queue reached HP64_SIZE (every state width)
  *   SOK_PROBE_LIMIT  -3  a hash probe chain exceeded HT_PROBE_LIMIT (or the
  *                        optional heap cap, sokoban_set_heap_cap, was hit)
  *   SOK_TABLE_FULL   -5  the big hash table reached its 85% insert limit
  *                        (the solve is not retried: the rerun is identical)
- *   SOK_NO_FIT       -6  the state does not fit the widest packing
- *                        (g_bits_per_cell*(1+nb)+nh > SOK_STATE_BITS_MAX, or
- *                        nh > 30); nothing was searched
+ *   SOK_NO_FIT       -6  the state cannot be represented (nb > MAX_BLOCKS or
+ *                        nh > 30, or g_bits_per_cell*(1+nb)+nh beyond a test
+ *                        build's -DSOK_STATE_BITS_MAX); nothing was searched
  * -2/-3/-5 are UNKNOWN: a caller must never read them as "shortcut" (prune)
  * nor as "no solution" (accept); backsearch explores such a state without
  * counting it (PROTOCOL3 §1).  -6 is an internal error for the caller.
@@ -74,10 +74,18 @@ void sokoban_set_grid(int rows, int cols);
 #define SOK_PROBE_LIMIT   (-3)
 #define SOK_TABLE_FULL    (-5)
 #define SOK_NO_FIT        (-6)
+/* Every state with nb <= MAX_BLOCKS blocks and nh <= 30 holes on a grid of
+ * <= MAX_NCELLS cells is solved by the same optimised solver (A*, decision
+ * mode, reference tables, multi-start), packed into one of three widths:
+ * 64 bits (bits_per_cell*nb + nh <= 64), 16 block bytes (nb <= 16) or 32 block
+ * bytes (nb <= 32).  In the old bits_per_cell*(1+nb)+nh measure the widest such
+ * state has 7*(1+32)+30 = 261 bits, the default below; a smaller -D value is a
+ * test knob that makes wider states SOK_NO_FIT. */
 #ifndef SOK_STATE_BITS_MAX
-#define SOK_STATE_BITS_MAX 128   /* widest state packing the solvers support (a smaller -D value is a test knob) */
+#define SOK_STATE_BITS_MAX 261
 #endif
-int sokoban_state_bits_max(void);   /* == SOK_STATE_BITS_MAX */
+int sokoban_state_bits_max(void);          /* == SOK_STATE_BITS_MAX */
+int sokoban_state_width(int nb, int nh);   /* packed width used for such a state: 1, 2 or 4 (x 64 bits), 0 = SOK_NO_FIT */
 
 /*
  * sokoban_solve(pz, used_dirs, prof)
@@ -181,7 +189,9 @@ void sokoban_set_decision_only(int on);
  * from that start would decide).  pred[i] (or NULL): bitmask of starts that
  * are shortest-path predecessors of start i; a shortcut there implies one at i.
  * n <= 24.  Returns 0, or -2 when the solve
- * did not fit (table overflow, heap cap, 128-bit puzzle): then out[] is
+ * did not fit (label-table or arena overflow, pending or heap cap, a cutoff
+ * of 254 or more, a primary-key collision caught by the second key, a state
+ * that does not fit at all): then out[] is
  * meaningless and the caller must fall back to per-start solves. */
 /* Parent-table reuse (see REFERENCE TABLE in sokoban_bfs.c).  After a cutoff
  * solve returned -1 exhaustively on the small table, sokoban_export_settled()
@@ -204,6 +214,7 @@ uint64_t sokoban_zobrist_block(int mask, int cell);
 void sokoban_ref_suspend(int suspend);                                     /* REF_CHECK: disable/enable the loaded table */
 int  sokoban_ref_active(void);
 
+long long sokoban_ms_collisions(void);   /* primary-key collisions the multi solver's second key caught (each such solve returned -2) */
 int sokoban_solve_multi(const Puzzle *pz, const int8_t *starts, const int16_t *cut, const uint32_t *pred,
                         const uint8_t *refk, int n, uint8_t *out, BfsProfile *prof);   /* refk: per-start chain offset for an installed reference, or NULL.
                                                                                         * The true offsets must be passed: a capped k would prune more than

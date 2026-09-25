@@ -15,8 +15,10 @@
  * bound on the final puzzle's forward solve.
  *
  * Grid size is configurable at runtime via --grid RxC (any R*C <= 64 =
- * MAX_NCELLS).  States are packed into 64 or 128 bits for the solver; a
- * state that does not fit ends the run with status "error" (exit 5).
+ * MAX_NCELLS).  The solver packs a state into 64 bits, 16 block bytes or
+ * 32 block bytes, all with the same optimised search; every state with at most
+ * MAX_BLOCKS blocks and 30 holes fits, and one that does not ends the run with
+ * status "error" (exit 5), never a prune.
  *
  * Win condition (verified in sokoban_bfs.c:682) is "player ends turn
  * on exit_pos" — the existing header comment about blocks reaching
@@ -1945,6 +1947,8 @@ static void build_partial_puzzle(const BState *s, Puzzle *pz) {
 #define SHORTCUT_PROFILE_BUCKETS 96
 static long long g_solver_calls_by_depth[SHORTCUT_PROFILE_BUCKETS];
 static double    g_solver_time_by_depth[SHORTCUT_PROFILE_BUCKETS];
+static long long g_solver_calls_by_width[3];   /* single checks by packed-state width (64-bit word, 16 / 32 block bytes) */
+static double    g_solver_time_by_width[3];
 static int       g_solver_profile = 0;   /* print per-depth solver-call profile; opt-in via --solver-profile */
 
 /* shortcut_check return codes, extended (all consumers use classify()):
@@ -1991,8 +1995,10 @@ static int shortcut_check(const BState *s) {
     if (b < 0) b = 0;
     if (b >= SHORTCUT_PROFILE_BUCKETS) b = SHORTCUT_PROFILE_BUCKETS - 1;
     g_solver_calls_by_depth[b]++;
-    g_solver_time_by_depth[b] += (t1.tv_sec - t0.tv_sec)
-                              + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+    g_solver_time_by_depth[b] += dt;
+    {   int w = sokoban_state_width(pz.num_blocks, pz.num_holes);   /* 1, 2, 4 (0: no fit) */
+        if (w) { int wi = w == 4 ? 2 : w - 1; g_solver_calls_by_width[wi]++; g_solver_time_by_width[wi] += dt; } }
     /* Only enforce the cap when no real shortcut was found.  If rc >= 0
      * the state is pruned anyway; if rc is a capacity code the check is
      * UNKNOWN (separate signal).  Otherwise high states_popped means the forward
@@ -2493,8 +2499,8 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         return;
     }
     if (cls == SC_ERROR) {
-        char m[160]; snprintf(m, sizeof m, "solver code %d on a state with %d blocks, %d holes at depth %d (does not fit the %d-bit packing)",
-                              x, s->nblocks, s->nholes, s->depth, sokoban_state_bits_max());
+        char m[192]; snprintf(m, sizeof m, "solver code %d on a state with %d blocks, %d holes at depth %d (the solver represents <= %d blocks, <= 30 holes, <= %d state bits)",
+                              x, s->nblocks, s->nholes, s->depth, MAX_BLOCKS, sokoban_state_bits_max());
         fatal_error(m);
     }
     const int unknown = (cls == SC_UNKNOWN);
@@ -6162,20 +6168,19 @@ int main(int argc, char **argv) {
             g_active_mask |= 1ULL << (r * g_cols + c);
 
     sokoban_init();
-    {   /* M45 interim guard: the solver packs a state into at most sokoban_state_bits_max() bits; a
-         * state that does not fit ends the run with status "error" (exit 5), never a silent prune. */
-        int bpc = 5; while ((1 << bpc) < g_ncells + 1) bpc++;
-        int worst = 0, worst_nh = 0;   /* blocks and holes sit on distinct cells, never on the player's */
+    {   /* M45: the solver represents every state with <= MAX_BLOCKS blocks (--num-blocks caps
+         * g_max_blocks there) and <= 30 holes (sokoban_state_width); a state it cannot represent is
+         * SOK_NO_FIT and ends the run with status "error" (exit 5), never a silent prune.  Only more
+         * than 30 holes can get there: say so up front outside protocol mode. */
+        int worst_nb = 0, worst_nh = -1;   /* blocks and holes sit on distinct cells, never on the player's */
         for (int nh = 0; nh <= g_max_holes && nh <= g_ncells - 1; nh++) {
             int nb = g_max_blocks < g_ncells - 1 - nh ? g_max_blocks : g_ncells - 1 - nh;
-            if (bpc * (1 + nb) + nh > worst) { worst = bpc * (1 + nb) + nh; worst_nh = nh; }
+            if (!sokoban_state_width(nb, nh)) { worst_nb = nb; worst_nh = nh; break; }
         }
-        if (!g_protocol_mode && worst > sokoban_state_bits_max()) {
-            int fit = (sokoban_state_bits_max() - worst_nh) / bpc - 1;
-            fprintf(stderr, "note: on %dx%d with %d holes only states with <= %d blocks fit the %d-bit solver packing; "
-                            "reaching a bigger one ends the run with status error (exit 5)\n",
-                    g_grid_rows, g_grid_cols, worst_nh, fit, sokoban_state_bits_max());
-        }
+        if (!g_protocol_mode && worst_nh >= 0)
+            fprintf(stderr, "note: on %dx%d a state with %d blocks and %d holes cannot be represented by the solver "
+                            "(<= %d blocks, <= 30 holes, <= %d state bits); reaching one ends the run with status error (exit 5)\n",
+                    g_grid_rows, g_grid_cols, worst_nb, worst_nh, MAX_BLOCKS, sokoban_state_bits_max());
     }
     sokoban_set_hole_prune(g_mandatory_holes);
     sokoban_set_forced_mandatory(g_forced_mand_cells);
@@ -6608,6 +6613,14 @@ int main(int argc, char **argv) {
                        100.0 * cum_time / total_time);
             }
             printf("  total %10lld   %8.3f s\n", total_calls, total_time);
+            static const char *wn[3] = { "64-bit", "16-byte", "32-byte" };
+            printf("  by packed-state width (single checks):\n");
+            for (int w = 0; w < 3; w++)
+                if (g_solver_calls_by_width[w])
+                    printf("    %-8s %10lld calls  %8.3f s  %8.2f us/call\n", wn[w], g_solver_calls_by_width[w],
+                           g_solver_time_by_width[w], 1e6 * g_solver_time_by_width[w] / g_solver_calls_by_width[w]);
+            printf("  multi-start: %lld solves, %lld fell back to single checks, %lld key collisions caught\n",
+                   g_bulk_calls, g_bulk_fallbacks, sokoban_ms_collisions());
         }
     }
 
