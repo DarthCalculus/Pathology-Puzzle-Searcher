@@ -256,8 +256,18 @@ is not acceptable.
    node with its summary and its REMAINING children (none of its time is lost),
    and the pass then continues with that probe's own children only: every seed
    still to come is no deeper than the one that split, i.e. larger. A probe that
-   cannot expand its root in the probe time ends the pass. The open pool thus
-   holds only jobs that cost ≥ 10 s or were never examined.
+   cannot expand its root in the probe time ends the pass. When the budget (or
+   a stop) ends the pass inside the children of the last kept split, that split
+   stays a split only if the work kept under it (its probe plus its children's
+   probes) is at least 1 s per extra open job it creates (children never probed,
+   minus one); otherwise it goes back to one `open` node like a fold-back (its
+   children dropped, its deepest level kept). This matters for the budget-cut
+   last probe, which gets only what is left, nearly always splits, and would
+   otherwise hand its whole REMAINING (mostly trivial) to the pool; the work
+   dropped instead is less than 1 s per job avoided. The open pool still gets the
+   unprobed siblings at each level of the chain (no deeper than a child that
+   did not finish in a probe, so mostly large, a few trivial) and any child the
+   budget did not reach under a split that saved enough.
    (Was 2 s / 60 s; raised after the first load test measured ~1 ms of server
    time per row: the worst-case job rate is now 1,280 / 10 s = 128 jobs/s.)
 4. **The server sets the window.** The lease response carries `split_after_s`:
@@ -286,13 +296,15 @@ is not acceptable.
    `POST /api/v2/reports {token, reports:[…]}` (array of §7.5 bodies) per
    `batch_interval_s` (10), plus one heartbeat per 30 s. Lease requests are
    sized by expected work (review M108): at most 2 × workers jobs are held
-   locally (running + queued), and a worker gets its next job when its current
+   locally (running + queued; the job of a worker that retires after the
+   worker count was lowered does not count), and a worker gets its next job when its current
    window has less than min(`lease_ahead_s`, window) left; a job's expected
    work is the mean window time at its depth (a depth nothing is known about
    counts as a whole window), and an idle worker always gets one. An idle worker
    with nothing queued may lease sooner than `batch_interval_s` (at least 2 s
-   apart). The local queue runs the server's lease order (largest `est_s`
-   first when the grant carries it, then shallowest, then grant order). The
+   apart). The local queue runs the server's lease order: largest `est_s`
+   first when the grant carries it (then shallowest, then grant order), and
+   grant order for grants without it (the server sent them in its order). The
    server caps at `lease_cap` (200) per request and 3 × workers + 200 held.
    Failed batches go to the outbox as one file.
 7. **No throttling between friends.** No per-token rate limit. The per-IP

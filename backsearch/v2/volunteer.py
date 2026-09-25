@@ -91,6 +91,8 @@ MIN_WINDOW_S_DEFAULT = 1.0   # floor of a window and of a run's split time; a ca
 HOLD_PER_WORKER = 2          # M108: jobs running + queued here <= 2 x workers
 LEASE_EARLY_GAP_S = 2.0      # an idle worker with nothing queued may lease this soon after the last request
 DEPTH_HIST_N = 16            # window durations kept per job depth (expected work of a job, M108)
+KEEP_SPLIT_S_PER_OPEN = 1.0  # M18: the pass's last kept probe split stays a split only if it saved at least this
+                             # many seconds per child it hands to the pool unprobed (else it goes back open)
 SEC_BOARD_S = 1.0            # the "last second" board
 
 # The only worker flags a campaign may add (PROTOCOL3 section 3). Anything else makes the
@@ -233,10 +235,15 @@ def absorb_order(seeds):
 
 
 def queue_key(job):
-    """M108: the local queue runs the job the server would lease first: largest est_s first (when the
-    grant carries it), then shallowest, then the order the jobs were granted in (jobs.js leaseOrder)."""
+    """M108: the local queue runs the job the server would lease first. A grant with est_s: largest
+    first, then shallowest, then grant order (jobs.js leaseOrder: est_s DESC, depth, created_at).
+    A grant without it runs in grant order: the server already sent it in its lease order (est_s it
+    does not send, then depth), so sorting those by depth could run a smaller shallow job before the
+    larger one the server handed out first."""
     est = job.get("est_s")
-    return (est is None, -(est or 0.0), job.get("depth", 0), job.get("seq", 0))
+    if est is None:
+        return (1, 0.0, 0, job.get("seq", 0))
+    return (0, -est, job.get("depth", 0), job.get("seq", 0))
 
 
 def parse_extra(extra):
@@ -687,7 +694,7 @@ class Volunteer:
                           "runs": 0, "cpu_seconds": 0.0, "reports_sent": 0, "batches_sent": 0,
                           "reports_failed": 0, "runs_without_summary": 0, "failures_reported": 0,
                           "runs_void": 0, "unresolved": 0, "grants_deduped": 0, "released_too_big": 0,
-                          "folded_back": 0, "watchdog": 0, "batches_413": 0}
+                          "folded_back": 0, "watchdog": 0, "batches_413": 0, "probe_splits_demoted": 0}
             self.best_per_exit = {}
             self.last_heartbeat = 0.0
             self.last_heartbeat_ok = 0.0
@@ -1488,7 +1495,9 @@ class Volunteer:
             active = [s for s in self.slots if not s.retire and s.thread is not None and s.thread.is_alive()]
             if not active:
                 return 0, False
-            running = sum(1 for s in self.slots if s.job is not None)
+            # only the workers that stay count: a retiring worker's job is not followed by another, and
+            # counting it would leave the kept workers idle until the retiring windows end
+            running = sum(1 for s in active if s.job is not None)
             queued = list(self.queue)
             w = self.window_now
             sa = w["split_after_s"] if w else self.fparam("split_after_s", 1800)
@@ -1571,7 +1580,11 @@ class Volunteer:
                 self.log("the server refused exit %d (%s); leasing jobs of any exit" % (pref, e.error))
                 self.last_lease_at = 0.0
             else:
-                self.log("lease failed (%s); retrying in %d s" % (e, int(self.fparam("batch_interval_s", 10))))
+                # a failed request waits a whole batch interval, also for an idle worker (no early retry
+                # every LEASE_EARLY_GAP_S against a struggling server)
+                wait = max(LEASE_EARLY_GAP_S, self.fparam("batch_interval_s", 10))
+                self.no_jobs_until = time.time() + wait
+                self.log("lease failed (%s); retrying in %s s" % (e, fmt_s(wait)))
             return
         if not isinstance(res, dict):
             return
@@ -1825,11 +1838,18 @@ class Volunteer:
         # probe's own children only (deeper, the ones near its cursor are trivial): every seed still to
         # come is no deeper than the one that split, i.e. larger. A probe that cannot even expand its
         # root in the probe time ends the pass the same way. The budget is absorb_total_s.
+        # When the budget (or a stop) ends the pass inside the last kept split's children, that split is
+        # judged at the end (_settle_last_split): kept only if it saved at least KEEP_SPLIT_S_PER_OPEN
+        # seconds per child it leaves unprobed, else it goes back open (a budget-cut probe would otherwise
+        # hand its whole REMAINING, mostly trivial, to the pool).
         todo = absorb_order([n["seed"] for n in nodes if n["status"] == "open"])
         absorbed = probe_splits = 0
+        demoted = None
         if todo and not self.stopping and absorb_total > 0:
             probe = max(min(0.5, min_w), self.fparam("absorb_probe_s", 10))
             absorb_end = time.time() + absorb_total
+            last = None               # the last kept probe split: {"seed", "saved" (s of work kept under it)}
+            cut = False               # the pass ended for the budget or a stop, not because it ran out of seeds
             with self.lock:
                 slot.phase = "absorb"
                 slot.window_end = absorb_end
@@ -1837,11 +1857,16 @@ class Volunteer:
             while todo:
                 left = absorb_end - time.time()
                 if self.stopping or left < min(0.5, min_w) or slot.drop_requested:
+                    cut = True
                     break
                 seed = todo.pop(0)
                 # spend up to absorb_total_s (PROTOCOL3 section 3): the last probe gets what is left
+                t_probe = time.time()
                 res = self.run_worker(slot, job, seed, min(probe, left), probe_run=True)
+                spent = max(0.0, time.time() - t_probe)
                 node = index[seed]
+                if last is not None and res.kind == "ok":
+                    last["saved"] += spent     # a finished or kept probe under the last split is work kept there
                 if res.kind != "ok":
                     if slot.killed_by_client:
                         break
@@ -1874,12 +1899,21 @@ class Volunteer:
                     nodes.append(child)
                     index[r] = child
                 probe_splits += 1
+                last = {"seed": seed, "saved": spent}
                 todo = absorb_order(new)    # only the split probe's own (deeper) children from here on
                 with self.lock:
                     slot.stack = todo
-            if absorbed or probe_splits:
-                self.log("worker %d: job %d absorption: %d node(s) finished, %d probe(s) split and kept"
-                         % (slot.idx, job["id"], absorbed, probe_splits))
+            if cut and last is not None and todo:
+                demoted = self._settle_last_split(slot, nodes, index, last, len(todo))
+                if demoted is not None:
+                    absorbed -= demoted["done"]
+                    probe_splits -= 1
+            if absorbed or probe_splits or demoted:
+                self.log("worker %d: job %d absorption: %d node(s) finished, %d probe(s) split and kept%s"
+                         % (slot.idx, job["id"], absorbed, probe_splits,
+                            "; the last split probe goes back open (%d of its %d children never probed, %s s kept "
+                            "under it)" % (demoted["unprobed"], demoted["children"], fmt_s(demoted["saved"]))
+                            if demoted else ""))
             if slot.killed_by_client or slot.drop_requested:
                 with self.lock:
                     slot.job = None
@@ -1939,6 +1973,43 @@ class Volunteer:
         if self.draining or self.stopping:
             self.send_event.set()
         return "ok"
+
+    def _settle_last_split(self, slot, nodes, index, last, unprobed):
+        """M18: the absorption pass ended (budget or stop) with `unprobed` children of its last kept
+        probe split never probed. Keeping the split hands those children to the pool as separate jobs
+        (after a budget-cut probe: its whole REMAINING, mostly trivial ones); turning it back into one
+        open node loses the `saved` seconds of work under it. The split stays when it saved at least
+        KEEP_SPLIT_S_PER_OPEN seconds per extra open job (unprobed - 1), else it is demoted like a
+        fold-back (PROTOCOL3 section 3): open, no summary or candidates, its children dropped, keeping
+        the deepest level found in it or them (the server accepts a level on an open node). Its
+        children are its only descendants: a child that split would have become the last split.
+        Returns None (kept) or {"done", "unprobed", "children", "saved"} (demoted)."""
+        seed = last["seed"]
+        if last["saved"] >= KEEP_SPLIT_S_PER_OPEN * max(0, unprobed - 1):
+            return None
+        node = index[seed]
+        kids = [n for n in nodes if n["parent"] == seed]
+        if any(n["status"] == "split" for n in kids):
+            return None                    # cannot happen (see above); keeping is always exact
+        best = node.get("level")
+        for n in kids:
+            lv = n.get("level")
+            if lv and (not best or lv.get("depth", 0) > best.get("depth", 0)):
+                best = lv
+        done = sum(1 for n in kids if n["status"] == "done")
+        gone = set(n["seed"] for n in kids)
+        nodes[:] = [n for n in nodes if n["seed"] not in gone]
+        for k in gone:
+            index.pop(k, None)
+        node["status"] = "open"
+        node.pop("summary", None)
+        node.pop("unresolved", None)
+        if best:
+            node["level"] = best
+        with self.lock:
+            slot.nodes_done = max(0, slot.nodes_done - done)
+            self.stats["probe_splits_demoted"] += 1
+        return {"done": done, "unprobed": unprobed, "children": len(kids), "saved": last["saved"]}
 
     def _account(self, summary):
         """CPU for the panel and the closing summary: the worker's own cpu_s (protocol 3),

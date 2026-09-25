@@ -293,6 +293,43 @@ function updateBoard(el, caption, b, opts = {}) {
   }
 }
 
+/* A worker card's facts: the part that changes with the job or the node (header, job, seed) is
+   rewritten only when it changes; the numbers that tick every poll (time left, stack, nodes, running)
+   live in their own spans, so a selection of the seed survives the 250 ms polls (M63). */
+function renderWorkerFacts(f, s, phase, retiring, st) {
+  if (f.children.length !== 2) {
+    f.innerHTML = '';
+    const top = document.createElement('div'); f.appendChild(top);
+    const live = document.createElement('div'); f.appendChild(live);
+  }
+  const top = f.children[0], live = f.children[1];
+  const html = `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${esc(retiring)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
+    (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
+      `<div class="seed">${esc(s.seed || '(exit root)')}</div>` +
+      (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') : '');
+  if (top._html !== html && !selectionIn(top)) setHTML(top, html);
+  const kind = s.job_id != null ? (s.phase === 'absorb' ? 'absorb' : 'window') : 'idle';
+  if (live._kind !== kind) {
+    live._kind = kind; live.innerHTML = ''; live._v = {};
+    const line = () => { const x = document.createElement('div'); live.appendChild(x); return x; };
+    const part = (parent, text, cls, key) => {
+      const x = document.createElement('span'); if (cls) x.className = cls; if (text) x.textContent = text;
+      parent.appendChild(x); if (key) live._v[key] = x; return x;
+    };
+    if (kind === 'idle') part(line(), '', 'k', 'idle');
+    else {
+      const a = line();
+      part(a, kind === 'absorb' ? 'absorbing, ' : 'window, ', 'k'); part(a, '', '', 'left'); part(a, ' s left');
+      const b = line();
+      part(b, kind === 'absorb' ? 'still to probe ' : 'local stack ', 'k'); part(b, '', '', 'stack');
+      part(b, ' · nodes done ', 'k'); part(b, '', '', 'done'); part(b, ' · running ', 'k'); part(b, '', '', 'el'); part(b, ' s');
+    }
+  }
+  const v = live._v;
+  if (kind === 'idle') setText(v.idle, s.state === 'idle' && !st.paused && !st.draining && !st.stopping ? 'waiting for the next lease' : '');
+  else { setText(v.left, s.window_left); setText(v.stack, s.stack_size); setText(v.done, s.nodes_done); setText(v.el, s.elapsed); }
+}
+
 async function post(path, body) {
   try {
     const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Volunteer': SECRET }, body: JSON.stringify(body || {}) });
@@ -424,13 +461,7 @@ function render(st) {
       }
       const phase = s.frozen || s.state === 'paused' ? 'paused' : s.state === 'finishing' ? 'handing back' : s.phase === 'absorb' ? 'absorbing' : s.phase === 'window' ? 'searching' : 'waiting for a job';
       const retiring = s.retiring ? ' · retires after this job' : '';
-      setHTML(d.children[0], `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${esc(retiring)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
-        (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
-          `<div class="seed">${esc(s.seed || '(exit root)')}</div>` +
-          (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') +
-          `<div><span class="k">${s.phase === 'absorb' ? 'absorbing, ' : 'window, '}</span>${esc(s.window_left)} s left</div>` +
-          `<div><span class="k">${s.phase === 'absorb' ? 'still to probe' : 'local stack'}</span> ${esc(s.stack_size)} · <span class="k">nodes done</span> ${esc(s.nodes_done)} · <span class="k">running</span> ${esc(s.elapsed)} s</div>`
-          : `<div class="k">${s.state === 'idle' && !st.paused && !st.draining && !st.stopping ? 'waiting for the next lease' : ''}</div>`));
+      renderWorkerFacts(d.children[0], s, phase, retiring, st);
       updateBoard(d.children[1], 'current node', s.cur, { code: false, empty: 'no board yet', maxPx: 150 });
     }
   }

@@ -44,9 +44,11 @@
 #                  is still reported; a lease with absorb_total_s 0 (endgame) runs no probes.
 # y  absorb_order  M18: probes go deepest first; the first probe that splits is kept as a split node,
 #                  the pass goes on into its children only; shallower siblings are never probed.
+#                  A budget-cut probe that splits with its children never probed goes back open.
 # z  lease         M108: at most 2 jobs per worker held; a queued job starts with the server's CURRENT
 #                  window (not the one of its lease); N18: sub-second windows (min_window_s) and
-#                  --split-after-nodes reach the worker.
+#                  --split-after-nodes reach the worker; workers 3 -> 1 while the retiring ones are
+#                  still busy: the kept worker goes on leasing (the hold cap counts only kept workers).
 # pw pause_workers M56: Pause, fewer workers, Resume leaves no worker stopped; fewer workers, then Pause
 #                  freezes the retiring ones too; M61: Ctrl-Z (SIGTSTP) freezes the workers, fg thaws them.
 # ui panel         the panel's script in node with a small DOM stand-in: 6x6 boards, the global board with
@@ -691,9 +693,30 @@ assert sent == [[0, 1], [2, 3]] and [r["job_id"] for r in vol.pending] == [2, 3]
 assert v.nonneg_float(0) == 0.0 and v.nonneg_float("12.5") == 12.5 and v.nonneg_float(-1) is None and v.nonneg_float(True) is None
 # M18: absorption probes deepest first, stable (the cursor stays first among equals)
 assert v.absorb_order(["U1,R1", "U1,R1,R1,R1", "U1,L2", "U1,R2,R2"]) == ["U1,R1,R1,R1", "U1,R2,R2", "U1,R1", "U1,L2"]
-# M108: the local queue runs largest est_s first, then shallowest, then in grant order
-q = [{"depth": 9, "seq": 1}, {"depth": 5, "seq": 2}, {"depth": 5, "seq": 3}, {"depth": 12, "seq": 4, "est_s": 50.0}]
-assert [x["seq"] for x in sorted(q, key=v.queue_key)] == [4, 2, 3, 1]
+# M108: the local queue runs largest est_s first (then shallowest, then grant order); grants without
+# est_s run in grant order (the server's own lease order), never re-sorted by depth
+q = [{"depth": 9, "seq": 1}, {"depth": 5, "seq": 2}, {"depth": 5, "seq": 3}, {"depth": 12, "seq": 4, "est_s": 50.0},
+     {"depth": 3, "seq": 5, "est_s": 50.0}, {"depth": 20, "seq": 6, "est_s": 80.0}]
+assert [x["seq"] for x in sorted(q, key=v.queue_key)] == [6, 5, 4, 1, 2, 3], [x["seq"] for x in sorted(q, key=v.queue_key)]
+# M18: the pass's last kept probe split goes back open when it kept less than 1 s of work per extra
+# open child (a fold-back: children dropped, the deepest level kept); else it stays a split
+def tree():
+    ns = [{"seed": "U1", "parent": None, "status": "split"},
+          {"seed": "U1,R1", "parent": "U1", "status": "split", "summary": {"status": "split"}, "level": {"depth": 5, "code": "a"},
+           "unresolved": [{"depth": 9}]}]
+    ks = [{"seed": "U1,R1," + t, "parent": "U1,R1", "status": "open"} for t in ("R1", "R2", "R3", "L1", "L2")]
+    ks[0].update(status="done", summary={"status": "exhausted"}, level={"depth": 9, "code": "b"})
+    ns += ks + [{"seed": "U1,L1", "parent": "U1", "status": "open"}]
+    return ns, {n["seed"]: n for n in ns}
+sl = v.Slot(0); sl.nodes_done = 3
+ns, ix = tree()
+r = vol._settle_last_split(sl, ns, ix, {"seed": "U1,R1", "saved": 2.9}, 4)      # 2.9 s < 1 s x (4 - 1)
+assert r == {"done": 1, "unprobed": 4, "children": 5, "saved": 2.9}, r
+assert [n["seed"] for n in ns] == ["U1", "U1,R1", "U1,L1"] and set(ix) == {"U1", "U1,R1", "U1,L1"}, ns
+assert ns[1]["status"] == "open" and "summary" not in ns[1] and "unresolved" not in ns[1] and ns[1]["level"]["depth"] == 9, ns[1]
+assert sl.nodes_done == 2 and vol.stats["probe_splits_demoted"] == 1
+ns, ix = tree()
+assert vol._settle_last_split(sl, ns, ix, {"seed": "U1,R1", "saved": 3.0}, 4) is None and len(ns) == 8 and ns[1]["status"] == "split"
 # M108: the window is chosen when it starts (the latest lease/heartbeat window), a re-run keeps its own
 vol.slots = []; vol.campaign = {"grid": "5x5", "split_after_s": 1800, "absorb_total_s": 120}
 job2 = {"id": 2, "exit": 0, "seed": "U1", "depth": 1, "split_after_s": 1800.0, "absorb_total_s": 120.0, "window_mode": "full"}
@@ -732,6 +755,17 @@ vol.slots = slots(4, 4); assert vol.lease_want()[0] == 4          # trivial jobs
 vol.queue.extend({"id": 200 + i, "depth": 1, "seed": "U1"} for i in range(3))
 assert vol.lease_want()[0] == 1 and vol.lease_want()[1] is False
 vol.queue.clear(); vol.depth_hist = {}; vol.grant_depths.clear()
+# the hold cap counts only the workers that stay: fewer workers while the retiring ones still run their
+# jobs must not leave the kept ones idle (3 -> 1, 8 -> 2, 8 -> 3 with the kept workers idle)
+for n, keep in ((3, 1), (8, 2), (8, 3)):
+    vol.slots = slots(n, n)
+    for s_ in vol.slots[:keep]:
+        s_.job = None
+    for s_ in vol.slots[keep:]:
+        s_.retire = True
+    assert vol.lease_want() == (keep, True), (n, keep, vol.lease_want())
+vol.slots = slots(3, 3); vol.slots[1].retire = vol.slots[2].retire = True
+assert vol.lease_want()[0] == 0                                    # the kept worker is busy, far from its end
 # M57: redundant clicks leave no stale request timestamp
 vol.slots = []; vol.paused = False; vol.stopping = False
 vol.pause_requested_at = 5.0; vol.pause(); vol.pause_requested_at = 6.0; vol.pause()
@@ -750,6 +784,17 @@ vol.api.post = lambda path, body, timeout=20: {"jobs": [{"id": 10, "exit": 1, "s
 vol._lease_once(); assert vol.exit_applied and not vol.exit_fallback and not vol.exit_pending
 assert vol.window_now["split_after_s"] == 60.0 and [j["id"] for j in vol.queue] == [9, 10]
 vol.queue.clear()
+# a failed lease request waits a whole batch interval, also for an idle worker (no retry every 2 s)
+vol.campaign["batch_interval_s"] = 10
+def down(path, body, timeout=20):
+    raise E(503, {"error": "busy"}, True)
+vol.api.post = down; vol.last_lease_at = 0.0; vol.no_jobs_until = 0.0
+vol._lease_once()
+assert vol.no_jobs_until >= _t.time() + 9.5, vol.no_jobs_until - _t.time()
+vol.last_lease_at = 0.0; calls = []
+vol.api.post = lambda path, body, timeout=20: calls.append(1) or {"jobs": []}
+vol._lease_once(); assert calls == [], "leased again before the batch interval"
+vol.no_jobs_until = 0.0
 # M66: a LEVEL line feeds the last-hour and last-second boards (short runs print no STATUS)
 vol._note_level({"id": 3, "exit": 1}, {"depth": 40, "code": "3000/0000"})
 st = vol.state()
@@ -909,6 +954,27 @@ EOF
   grep -q "absorption: 9 node(s) finished, 1 probe(s) split and kept" "$TMP/y.log" && ok "logged: $(grep -o 'absorption: .*' "$TMP/y.log" | head -1)" || bad "no absorption log: $(grep absorption "$TMP/y.log" | head -2)"
   [ "$(stat grants_of_absorbed)" = 0 ] && ok "no absorbed node was ever leased" || bad "$(stat grants_of_absorbed) absorbed nodes leased"
   no_bang y.log
+  stop_server
+  # The same tree with a budget of 2.6 s: the three deep children finish (about 0.6 s), the first +1
+  # probe gets its 2 s (or what is left), splits into six children and the budget is gone (at most one
+  # of them probed). Kept, it would hand 5-6 never-probed children to the pool for about 2 s of kept
+  # work (under 1 s per extra job): it goes back open.
+  rm -rf "$TMP/outbox" "$HOME/.pathology_volunteer.json"
+  start_server 1 60 3 --absorb-total-s 2.6 --absorb-probe-s 2 --batch-interval-s 1 --exits 0 --heartbeat-s 2 || return
+  FAKE_REMAINING_DEPTHS=5,4,3,1,1,1 FAKE_DEPTH_DECAY=0.05 FAKE_MIN_S=60 FAKE_MAX_S=80 start_client y2.log --workers 1 --no-ui || return
+  wait_true 30 eval '[ "$(aq "len(a[\"report_log\"])")" -ge 1 ]' || { bad "no report within 30 s: $(tail -3 "$TMP/y2.log")"; return; }
+  kill -INT "$CLIENT_PID"; wait_exit "$CLIENT_PID" 20; CLIENT_PID=""
+  r=$(aq "a['report_log'][0]['nodes']")
+  "$PY" - "$r" <<'EOF2' && ok "J's report: its deep children done, the +1 probe that split as the budget ran out is back to open with no children: $r" || bad "report nodes: $r"
+import sys, ast
+nodes = ast.literal_eval(sys.argv[1])
+assert nodes[0][:2] == [8, "split"], nodes[0]
+assert sorted(st for d, st, el in nodes if d == 9) == ["open", "open", "open"], nodes    # the split probe went back open
+assert sorted(d for d, st, el in nodes if d >= 10) == [11, 12, 13] and all(st == "done" for d, st, el in nodes if d >= 10), nodes
+EOF2
+  grep -Eq "the last split probe goes back open \([56] of its 6 children never probed" "$TMP/y2.log" \
+    && ok "logged: $(grep -o 'absorption: .*' "$TMP/y2.log" | head -1)" || bad "no demotion logged: $(grep absorption "$TMP/y2.log" | head -2)"
+  no_bang y2.log
   stop_server; done_test
 }
 
@@ -941,7 +1007,42 @@ test_z() {
   j=$(aq "a['report_log'][0]['nodes'][0]")
   "$PY" -c 'import sys,ast; d,st,el=ast.literal_eval(sys.argv[1]); sys.exit(0 if st=="split" and el is not None and el < 0.45 else 1)' "$j" \
     && ok "J split after one step (--split-after-nodes 1): $j" || bad "J: $j"
-  stop_server; done_test 100
+  stop_server
+  # The hold cap counts only the workers that stay. 3 workers on 2 s windows; the retiring workers 2 and 3
+  # are frozen here (so their windows cannot end) and the count goes 3 -> 1: worker 1 must go on leasing.
+  # With their jobs counted (2 x 1 - 2 running) it ran out of queued jobs and sat idle.
+  rm -rf "$TMP/outbox" "$HOME/.pathology_volunteer.json"
+  start_server 60 120 2 --batch-interval-s 1 --exits 0 --heartbeat-s 1 --absorb-total-s 0 || return
+  FAKE_MIN_S=20 FAKE_MAX_S=30 start_client z3.log --workers 3 --no-browser || return
+  sec=$(ui_secret "$UPORT")
+  frozen=""
+  for _ in 1 2 3 4 5 6; do
+    p12=$(state_field "' '.join(str(w['pid']) for w in s['slots'] if w['idx'] in (1, 2) and w['pid'] and w['job_id'] is not None)" 2>/dev/null)
+    if [ "$(echo $p12 | wc -w | tr -d ' ')" = 2 ]; then
+      kill -STOP $p12 2>/dev/null
+      again=$(state_field "' '.join(str(w['pid']) for w in s['slots'] if w['idx'] in (1, 2) and w['pid'])" 2>/dev/null)
+      st12=$(for p in $p12; do ps -o stat= -p "$p" 2>/dev/null | cut -c1; done | tr -d ' \n')
+      [ "$again" = "$p12" ] && [ "$st12" = TT ] && { frozen="$p12"; break; }
+      kill -CONT $p12 2>/dev/null
+    fi
+    sleep 0.3
+  done
+  if [ -z "$frozen" ]; then bad "could not freeze workers 2 and 3 mid-window"; else
+    EXTRA_PIDS="$EXTRA_PIDS $frozen"
+    http_post "http://127.0.0.1:$UPORT/workers" '{"workers": 1}' "$sec" >/dev/null
+    n0=$(grep -c "worker 0: job .* window" "$TMP/z3.log")
+    g0=$(stat lease_grants)
+    wait_true 25 eval '[ $(( $(grep -c "worker 0: job .* window" "$TMP/z3.log") - n0 )) -ge 6 ]' \
+      && ok "workers 3 -> 1 with the 2 retiring ones busy: worker 1 ran $(( $(grep -c "worker 0: job .* window" "$TMP/z3.log") - n0 )) more windows, $(( $(stat lease_grants) - g0 )) job(s) leased meanwhile" \
+      || bad "worker 1 ran only $(( $(grep -c "worker 0: job .* window" "$TMP/z3.log") - n0 )) window(s) after 3 -> 1; lease grants $g0 -> $(stat lease_grants)"
+    [ "$(state_field "sum(1 for w in s['slots'] if w['retiring'] and w['job_id'] is not None)")" = 2 ] \
+      && ok "the 2 retiring workers still held their jobs all along" || bad "retiring: $(state_field "[(w['retiring'], w['job_id']) for w in s['slots']]")"
+    kill -CONT $frozen 2>/dev/null
+  fi
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 30; rc=$RC; CLIENT_PID=""
+  [ "$rc" = 0 ] && ok "Stop: exit 0" || bad "exit $rc"
+  no_bang z3.log
+  stop_server; done_test 130
 }
 
 test_pw() {
@@ -1061,6 +1162,21 @@ vm.runInContext(script, ctx);
   assert.strictEqual(g.children[0], before, 'an unchanged board was redrawn');
   assert.ok(/7200|2\.\d h|2 h/.test(byId.pausedMax.textContent) || /h after each lease/.test(byId.pausedMax.textContent), 'paused max: ' + byId.pausedMax.textContent);
   for (const s of st1.slots) { const w = byId['w' + s.idx]; assert.ok(w, 'worker card ' + s.idx); }
+  // worker cards: the numbers that tick every poll live in their own spans; the seed block is not rewritten
+  const busy = JSON.parse(JSON.stringify(st1));
+  busy.slots = [Object.assign({}, st1.slots[0] || {}, { idx: 0, job_id: 77, exit: 0, seed: 'U1,R2', cur_seed: 'U1,R2', phase: 'window',
+    state: 'running', frozen: false, retiring: false, pid: 4242, window_left: 12, stack_size: 1, nodes_done: 0, elapsed: 3, cur: null })];
+  run('render(' + JSON.stringify(busy) + ')');
+  const facts = byId.w0.children[0], top = facts.children[0], sets = top.sets;
+  assert.ok(/U1,R2/.test(top.innerHTML) && /window, 12 s left/.test(facts.children[1].textContent), 'card: ' + top.innerHTML + ' | ' + facts.children[1].textContent);
+  busy.slots[0].window_left = 11; busy.slots[0].elapsed = 4; busy.slots[0].nodes_done = 2;
+  run('render(' + JSON.stringify(busy) + ')');
+  assert.strictEqual(top.sets, sets, 'the seed block was rewritten for a tick');
+  assert.ok(/window, 11 s left/.test(facts.children[1].textContent) && /nodes done 2 · running 4 s/.test(facts.children[1].textContent),
+            'ticking numbers: ' + facts.children[1].textContent);
+  busy.slots[0].phase = 'absorb'; busy.slots[0].stack_size = 5;
+  run('render(' + JSON.stringify(busy) + ')');
+  assert.ok(/absorbing, 11 s left/.test(facts.children[1].textContent) && /still to probe 5/.test(facts.children[1].textContent), 'absorb: ' + facts.children[1].textContent);
   // completion: the banner says so and says the window can be closed
   run('render(' + JSON.stringify(st2) + ')');
   const b = byId.banner.innerHTML;
