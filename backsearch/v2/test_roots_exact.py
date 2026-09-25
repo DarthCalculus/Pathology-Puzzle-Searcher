@@ -11,19 +11,21 @@ shallow_best must be their best.  For each K this test:
 
   1. lists the layer with the campaign flags (the client's argv minus --seed-path / --split-after) and
      checks it as v2_seed will (server/lib/v2seed.js): a protocol-3 worker MUST print the LAYERINFO
-     header, with this k and grid, its own SRC_HASH, this exit's root count, and flags that describe the
-     search with bulk_walk 1 (the job tree's semantics); every LAYER line has exactly 6 fields (LAYER,
-     exit, path, depth, blocks, holes) and comes after the header, every root has depth == tokens >= K
-     (a root deeper than K must end in a run of walk tokens reaching back above the layer: a bulk
-     child) and respects the hole / block caps, no root repeats; shallow_best must equal the
-     monolithic run's best above the layer (depth < K);
+     header, with this k and grid, its own SRC_HASH, seed "" (listed from the exit root), this exit's
+     root count, and flags that describe the search with bulk_walk 1 (the job tree's semantics); every
+     LAYER line has exactly 6 fields (LAYER, exit, path, depth, blocks, holes) and comes after the
+     header, every root has depth == tokens >= K (a root deeper than K must end in a run of walk tokens
+     reaching back above the layer: a bulk child) and respects the hole / block caps, no root repeats;
+     shallow_best must equal the monolithic run's best above the layer (depth < K);
   2. runs every root to exhaustion in the client's argv (--jobs N at a time, BS_TRACE_VALID);
   3. compares the union with the monolithic run: LOST levels at depth >= K and EXTRA levels (a root
      found a level the monolithic run pruned) both fail, and so does a best depth that differs
      (max of the union's best and shallow_best).
-A worker may refuse a layer (PROTOCOL3's fallback: "refuse K >= 5"): a refusal (a non-zero exit code)
-is accepted for K >= 5 and fails for K <= 4.  Exit code 0 with no LAYER lines is not a refusal but an
-empty listing: every level at depth >= K is then lost.  An --only filter that selects nothing fails.
+The listing is exact at every K (the job-tree listing replaced PROTOCOL3's "refuse K >= 5" fallback),
+so a listing that fails -- any non-zero exit code: a refusal, path_overflow (4), or status error (5)
+from the worker's own replay / dedup-full / inconclusive-check guards -- fails the layer at every K.
+Exit code 0 with no LAYER lines is an empty listing: every level at depth >= K is then lost.  An
+--only filter that selects nothing fails.
 
   python3 test_roots_exact.py WORKER [--layers 2 4 6] [--timeout 120] [--jobs N] -- --grid 4x4 --exit 0 \\
           --allow-exit-transit --num-holes 3
@@ -71,9 +73,9 @@ SUITES['all'] = SUITES['quick'] + SUITES['campaign']
 
 
 def list_layer(worker, grid, exit_, flags, k, timeout):
-    """Run --list-layer k.  Returns (roots, layerinfo or None, refused message or None, errors).
-    roots are (exit, path, depth, blocks, holes).  Only a non-zero exit code is a refusal: exit code 0
-    with no LAYER lines is an EMPTY listing (every level at depth >= k is then lost), never a refusal.
+    """Run --list-layer k.  Returns (roots, layerinfo or None, failure message or None, errors).
+    roots are (exit, path, depth, blocks, holes).  A non-zero exit code is a failed listing (a FAIL at
+    every K); exit code 0 with no LAYER lines is an EMPTY listing (every level at depth >= k is then lost).
     errors: format problems v2_seed would reject (server/lib/v2seed.js parseLayerText)."""
     cmd = [worker.path, '--grid', grid, '--two-tables', '--exit', str(exit_), '--time', '0'] + flags + \
         ['--list-layer', str(k)]
@@ -198,6 +200,9 @@ def check_layer(worker, roots, info, grid, exit_, k, flags, errors=()):
         if want_hash and info.get('src_hash') != want_hash:
             raise Fail(f'LAYERINFO src_hash {str(info.get("src_hash"))[:16]!r} is not the worker\'s SRC_HASH '
                        f'{want_hash[:16]}')
+        if info.get('seed') != '':
+            # the listing starts at the exit root: a --seed-path listing (seed = its path) covers one subtree only
+            raise Fail(f'LAYERINFO seed {info.get("seed")!r}: a campaign listing starts at the exit root (seed "")')
         rmap = info.get('roots')
         if not isinstance(rmap, dict) or str(exit_) not in rmap:
             raise Fail(f'LAYERINFO roots {rmap!r} does not give exit {exit_}\'s root count')
@@ -303,12 +308,11 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
             f'valid levels, best {fbest}, {ref.summary.get("states")} states ({time.time() - t0:.1f}s)')
         for k in layers:
             t1 = time.time()
-            roots, info, refused, errors = list_layer(worker, grid, exit_, flags, k, timeout)
-            if refused:
-                if k >= 5:
-                    out(f'  layer {k}: refused ({refused}) -- allowed for K >= 5')
-                    continue
-                out(f'  layer {k}: FAIL refused for K <= 4 ({refused})')
+            roots, info, failed, errors = list_layer(worker, grid, exit_, flags, k, timeout)
+            if failed:
+                # no refusal allowance: the worker claims an exact listing at every K, so exit 2 / 4 / 5
+                # (a refusal, path_overflow, or its own replay / dedup / inconclusive-check guard) is a FAIL
+                out(f'  layer {k}: FAIL the listing failed ({failed})')
                 fails.append(f'{name}-K{k}')
                 continue
             problem, sb_depth = None, 0

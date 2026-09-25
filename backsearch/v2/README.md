@@ -74,9 +74,11 @@ node tools/v2_hashes.js remove <hash> --reissue   # after a correctness fix
 node tools/v2_finish.js [--publish]           # refuses any exit whose audit is not clean
 ```
 
-`roots.tsv` is the worker's `--list-layer K` output; for the 5x5 ≤3-hole
+`roots.tsv` is the WHOLE stdout of the release worker's `--list-layer K` run for
+the campaign's flags (one LAYERINFO header per exit, then its LAYER lines;
+PROTOCOL3 §2.4); v2_seed refuses a file without the headers. For the 5x5 ≤3-hole
 campaign the six exits' depth-4 layers are in `roots_h3/` (2,761 roots, see DESIGN §7.1;
-`roots_h3/layer4_all.tsv`). `plan.json` fields are listed at the top of
+`roots_h3/layer4_all.tsv`; listed before the header existed, so LAYER lines only). `plan.json` fields are listed at the top of
 `v2_seed.js`; the campaign parameters chosen in DESIGN.md §6 are the defaults.
 
 Audit anytime: `GET /api/v2/audit?exit=E` lists uncovered roots, jobs done

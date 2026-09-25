@@ -65,7 +65,26 @@ different hash and can never be whitelisted by accident). Every table-size macro
 - Root listing (`--list-layer K`, `--estimate`, `--estimate-dump`) uses exactly the job tree's
   semantics (bulk walk-back on), so the union of K-layer roots covers the whole tree for every K.
   It prints a header `LAYERINFO\t{"k":K,"grid":..,"flags":{..},"src_hash":..,"roots":{"<exit>":n}}`.
-  (Fallback only if the bulk-semantics listing cannot be made exact: refuse K >= 5.)
+  As implemented (worker 27443a8 on; the fallback "refuse K >= 5" is not used, the listing is exact
+  at every K):
+  - A root is a job-tree node of depth >= K whose tree parent is shallower. A bulk walk-back child
+    is one tree edge, so a root can be deeper than K; its depth equals its token count and its
+    tokens from K on are one walk run. Every node above the layer is expanded by the listing.
+  - One header per exit, before that exit's LAYER lines. Its full form:
+    `{"k":K,"grid":"RxC","flags":{as SUMMARY},"src_hash":"<hex>","protocol":3,"seed":"",
+    "roots":{"<exit>":n},"shallow_best":{"<exit>":{"depth":d,"code":".."} | null},
+    "above":{"<exit>":n},"root_depth":{"<exit>":[min,max]}}`. `k` is the absolute layer depth
+    (under `--seed-path P`, `--list-layer K` lists K below P and k = depth(P) + K); `seed` is the `--seed-path` the listing started from (`""` = the exit root; a campaign accepts
+    only `""`); `shallow_best` is the deepest valid level above the layer (depth < K, verified
+    like a LEVEL line; null = none), which no job reports; `above` = nodes expanded above the layer.
+  - Before printing, the listing replays every root's path as its job will and requires the very
+    same node (path, cells, blocks, holes, bulk_walk, walk history and segment, adjflags). A
+    mismatch, a full dedup table, or an inconclusive check above the layer ends the listing with
+    status `error` (exit 5); a path over path_tok_max exits 4. An exit's header and LAYER lines are
+    printed only after all of its checks pass (a failing listing must never be used: check the exit code).
+  - `--estimate` prints the same header and LAYER lines on stdout (so its stdout is a layer file)
+    and appends the header plus one row per root to the `--estimate-dump` file, in the same
+    (DFS) order.
 - `--split-after-nodes N`: split deterministically after N expansions (tests).
 - In protocol mode (`--status-every` given) the worker ignores `BS_DUMP_SEED` and the `BS_TRACE_*`
   variables unless `BS_ALLOW_DEBUG=1`.
@@ -129,8 +148,9 @@ different hash and can never be whitelisted by accident). Every table-size macro
   failures from at least 2 clients (or 5 in total) the job becomes `quarantined`; quarantined jobs
   block the audit and are listed in it.
 - Seeding: v2_seed requires the LAYERINFO header, checks its flags/hash against the plan, requires
-  exactly the listed number of roots per exit at depth K, validates before `--close-others`, and
-  stores `est_s` per root when the input is an `--estimate-dump` file.
+  `seed` "" and shallow_best < K, requires exactly the listed number of roots per exit, each with
+  depth == tokens >= K (a root deeper than K must end in one walk run from token K on), validates
+  before `--close-others`, and stores `est_s` per root when the input is an `--estimate-dump` file.
 - Scheduling: lease largest `est_s` first across exits (split children inherit
   parent est_s × their share, or fall back to depth); work stealing never steals a job granted or
   stolen within the holder's last 60 s or listed as running in its last heartbeat; a job is never

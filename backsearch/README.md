@@ -229,11 +229,14 @@ Three tools turn "run until the queue drains" into a plannable, resumable job:
 #    Use K >= 10 and >= 10 probes per layer node.
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 0 --estimate 1500000 --estimate-depth 10
 
-# 2. Split the exit into independent sub-jobs: the dedup'd depth-K layer as
-#    --seed-path strings.  Their subtrees plus the (depth < K) ancestors are
-#    the whole tree, so the union of exhaustive per-job runs is an exhaustive
-#    run (verified: 867 jobs reproduce the monolithic max depth and count).
-./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 0 --list-layer 8 | grep -c LAYER
+# 2. Split the exit into independent sub-jobs: the depth-K root layer of the
+#    job tree as --seed-path strings (a root is a node of depth >= K whose
+#    parent is shallower; a bulk walk-back child can be a root deeper than K).
+#    Their subtrees plus the (depth < K) nodes above them are the whole tree, so
+#    the union of exhaustive per-job runs is an exhaustive run; the best level
+#    above the layer is the LAYERINFO header's shallow_best (one header per exit,
+#    v2/PROTOCOL3.md §2.4).  Exact at every K (v2/test_roots_exact.py).
+./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 0 --list-layer 8 | grep -c '^LAYER[[:space:]]'
 
 # 3. Run them: resumable, parallel, records every job in DIR/done.tsv, keeps the
 #    full worker output of deep finds, --status for progress.  Use the no-torch
@@ -247,7 +250,7 @@ bash status.sh                          # everything at a glance
 
 The DFS tree is extremely unbalanced (a handful of depth-7 subtrees hold most of
 an exit's work), so `--split-after SEC` kills any job still running after SEC
-seconds and replaces it with its depth+3 children (`--seed-path P --list-layer 3`);
+seconds and replaces it with its roots 3 below it (`--seed-path P --list-layer 3`);
 the parent is recorded as `split` in done.tsv and the children are appended to
 jobs.tsv, so resuming still works.  Waste is at most SEC per split.
 

@@ -194,6 +194,9 @@ static int    g_probe_n         = 0;
 #ifndef PROBE_BUF_MAX
 #define PROBE_BUF_MAX (MAX_NCELLS + 16)
 #endif
+#if PROBE_BUF_MAX < 1 || PROBE_BUF_MAX > 256
+#error "PROBE_BUF_MAX must be 1..256: the root listing's DFS-order key stores 255 - rank in one byte (lv_push)"
+#endif
 static int8_t g_emit_D = -1, g_emit_V = -1; /* set by expand() before each try_successor() */
 static int    g_emit_walk_committed = 0;
 /* Bulk walk-back generation (--no-bulk-walk to disable).  For a state whose

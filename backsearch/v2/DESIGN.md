@@ -221,8 +221,16 @@ the server should also re-check leases on every heartbeat, not only on wake.
 ## 6. Parameters for the 5x5 ≤3 holes campaign
 
 grid 5x5; extra `--allow-exit-transit --num-holes 3`; exits 0,1,2,6,7,12;
-layer 8; max_clients 40; workers_max 32; job_target 20 min; split_after 1800 s;
-lease 3600 s; paused_max 12 h; dup_fraction 0.02.
+layer 4 (as seeded: 2,761 roots in `roots_h3/`; §7 rule 1: seed shallow); max_clients 40;
+workers_max 32; job_target 20 min; split_after 1800 s; lease 3600 s; paused_max 12 h;
+dup_fraction 0.02.
+
+(This section first said layer 8. Until 2026-09-24 `--list-layer` cut the tree with bulk
+walk-back off, and at K >= 5 its roots lost subtrees; campaign #1 used layer 4, which that
+defect did not affect. The listing now cuts the job tree and is exact at every K: a root is a
+job-tree node of depth >= K whose parent is shallower (a bulk walk-back child can be a root
+deeper than K), and the header's shallow_best covers the levels above the layer; PROTOCOL3 §2.4.
+For campaign #2 (6x6, 0 holes, exits 0,1,2,7,8,14) the layer-4 listing has 1,368 roots.)
 
 ## 7. Load rules (added 2026-09-23 after the load analysis; these override §3/§4 where they differ)
 
