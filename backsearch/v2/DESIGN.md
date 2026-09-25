@@ -211,13 +211,17 @@ python3 volunteer.py --name "Your name" [--workers N] [--server URL] [--port 876
    `JOBS_DATA_DIR`, `RECORDS_DATA_DIR`; no backups), the real worker, two real clients with one worker
    each. The campaign is an allowlisted protocol-3 plan with every canonical exit, seeded by `v2_seed.js`
    from the worker's own `--list-layer` output; splits are deterministic (`split_after_nodes`), lease
-   10 s, heartbeat 5 s, 1-s windows, `dup_fraction` 0.1. Scenario, each step waiting for its condition:
-   client A is SIGKILLed while its worker runs and it holds leases, and restarted; client B gets SIGINT
+   10 s, heartbeat 5 s, 1-s windows, `dup_fraction` 0.2. Scenario, each step waiting for its condition:
+   client A is SIGKILLed while its worker runs and it holds leases, and restarted (before the restart the
+   test plants a SIGSTOPped orphan, A's own pinned worker on a real search, in the pidfile A left: a real
+   orphan dies by itself of the broken pipe, so this is the survivor the startup cleanup exists for; the
+   restarted A must SIGKILL it and log it); client B gets SIGINT
    in the middle of a window (it must hand the window back, exit 0 and hold no lease), and restarted;
    the server is stopped with SIGTERM while work remains (exit 0), left down 3 s (both clients must
    notice) and restarted; both clients must then exit by themselves with code 0 when the campaign is
    complete. Asserts: campaign complete; a FRESH audit of every exit clean and exact (no mismatch,
-   quarantine or pending dup); at least one split and one compared dup; no failure report, no rejected
+   quarantine or pending dup); at least one split and one really compared dup (a `done:match` report of
+   a dup job; split or incomparable dups compare nothing) and no mismatch report; no failure report, no rejected
    report, empty outboxes; every exit's best equals the monolithic run's; the union of the valid levels
    traced by the runs behind ACCEPTED done/split nodes (tied through the client's development run log,
    `VOLUNTEER_RUN_LOG`) equals the monolithic run's canonical set at depth >= K per exit, nothing lost

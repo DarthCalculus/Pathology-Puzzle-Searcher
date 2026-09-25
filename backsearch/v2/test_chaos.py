@@ -15,7 +15,9 @@ Setup
     seeded with the server's tools/v2_seed.js into a temp jobs.db;
   - splitting is deterministic: the campaign sets split_after_nodes (the client passes
     --split-after-nodes to every run), so every root larger than N expansions splits;
-  - lease 10 s, heartbeat 5 s, 1-s windows, a 1-s absorption budget, dup_fraction 0.1;
+  - lease 10 s, heartbeat 5 s, 1-s windows, a 1-s absorption budget, dup_fraction 0.2 (only a leased job
+    that ends 'done' as a whole can be re-issued, about 40-70 per run: 0.2 makes a run with no compared
+    duplicate a 1e-5 event; at 0.1 runs had 2 to 7);
   - two clients (1 worker each, their own HOME, outbox and name); the worker's BS_TRACE_VALID
     reaches the runs (VOLUNTEER_ALLOW_DIRTY=1 BS_ALLOW_DEBUG=1) and the client's development run log
     (VOLUNTEER_RUN_LOG) records pid, job, seed and outcome of every run;
@@ -25,7 +27,11 @@ Setup
 
 Scenario (every step waits for its condition; the test fails if a condition never comes)
   1. client A is SIGKILLed while its worker runs and it holds at least one lease; restarted 1 s later
-     (same outbox and token: its orphaned workers are cleaned up, its lapsed leases come back);
+     (same outbox and token: its lapsed leases come back). Before the restart the test plants a stopped
+     orphan (A's own pinned worker binary on a real search, SIGSTOPped, added to the pidfile A left):
+     a real orphan dies by itself (broken pipe, or SIGHUP of its orphaned process group when paused), so
+     this is the survivor the startup cleanup (M14) exists for; the restarted A must SIGKILL it (and any
+     real orphan still alive) and log it;
   2. client B gets SIGINT while its worker runs a leased job: it must hand back its window (a report
      after 'stopping:'), exit 0 and hold no lease afterwards; restarted;
   3. the server is stopped with SIGTERM (it must exit 0) while work remains, left down 3 s (the
@@ -34,8 +40,9 @@ Scenario (every step waits for its condition; the test fails if a condition neve
 
 Assertions afterwards
   - the campaign is 'complete'; a FRESH audit of every exit is clean and exact (M90), with no
-    mismatch, no quarantined job, no pending duplicate; at least one duplicate was compared; no
-    failure report was filed; at least one job split;
+    mismatch, no quarantined job, no pending duplicate; at least one duplicate's fingerprint was
+    really compared (a 'done:match' report of a dup job; a split or incomparable dup does not count)
+    and no report came back 'mismatch'; no failure report was filed; at least one job split;
   - every exit's best equals the monolithic run's best (shallow best included), and champion levels
     the site solver checked agree with their depth;
   - M91: the union of the valid levels traced by ACCEPTED runs only (every done or split node of the
@@ -190,6 +197,7 @@ class Chaos:
             if p.poll() is None:
                 try:
                     p.send_signal(signal.SIGTERM)
+                    p.send_signal(signal.SIGCONT)     # a stopped process (the planted orphan) must see it
                 except OSError:
                     pass
         end = time.time() + 10
@@ -314,7 +322,7 @@ class Chaos:
         # the campaign
         plan = {'title': 'chaos %s' % a.config, 'grid': grid, 'extra': extra, 'layer': K, 'hashes': [self.hash],
                 'max_clients': 10, 'workers_max': 4, 'job_target_s': 1, 'split_after_s': 1, 'ramp_split_after_s': 1,
-                'lease_s': 10, 'paused_max_s': 20, 'dup_fraction': 0 if a.e2e else 0.1, 'fail_regrant_s': 5,
+                'lease_s': 10, 'paused_max_s': 20, 'dup_fraction': 0 if a.e2e else 0.2, 'fail_regrant_s': 5,
                 'absorb_probe_s': 1, 'absorb_total_s': 1, 'batch_interval_s': 1, 'lease_ahead_s': 2, 'heartbeat_s': 5,
                 'split_after_nodes': cfg['nodes'], 'release': 'v-chaos'}
         pf = os.path.join(self.T, 'plan.json')
@@ -348,7 +356,10 @@ class Chaos:
         say('1. SIGKILLed client A at %.1f s holding leases %s, worker pid(s) %s' % (time.time() - t0, held, wpids))
         time.sleep(1.0)
         self.orphans_left = self.worker_pids('A')
+        planted = self.plant_orphan('A')
+        mark_a = len(self.client_log('A'))
         self.start_client('A')
+        self.check_orphans('A', planted, mark_a)
         # 2. SIGINT B while its worker runs a leased job
         def b_busy():
             tok = self.token('B')
@@ -426,6 +437,54 @@ class Chaos:
         except (OSError, ValueError):
             self.status = None
         self.stop_server()
+
+    def plant_orphan(self, name):
+        """A real worker from a dead client run that is still alive when the client comes back (M14): a
+        running orphan dies by itself of the broken pipe and a paused one of the orphaned process group's
+        SIGHUP, so the survivor the startup cleanup exists for is made here: the client's own pinned binary,
+        started on a real search, SIGSTOPped at once and added to the pidfile the killed client left behind.
+        The restarted client must kill it before it pins its binary again (check_orphans)."""
+        pf = os.path.join(self.T, 'outbox_' + name, '.workers.pid')
+        try:
+            d = json.load(open(pf))
+        except (OSError, ValueError) as e:
+            raise Fail('client %s left no readable pidfile %s after SIGKILL: %s' % (name, pf, e))
+        binp = d.get('bin') if isinstance(d, dict) else None
+        if not binp or not os.path.isfile(binp) or not binp.startswith(os.path.join(self.T, 'outbox_' + name) + '/'):
+            raise Fail("client %s's pidfile names no pinned worker in its outbox: %r" % (name, d))
+        p = subprocess.Popen([binp, '--grid', self.cfg['grid'], '--two-tables', '--time', '0'] + self.cfg['extra']
+                             + ['--exit', str(self.exits[0])], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=self.worker_env(), start_new_session=True)
+        os.kill(p.pid, signal.SIGSTOP)
+        self.procs.append(p)
+        d['workers'] = list(d.get('workers') or []) + [p.pid]
+        tmp = pf + '.chaos'
+        json.dump(d, open(tmp, 'w'))
+        os.replace(tmp, pf)
+        say('   planted a stopped orphan worker pid %d (%s) in the pidfile of %s' % (p.pid, os.path.basename(binp), name))
+        return p
+
+    def check_orphans(self, name, planted, mark):
+        """The restarted client killed every worker of its dead predecessor still alive: the planted one and
+        any real orphan (review T2: the chaos run itself exercises the startup cleanup)."""
+        def gone():
+            if planted.poll() is None:
+                return None
+            live = set(self.orphans_left) & set(self.worker_pids(name))   # still running A's pinned binary
+            return None if live else True
+        self.wait_until('restarted client %s killing the orphaned workers of its dead run' % name, gone, 30)
+        text = self.client_log(name)[mark:]
+        m = re.search(r'killed (\d+) worker\(s\) left behind by an earlier client run: \[([0-9, ]*)\]', text)
+        killed = [int(x) for x in m.group(2).split(',') if x.strip()] if m else []
+        self.orphan_cleanup = {'planted': planted.pid, 'rc': planted.returncode, 'killed_logged': killed,
+                               'real_orphans': self.orphans_left}
+        say('   restarted %s killed the orphans %s (planted pid %d ended with %s)'
+            % (name, killed or 'none logged', planted.pid, planted.returncode))
+        if planted.pid not in killed:
+            raise Fail('restarted client %s did not log killing the planted orphan %d; its log after restart:\n%s'
+                       % (name, planted.pid, text[-1500:]))
+        if planted.returncode != -signal.SIGKILL:
+            raise Fail('the planted orphan ended with %s, not SIGKILL from the client' % planted.returncode)
 
     def scenario_e2e(self, t0):
         """--e2e: one client, no disruption; it must work the whole campaign and exit by itself (code 0)
@@ -505,11 +564,20 @@ class Chaos:
         by_status = collections.Counter((r[3], r[7] is not None) for r in rows)
         self.info['jobs'] = {('dup ' if d else '') + s: n for (s, d), n in sorted(by_status.items())}
         splits = sum(n for (s, d), n in by_status.items() if s == 'split' and not d)
-        dups_done = sum(n for (s, d), n in by_status.items() if d and s in ('done', 'split'))
         if splits < 1:
             P.append('no job split: the split path was not exercised')
-        if dups_done < 1 and not self.a.e2e:       # one client: a dup never goes back to its original's client (M32)
-            P.append('no duplicate was re-run and compared (dup_fraction 0.1)')
+        # duplicates: the server compares fingerprints only when the dup and its original both ended 'done'
+        # with the same src_hash (report outcome 'done:match' / 'done:mismatch'); a split or otherwise
+        # incomparable dup ('...:incomparable') compared nothing, so only real comparisons count (T2 review)
+        dup_out = dict(self.q('SELECT r.outcome, COUNT(*) FROM reports r JOIN jobs j ON j.id = r.job_id '
+                              'WHERE j.dup_of IS NOT NULL GROUP BY r.outcome'))
+        self.info['dup_reports'] = dup_out or 'none'
+        compared = dup_out.get('done:match', 0)
+        if compared < 1 and not self.a.e2e:       # one client: a dup never goes back to its original's client (M32)
+            P.append('no duplicate was re-run and compared (no done:match report; dup reports %s)' % (dup_out or 'none'))
+        bad_out = self.q("SELECT job_id, outcome FROM reports WHERE outcome LIKE '%mismatch%'")
+        if bad_out:
+            P.append('fingerprint mismatch reports: %s' % bad_out[:10])
         mism = [r[0] for r in rows if r[8]]
         if mism:
             P.append('fingerprint mismatches on jobs %s' % mism[:10])
@@ -628,7 +696,7 @@ class Chaos:
         elif not os.path.exists(os.path.join(self.T, 'records', 'records.db')) and hasattr(self, 'wall'):
             self.problems.append('M96: the test server did not create its own records.db (RECORDS_DATA_DIR ignored?)')
             ok = False
-        for k in ('killA', 'intB', 'restart'):
+        for k in ('killA', 'orphan_cleanup', 'intB', 'restart'):
             if hasattr(self, k):
                 say('%s: %s' % (k, getattr(self, k)))
         if getattr(self, 'orphans_left', None) is not None:

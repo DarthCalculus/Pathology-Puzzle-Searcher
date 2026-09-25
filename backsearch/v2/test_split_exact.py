@@ -208,13 +208,16 @@ def client_argv(worker, grid, exit_, seed, split_after, extra):
 
 def check_client_argv():
     """Compare client_argv with volunteer.py's own worker_argv (review M88 (a)).  Returns a note; raises
-    Fail if they differ."""
+    Fail if they differ OR if the comparison cannot be made (volunteer.py not importable, worker_argv
+    missing or raising on the Fake below): a skipped cross-check once went unnoticed for a whole client
+    release (3.1.0 added split_after_nodes()), so it is never skipped silently (T2 review)."""
     global STATUS_EVERY_MS
     sys.path.insert(0, HERE)
     try:
         import volunteer
-    except Exception as e:                      # the client is owned elsewhere; do not fail on import
-        return f'volunteer.py not importable ({type(e).__name__}: {e}); argv not cross-checked'
+    except Exception as e:
+        raise Fail(f'volunteer.py is not importable ({type(e).__name__}: {e}): the harness argv cannot be '
+                   'cross-checked against the client')
     finally:
         sys.path.pop(0)
     STATUS_EVERY_MS = getattr(volunteer, 'STATUS_EVERY_MS', STATUS_EVERY_MS)
@@ -247,12 +250,14 @@ def check_client_argv():
         return out
     fn = getattr(getattr(volunteer, 'Volunteer', None), 'worker_argv', None)
     if fn is None:
-        return 'volunteer.Volunteer.worker_argv not found; argv not cross-checked'
+        raise Fail('volunteer.Volunteer.worker_argv not found: the harness argv cannot be cross-checked; '
+                   'update check_client_argv() in test_split_exact.py')
     for seed in ('U1,L2', ''):
         try:
             theirs = fn(Fake(), {'exit': 0, 'id': 1, 'seed': seed}, seed, 1.5)
         except Exception as e:
-            return f'volunteer.worker_argv raised {type(e).__name__}: {e}; argv not cross-checked'
+            raise Fail(f'volunteer.worker_argv raised {type(e).__name__}: {e} on the harness stand-in: give the '
+                       'Fake in check_client_argv() (test_split_exact.py) what the client now reads')
         mine = client_argv('W', '4x4', 0, seed, 1.5, flags)
         if norm(theirs) != norm(mine):
             raise Fail(f'the harness argv no longer matches the client:\n  client  {theirs}\n  harness {mine}\n'
