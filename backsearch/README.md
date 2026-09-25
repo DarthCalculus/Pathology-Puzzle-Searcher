@@ -27,45 +27,94 @@ GCC (`-fprofile-generate/-use`); pick the compiler with `CC=gcc-13 ./build_pgo.s
 Linux needs zlib headers (`apt install build-essential zlib1g-dev`, plus `llvm`
 if you use clang, otherwise the script falls back to a plain `-O3` build).
 
-**Recommended — profile-guided build** (the forward solver is ~90% of runtime and PGO is worth 10–20% on top of `-O3`; links libtorch automatically if `import torch` works, otherwise a no-op NN stub):
+**Release build** (what volunteers and the collective search run; the campaign whitelists the
+source hash it embeds):
 
 ```bash
 cd backsearch
-./build_pgo.sh                      # -> ./backsearch_worker
-./build_pgo.sh -o worker_test --no-torch
+./build_pgo.sh -o backsearch_worker_nt --no-torch   # profile-guided, portable, SRC_HASH embedded
+./backsearch_worker_nt --version                    # SRC_HASH, GIT_SHA, PROTOCOL 3, LIMITS, KNOBS
+./build_pgo.sh --print-hash                         # the hash the current sources give, without building
 ```
 
-Plain build, any C11 compiler (clang or gcc), no PGO:
+- The profile comes from two campaign-shaped training runs (a 5x5 ≤3-hole layer-4 root and a
+  6x6 0-hole wide subtree, protocol mode, a few seconds each); the build fails if a run fails or
+  the profile misses the hot solver instances. PGO is worth 0-3 % over plain `-O3` with this
+  training (a cold wide-solver instance once cost 27 %). `--train "ARGS"` / `--train2 "ARGS"`
+  replace the training runs; `NATIVE=1` adds `-mcpu=native` / `-march=native` (this machine only).
+- Without `--no-torch` the script links libtorch when `import torch` works (the NN hooks are
+  experimental; campaigns never use them). `./build_pgo.sh` alone writes `./backsearch_worker`.
+- SRC_HASH = sha256 of `backsearch.c` + `sokoban_bfs.c` + `sokoban_bfs.h`. **Knob builds** for
+  tests, `KNOBS="-DSHALLOW_LG2=24 -DRECENT_LG2=24" ./build_pgo.sh -o /tmp/worker_big`, fold the
+  sorted `-D` overrides into the hash, so they can never be whitelisted by accident; `--version`
+  prints the effective values in its KNOBS line. Compiler flags smuggled in through `CC` are refused.
+
+Plain build, any C11 compiler (clang or gcc), no PGO. For the collective search it must embed the
+source hash, or the client refuses the binary:
 
 ```bash
-cc -O3 -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
+cc -O3 -DSRC_HASH_STR="\"$(./build_pgo.sh --print-hash)\"" -o backsearch_worker_nt backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ```
+
+**The v2 protocol flags** (the collective search; the contract is [v2/DESIGN.md](v2/DESIGN.md) §2):
+
+| flag | what |
+|---|---|
+| `--seed-path P` | search only the subtree of the node with this path (≤ 1024 tokens; one that does not replay ends with status `bad_seed`, exit 3) |
+| `--split-after S` / `--split-after-nodes N` | stop after S seconds / N expansions (and on SIGINT/SIGTERM) and print the exact remaining work as `REMAINING` seed paths |
+| `--status-every MS` | stream `STATUS` lines; turns on protocol mode (the `BS_*` debug variables are ignored unless `BS_ALLOW_DEBUG=1`) |
+| `--version` | `SRC_HASH`, `GIT_SHA`, `PROTOCOL`, `LIMITS`, `KNOBS` |
+| `--list-layer K` | the job tree's root layer: a `LAYERINFO` header per exit, then one `LAYER` line per root (a root is a node of depth ≥ K whose parent is shallower); exact at every K |
+| `--estimate N --estimate-depth K [--estimate-dump F]` | the same roots plus a Knuth estimate of the tree below them; the dump file gets one row per root with its estimated seconds |
+| `--min-walls N` | the same as `--num-walls N` |
+| `--solver-profile` | per-depth and per-width solver statistics, table growths |
+
+Every run ends with the protocol lines `LEVEL`, `UNRESOLVED` (candidates whose shortcut check hit
+a capacity limit: explored, never counted as valid) and `SUMMARY` (JSON, including `status`,
+`states`, `accepted`, `valid`, `best`, `verify`, `unknown*`, `cpu_s`, `max_rss_mb` and `flags`).
+Statuses and exit codes: `exhausted`/`split` 0, `bad_seed` 3, `path_overflow` 4, `error` 5,
+`unknown_chain` 6.
 
 **Solver regression / benchmark:** `solvebench.c` replays every forward-solver call recorded in a `--harvest` file and checks each answer against the recorded one (exit status 3 on any mismatch). Build and usage are in its header comment. Use it before and after any change to `sokoban_bfs.c`.
 
-**End-to-end equivalence checks.** The DFS is deterministic, so an exact change must reproduce the number of *accepted* states and the best depth (the worker prints `accepted:`).  `states checked` / `solver calls` may drop when a new prune fires before the solver (the shortest-walk-segment prune in `expand()` does that); `elapsed` may change.
+**End-to-end equivalence checks.** The DFS is deterministic, so an exact change must reproduce
+`states`, `accepted`, `valid`, `best` and `verify` of SUMMARY on every config below; a change in
+any other count (`solver_calls`, the eviction counts) must be explained precisely. `solver_calls`
+drops when a new prune decides states before the solver (the shortest-walk-segment prune, the
+dead-end skip, a multi-start solve replacing single checks); `elapsed` changes. Current values,
+from the release candidate (SRC_HASH c3ee5d2b…, 2026-09-25); every config passes `--time 0`:
 
-```bash
-# shallow, ~3 s:   accepted 1289049, best depth 16
-./backsearch_worker --grid 4x5 --exit 0 --max-depth 16 --time 20
-# deep, ~15 s:     accepted 2362998, best depth 94   (1 eviction per table; was 2362700 before the 2026-09-18 solver changes)
-./backsearch_worker --grid 5x5 --two-tables --exit 0 --num-holes 1 --num-blocks 3 --time 55
-# no-transit exit 7, ~9 s:            accepted 2877948,  best depth 43
-./backsearch_worker --grid 5x5 --two-tables --exit 7 --time 55
-# REAL RULES (transit), ~40 s:         accepted 2189699 (2292601 with --no-exit-block-prune), valid levels 473037, best depth 58
-./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 7 --num-blocks 3 --time 55
-# REAL RULES, ~1 min, needs -DSHALLOW_LG2=24 -DRECENT_LG2=24 for zero evictions: accepted 4583712 (5279939 with --no-exit-block-prune), valid levels 584050, best depth 58
-./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 12 --num-blocks 4 --time 0
-```
+| config | args | states | accepted | valid | best | verify | evict s/r | solver_calls | s |
+|---|---|---|---|---|---|---|---|---|---|
+| eq1 | `--grid 4x5 --exit 0 --max-depth 16` | 3,293,164 | 1,289,049 | 1,289,049 | 16 | 16 | 0/0 | 2,014,051 | 2 |
+| eq2 | `--grid 5x5 --two-tables --exit 0 --num-holes 1 --num-blocks 3` | 4,360,612 | 2,362,998 | 2,362,998 | 94 | 94 | 1/1 | 2,507,815 | 10 |
+| eq3 | `--grid 5x5 --two-tables --exit 7` (no transit) | 6,984,746 | 2,877,948 | 2,877,948 | 43 | 43 | 3/3 | 6,118,873 | 7 |
+| eq4 | `--grid 5x5 --two-tables --allow-exit-transit --exit 7 --num-blocks 3` | 3,568,433 | 2,189,699 | 473,037 | 58 | 58 | 1/1 | 2,349,208 | 3 |
+| eq6 | `--grid 6x6 --allow-exit-transit --num-holes 0 --exit 0 --num-blocks 4 --max-depth 40` | 21,193,053 | 9,404,861 | 9,404,861 | 40 | 40 | 13/11 | 16,005,966 | 26 |
+| eq5b | `--grid 6x6 --allow-exit-transit --num-holes 0 --exit 14 --seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R1` | 116,227 | 56,740 | 309 | 56 | 56 | 0/0 | 64,193 | 4 |
+| eq8 | as eq5b with `--seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R2,D1,R1,L2,U1,U1` | 71,255 | 30,258 | 976 | 48 | 48 | 0/0 | 37,256 | 10 |
+| eq9 | as eq5b with `--seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R2,R2` | 19,495 | 6,146 | 0 | 0 | -1 | 0/0 | 11,358 | 1 |
 
-The accepted count is a strict invariant only when the dedup tables never evict
-(`evicts 0 / 0` in the stats).  With evictions, two exact builds can differ by a
-few hundredths of a percent because a prune that fires before the dedup insert
-changes table contents and hence how much redundant re-exploration the two-table
-scheme does; the best depth still has to match.  Check a transit config as well
-as the no-transit ones — the walk-segment prune's first version passed all three
-no-transit configs and failed under transit (a hand-built transit root left its
-segment anchor unset).
+- eq5b, eq8 and eq9 are 6x6 0-hole subtrees whose checks are mostly wider than 64 bits (the
+  16-byte solver instance); eq4 is the real rules (transit) on 5x5; eq6 evicts.
+- The same states/accepted/valid/best/verify came from the pre-protocol-3 worker (SRC_HASH
+  6c531ee6…). Since then `solver_calls` dropped (eq4 2,782,913 → 2,349,208; eq5b 104,674 → 64,193:
+  dead-end children decided without a check, wide bulk batches in one multi-start solve), and eq6's
+  shallow evictions went 16 → 13 (the M42 eviction progress guarantee keeps less of the threshold
+  bucket; the first 6 evictions are identical, the 7th differs).
+- A longer config (about a minute, last measured 2026-09-22 before protocol 3): `--grid 5x5
+  --two-tables --allow-exit-transit --exit 12 --num-blocks 4` gave accepted 4,583,712 (5,279,939
+  with `--no-exit-block-prune`), valid levels 584,050, best 58 on a build with
+  `-DSHALLOW_LG2=24 -DRECENT_LG2=24` (zero evictions; today a `KNOBS=` build).
+
+States and accepted are strict invariants only while the insert sequence into the dedup tables is
+unchanged: a new prune that fires before the dedup insert changes the table contents, and on an
+evicting config that changes how much redundant re-exploration the two-table scheme does (by a few
+hundredths of a percent); valid and the best depth still have to match. Check a transit config as
+well as the no-transit ones — the walk-segment prune's first version passed all three no-transit
+configs and failed under transit (a hand-built transit root left its segment anchor unset). The v2
+tests (`v2/test_split_exact.py`, `v2/test_roots_exact.py`, `v2/test_oracle.py`; [v2/README.md](v2/README.md))
+check the level sets themselves.
 
 **Bulk walk-back generation (default on; `--no-bulk-walk` to disable).** Every
 walk-back descendant of a state that stays on already-committed cells shares the
@@ -225,7 +274,7 @@ Three tools turn "run until the queue drains" into a plannable, resumable job:
 #    (with dedup), then ~N probes through expand()/try_successor() with dedup
 #    off.  Prints estimated nodes, states checked, wall time, a depth profile
 #    and the heaviest layer nodes.  Runs LOW (deep corridors are under-sampled):
-#    actual/estimate was 1x-4x on the runs checked so far — a lower bound.
+#    actual/estimate was 1x-13x on the runs checked so far — a lower bound.
 #    Use K >= 10 and >= 10 probes per layer node.
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 0 --estimate 1500000 --estimate-depth 10
 
@@ -235,7 +284,11 @@ Three tools turn "run until the queue drains" into a plannable, resumable job:
 #    Their subtrees plus the (depth < K) nodes above them are the whole tree, so
 #    the union of exhaustive per-job runs is an exhaustive run; the best level
 #    above the layer is the LAYERINFO header's shallow_best (one header per exit,
-#    v2/PROTOCOL3.md §2.4).  Exact at every K (v2/test_roots_exact.py).
+#    v2/DESIGN.md §2.8).  Exact at every K (v2/test_roots_exact.py) with a
+#    worker from project45 27443a8 on; older workers listed with bulk walk-back
+#    off and lost subtrees at K >= 5, so never use their deep layers.
+#    campaign.py reads only the LAYER lines (not shallow_best), which matters
+#    only if an exit's maximum is shallower than K.
 ./backsearch_worker --grid 5x5 --two-tables --allow-exit-transit --exit 0 --list-layer 8 | grep -c '^LAYER[[:space:]]'
 
 # 3. Run them: resumable, parallel, records every job in DIR/done.tsv, keeps the
@@ -295,7 +348,7 @@ and champion submissions.  Note the site's submit limit is 60/hour.
 For a debug build with symbols:
 
 ```bash
-cc -O0 -g -DGIT_SHA_STR=\"$SHA\" -o backsearch_dbg backsearch.c sokoban_bfs.c -lz
+cc -O0 -g -DGIT_SHA_STR=\"$SHA\" -o backsearch_dbg backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ```
 
 ### Windows
@@ -307,7 +360,7 @@ Three options, easiest to hardest:
 ```bash
 sudo apt install build-essential python3       # one-time setup
 cd backsearch
-cc -O3 -o backsearch_worker backsearch.c sokoban_bfs.c -lz
+cc -O3 -o backsearch_worker backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ./backsearch --grid 5x5 --time 60
 ```
 
@@ -318,7 +371,7 @@ The wrapper, Python filter, and FIFO-based merging all work transparently inside
 ```bash
 # In an MSYS2 shell (after installing mingw-w64-x86_64-gcc):
 cd backsearch
-gcc -O3 -o backsearch_worker.exe backsearch.c sokoban_bfs.c -lz
+gcc -O3 -o backsearch_worker.exe backsearch.c sokoban_bfs.c nn_stub.c -lz -lm
 ./backsearch --grid 5x5 --time 60
 ```
 
@@ -328,7 +381,7 @@ The wrapper script will resolve `backsearch_worker.exe` if you rename it (or jus
 
 ```bash
 # macOS: brew install mingw-w64
-x86_64-w64-mingw32-gcc -O3 -o backsearch_worker.exe backsearch.c sokoban_bfs.c -lz   # add -static if linking zlib statically
+x86_64-w64-mingw32-gcc -O3 -o backsearch_worker.exe backsearch.c sokoban_bfs.c nn_stub.c -lz -lm   # add -static if linking zlib statically
 ```
 
 You get a Windows `.exe`, but you'll still need MSYS2 or Git Bash on the target machine to run the wrapper script.

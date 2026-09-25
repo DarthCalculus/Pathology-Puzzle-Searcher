@@ -56,12 +56,18 @@ Cells are blank where holes exceed blocks (equivalent to the row's "any" cell) a
 | 4 | 56 | 106 | 119 | 127 | 127 | | 127 |
 | 5 | 67 | 113 | 121 | 127 | ? | ? | ? |
 | 6 | 69 | 122 | 124 | ? | ? | ? | ? |
-| 7 | 69 | 122 | 149 | ? | ? | ? | ? |
-| 8 | 69 | 122 | 149 | ? | ? | ? | ? |
-| any | 69 | 122 | 149 | ? | ? | ? | ? |
+| 7 | 69 | 122 | 149 | 149 | ? | ? | ? |
+| 8 | 69 | 122 | 149 | 149 | ? | ? | ? |
+| any | 69 | 122 | 149 | 149 | ? | ? | ? |
 
 The 149 is davidspencer6174's *Capital C* (7 blocks, 2 holes); it is proven
-longest among all 5x5 levels with at most 2 holes.  4x5 is fully enumerated
+longest among all 5x5 levels with at most 2 holes, and, by the first collective
+campaign (September 2026: 597 CPU-hours from volunteers, published under
+"Collective"), among all 5x5 levels with at most 3 holes (per exit 127, 149, 112,
+138, 115 and 80; the 3-hole column's 149s for 7 and 8 blocks follow from it).
+The second campaign, 6x6 with no holes (best known 165 moves), is running: see
+[`backsearch/VOLUNTEERS.md`](backsearch/VOLUNTEERS.md) to help, and
+[`backsearch/v2/DESIGN.md`](backsearch/v2/DESIGN.md) for how it works.  4x5 is fully enumerated
 (70).  Per-exit proofs, states searched and CPU time for each entry are listed on
 the site's Proofs page; the raw campaign records are in `backsearch/results/`.
 
@@ -79,7 +85,9 @@ cd backsearch
 ./backsearch_worker_nt --grid 5x5 --two-tables --allow-exit-transit \
     --exit 1 --num-holes 3 --estimate 1500000 --estimate-depth 10
 
-# split an exit into resumable jobs and run them in parallel
+# split an exit into resumable jobs and run them in parallel (the depth-K root
+# listing is exact at every K with a worker from commit 27443a8 on; older
+# workers lost subtrees at K >= 5 -- see backsearch/README.md)
 python3 campaign.py --out results/camp_b6h2 --exits 0,1,2,6,7,12 \
     --extra "--num-blocks 6 --num-holes 2" --layer 8 --workers 2 \
     --worker ./backsearch_worker_nt --shuffle

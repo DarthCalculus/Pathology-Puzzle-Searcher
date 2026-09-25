@@ -49,7 +49,7 @@ python3 v2/volunteer.py --name "Your name" --workers 4
   no job waits on your machine that someone else could run. Each window takes the
   length the server sets when it starts (shorter near the end of a campaign).
 * Laptop sleep is fine: on wake the client checks which jobs it still holds.
-* If the server is unreachable, finished reports queue in `volunteer_outbox/`
+* If the server is unreachable, finished reports queue in `v2/volunteer_outbox/`
   and are delivered later; work continues on the jobs already leased.
 * When the worker code changes you will be told to run
   `git pull && ./build_pgo.sh -o backsearch_worker_nt --no-torch` in the
@@ -65,34 +65,70 @@ python3 v2/volunteer.py --name "Your name" --workers 4
 
 ## Owners
 
-Seed a campaign (on the server, in `PathologyRecords/server`):
+The `node tools/...` commands run on the server, in `PathologyRecords/server` (the full
+recipe, backups and deploys are in `server/ops/README.md` there); the root listing runs with the
+worker, in `backsearch/`. Proofs from a campaign are attributed "Collective"; the owner's own
+proofs "Panacea".
+
+List the roots with the release worker (built by `./build_pgo.sh -o backsearch_worker_nt
+--no-torch`, whose hash the campaign whitelists), for exactly the campaign's flags, and keep
+the WHOLE stdout. For campaign #2 (6x6, no holes, layer 4):
 
 ```
-node tools/v2_seed.js --campaign-file plan.json --layer-file roots.tsv [--dry]
-node tools/v2_hashes.js add <src-hash>        # from `backsearch_worker_nt --version`
-node tools/v2_hashes.js remove <hash> --reissue   # after a correctness fix
-node tools/v2_finish.js [--publish]           # refuses any exit whose audit is not clean
+./backsearch_worker_nt --grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --time 0 \
+    --estimate 30000 --estimate-depth 4 --estimate-dump dump.tsv > roots.tsv
+grep -c '^LAYER[[:space:]]' roots.tsv        # 1,368 roots: exits 0/1/2/7/8/14 = 17/116/158/188/513/376
 ```
 
-`roots.tsv` is the WHOLE stdout of the release worker's `--list-layer K` run for
-the campaign's flags (one LAYERINFO header per exit, then its LAYER lines;
-PROTOCOL3 §2.4); v2_seed refuses a file without the headers. For the 5x5 ≤3-hole
-campaign the six exits' depth-4 layers are in `roots_h3/` (2,761 roots, see DESIGN §7.1;
-`roots_h3/layer4_all.tsv`; listed before the header existed, so LAYER lines only). `plan.json` fields are listed at the top of
-`v2_seed.js`; the campaign parameters chosen in DESIGN.md §6 are the defaults.
+(`--list-layer 4` gives the same roots without the estimate; the estimate dump gives every root
+its `est_s`, which the server leases largest first.) Then:
 
-Audit anytime: `GET /api/v2/audit?exit=E` lists uncovered roots, jobs done
-under a hash that is no longer whitelisted, and fingerprint mismatches. A proof
-is published only when every exit's audit is clean.
+```
+node tools/v2_seed.js --campaign-file plan.json --layer-file roots.tsv --estimate-file dump.tsv --dry
+node tools/v2_seed.js --campaign-file plan.json --layer-file roots.tsv --estimate-file dump.tsv [--close-others]
+node tools/v2_hashes.js list | add <src-hash> | remove <hash> [--reissue]   # --reissue only after a correctness fix
+node tools/v2_jobs.js quarantined | mismatches | candidates | release ...    # what blocks an exit
+node tools/v2_resolve.js        # solve the open unresolved candidates deeper than each exit's best
+node tools/v2_verify.js         # re-solve champions the server has not confirmed yet
+node tools/v2_finish.js [--solve]   # dry run; then --publish: solve, check, store the champion, add the proof
+```
+
+- `roots.tsv` has one LAYERINFO header per exit, then its LAYER lines (DESIGN §2.8); v2_seed
+  refuses a file without the headers, with `seed` other than `""`, or with a root count or depth
+  that does not match. A root is a job-tree node of depth ≥ K whose parent is shallower, so a
+  listing is exact at every K with the current worker; campaigns still seed at layer 3 or 4
+  (DESIGN §7.1). Workers before project45 27443a8 (the live 406e5500 included) listed with bulk
+  walk-back off: never seed from a layer deeper than 4 listed by one of them.
+- For the 5x5 ≤3-hole campaign (#1) the six exits' depth-4 layers are in `roots_h3/`
+  (2,761 roots, `roots_h3/layer4_all.tsv`; listed before the header existed, so LAYER lines only).
+- `plan.json` fields and their defaults are listed at the top of `v2_seed.js`; campaign #2's
+  values are in DESIGN §6.1. The extra flags are an allowlist: `--allow-exit-transit` (always),
+  `--num-holes N`, `--num-blocks N`, `--min-walls N`, nothing else (never `--allow-block-on-exit`).
+- Audit anytime: `GET /api/v2/audit?exit=E` (add `campaign=ID` for a finished one) lists
+  uncovered roots, jobs done under a hash that is no longer whitelisted, fingerprint mismatches,
+  quarantined jobs, pending duplicates and unresolved candidates, and says whether the exit is
+  clean and exact. A campaign turns complete by itself when every job is finished and every exit
+  is clean (clients then exit by themselves); each exit's proof
+  is published once that exit is **exact** (clean, and every unresolved candidate deeper than its
+  best resolved by `v2_resolve.js`).
 
 ## Tests
 
+Run from `backsearch/`, one test at a time:
+
 ```
+python3 v2/test_split_exact.py ./backsearch_worker_nt --quick        # or --suite campaign [--only NAME]
 python3 v2/test_split_exact.py ./backsearch_worker_nt --split 0.15 -- --grid 5x5 --exit 12 --num-blocks 3 --allow-exit-transit
-bash v2/test_chaos.sh ./backsearch_worker_nt          # needs node and the server checkout; --config 6x6h0b1, --e2e
-bash v2/test_client.sh                                 # fake server + fake worker (test 'ui' needs node)
-node --test ../PathologyRecords/server/test/v2_gates.test.js
+python3 v2/test_roots_exact.py ./backsearch_worker_nt --quick        # or --suite campaign | deep [--jobs N]
+python3 v2/test_oracle.py ./backsearch_worker_nt --quick             # independent enumerator (builds oracle_enum.c)
+python3 v2/test_dkey.py ./backsearch_worker_nt                       # 96-bit dedup key sensitivity (~50 s)
+bash v2/test_chaos.sh ./backsearch_worker_nt   # needs node and the server checkout; --config 6x6h0b1, --e2e
+bash v2/test_client.sh [a e h s t ui ...]      # fake server + fake worker (test 'ui' needs node)
+bash v2/test_load.sh 10 16 60 10               # server load: CLIENTS WORKERS SECONDS JOB_S (also 30 16 60 2)
+(cd <PathologyRecords checkout> && node --test server/test/v2_gates.test.js)   # the server's gate tests
 ```
 
-Every test but the chaos test runs one worker at a time and finishes in about a minute. The chaos
-test runs a server, two clients and their workers at once (two CPUs) for one to two minutes.
+Every test but the chaos and load tests runs one worker at a time and finishes in about a
+minute (the campaign and deep suites take longer; run them with `--only`). The chaos test runs
+a server, two clients and their workers at once (two CPUs) for one to two minutes. What each
+test asserts is in DESIGN §5; the worker equivalence configs are in `../README.md`.

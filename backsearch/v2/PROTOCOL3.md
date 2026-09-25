@@ -1,8 +1,14 @@
 # Protocol 3: the contract for campaign #2 (6x6, 0 holes)
 
+**Change record.** Since 2026-09-25 this file is folded into [DESIGN.md](DESIGN.md), which is the
+single current specification; where the two differ, DESIGN.md is current, and DESIGN §10 lists what the
+implementation changed against the text below. This file is kept as written (plus the as-implemented
+notes the stages added in §2.1 and §2.4, and the `unknown_chain` row in §2.3), because code comments
+cite its section numbers.
+
 Written 2026-09-24 from the full review (`v2/REVIEW-2026-09-24.md`, issue ids M*/N*/C*/H*).
-Every component implements exactly this. Where it differs from DESIGN.md §1-§9, this file wins;
-the docs pass folds it into DESIGN.md afterwards. The next campaign is **6x6 with 0 holes**:
+Every component implements exactly this. Where it differed from DESIGN.md §1-§9 at the time, this file
+won; the docs pass has folded it into DESIGN.md. The next campaign is **6x6 with 0 holes**:
 `--grid 6x6 --allow-exit-transit --num-holes 0`, canonical exits 0,1,2,7,8,14. Levels there are
 long (best known 165 moves, 10 blocks) and most solver time goes to states wider than 64 bits.
 
@@ -54,6 +60,7 @@ different hash and can never be whitelisted by accident). Every table-size macro
 | `bad_seed` | 3 | --seed-path does not replay (or is longer than path_tok_max) |
 | `path_overflow` | 4 | a node deeper than path_tok_max tokens was reached; no REMAINING |
 | `error` | 5 | allocation failure or internal error; message on stderr |
+| `unknown_chain` | 6 | (added in stage W1) a capacity cascade under the job's root (the UNKNOWN chain guard, DESIGN §2.6); SUMMARY `detail`; no REMAINING, LEVEL or UNRESOLVED; void |
 
 `time_cap` is gone from protocol mode (--time 0 is always passed). Any other exit is a crash.
 
