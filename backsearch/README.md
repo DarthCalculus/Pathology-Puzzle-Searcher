@@ -257,8 +257,14 @@ jobs.tsv, so resuming still works.  Waste is at most SEC per split.
 Cross-job dedup loss is small (dedup off entirely costs ~1.4x states), and dedup
 table size barely matters (2x larger tables changed a 74M-state run by 1.5%).
 Keep concurrent workers to what RAM allows: plan on 0.5 GB each (measured
-2026-09-25: about 0.2 GB for a typical job, 0.25-0.4 GB for the heaviest 6x6
-0-hole jobs, 4 MB for a trivial one).
+2026-09-25: about 0.2 GB for a typical job, up to ~0.42 GB for the heaviest
+6x6 0-hole jobs -- exit 7 root U2,R2,U2,U1 after 30k expansions: max RSS 417
+MiB, peak footprint 385 MiB; macOS max RSS varies by up to ~100 MB between
+identical runs, since freed pages stay counted until the kernel reclaims them
+-- and 4 MB for a trivial one).  SUMMARY reports each run's `max_rss_mb`.  The
+parent-table pool is bounded (48 MB of live tables plus 12 MB of released
+buffers kept for reuse), and a solver table tier of 4M+ slots is freed as soon
+as a solve grows past it, or when the next solve starts.
 
 **5x5 under real rules (2026-09-14 estimates, dedup-free lower bounds):** exit 0
 45 h, exit 1 124 h, exit 2 33 h, exit 6 ~8000 h, exit 7 216 h, exit 12 105 h of

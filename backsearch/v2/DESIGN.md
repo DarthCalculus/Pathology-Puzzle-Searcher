@@ -21,6 +21,18 @@ between the three components. Change it here first, then the code.
    tables never evict and a job's `(states, valid, best)` is a deterministic
    fingerprint of `(seed, hash)`. About 2 % of finished jobs are re-issued to
    a different client and the fingerprints compared.
+   Fingerprints are compared within one hash only. Across worker versions
+   they agree only for jobs with no inconclusive (UNKNOWN) checks: solver
+   speed-ups that change which checks run or how big a table may grow (the
+   W4 growable tables, bigger parent tables, dead-end children decided
+   without a check) can decide a state that an older worker left UNKNOWN,
+   which changes that job's valid and unknown counts (never loses a level:
+   UNKNOWN states are explored and reported as candidates).
+   The dedup key is 96 bits (a 64-bit hash plus an independent 32-bit check
+   value, worker W4 on): a false dedup match would silently skip a subtree;
+   the chance of one anywhere in a campaign is about 1e-12 (with 64 bits
+   alone, about 1 %). `v2/test_dkey.py` checks that the check value is
+   really compared.
 6. **Trusted friends, untrusted input.** No accounts, but every field from a
    client is validated, size-capped and escaped before it reaches the DB or a
    page.
@@ -213,6 +225,12 @@ python3 volunteer.py --name "Your name" [--workers N] [--server URL] [--port 876
    clean stop, kill -9 and restart, pause/resume/stop via the local HTTP
    controls, worker dying without SUMMARY (loud log, backoff, nothing
    reported).
+6. **Dedup-key sensitivity** (worker, `v2/test_dkey.py WORKER`, ~50 s): two
+   test-only builds keep 20 bits of the dedup hash so distinct states collide
+   thousands of times per run. With the 32-bit check value compared, levels
+   and counts must equal the tested worker's; with it disabled, the same runs
+   must lose states and levels (two-table and single-table dedup). Passed
+   2026-09-25.
 
 Known follow-ups: a `POST /api/v2/release` route so a stopping client can
 hand back leased-ahead jobs immediately (today they idle until `lease_s`);

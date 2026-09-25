@@ -1096,7 +1096,7 @@ typedef struct {
  * last tier fills to 85% (then SOK_TABLE_FULL, -5: undecided, never a prune).
  * Tiers of HTP_KEEP_LG2 or more slots are released when the next solve starts
  * (a solve that big is rare; keeping them resident would cost 64-256 MB per
- * worker for the rest of the job). */
+ * worker for the rest of the job), and as soon as a solve grows past one. */
 #ifndef HTP_SMALL_LG2
 #define HTP_SMALL_LG2 16
 #endif
@@ -1265,6 +1265,13 @@ static HSlot64 *hsp64_grow_rehash(HashStatePush64 *hs) {
         hs->touched[j] = h;
     }
     return old;
+}
+/* After a growth (the pending entries re-pointed): the tier left behind is
+ * freed at once when it is one of the big ones (>= HTP_KEEP_LG2), so a solve
+ * that climbs to the last tier never holds two big tiers (64 + 256 MB). */
+static void hsp64_grow_done(HashStatePush64 *hs) {
+    const int ot = hs->tier - 1;
+    if (ot >= 1 && htp_tier_lg(ot) >= HTP_KEEP_LG2) { free(hs->tiers[ot]); hs->tiers[ot] = NULL; }   /* (tier 0, the small table, is never freed) */
 }
 
 /* Candidate push collected in pass 1 (before walk distances are known).  The
@@ -1857,6 +1864,7 @@ static void SOKN(grow)(HashStatePush64 *hs, BucketV *bq) {
         for (int i = 0; i < bq[b].len; i++) it[i].slot = (uint32_t)old[it[i].slot].cost;
     }
     hs->overflow = 0;
+    hsp64_grow_done(hs);
 }
 
 /* Full (uncapped) solve: the shortest forward solution, -1, or an undecided code. */

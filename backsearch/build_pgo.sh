@@ -204,14 +204,27 @@ if [ "$FAMILY" = clang ]; then
   fcount() { { $PROFDATA show --function="$1" --counts "$TMP/w.profdata" 2>/dev/null || true; } | sed -n 's/^ *Function count: *\([0-9]*\).*/\1/p' | head -1 || true; }
   NEED="solve_push_cutoff_w1 solve_multi_w1"
   if [ -n "$TRAIN2_ARGS" ]; then NEED="$NEED solve_push_cutoff_w2"; fi
+  # A function the profile has no count for was renamed or removed (this list
+  # must follow the source): refuse.  Only when NO count can be read at all (an
+  # llvm-profdata that prints per-function counts differently) is the check
+  # skipped, with a warning.
+  FOUND=0; MISSING=""
   for f in $NEED; do
     c=$(fcount "$f")
-    if [ -z "$c" ]; then echo "      (profile check: no count found for $f; skipped)"; continue; fi
+    if [ -z "$c" ]; then MISSING="$MISSING $f"; continue; fi
+    FOUND=$((FOUND + 1))
     if [ "$c" -eq 0 ]; then
       echo "the training runs never reached $f: its code would be compiled as cold (choose a training run that does)" >&2; exit 1
     fi
     echo "      $f: $c calls"
   done
+  if [ -n "$MISSING" ]; then
+    if [ "$FOUND" -eq 0 ]; then
+      echo "WARNING: $PROFDATA printed no per-function counts; the solver-instance check was skipped" >&2
+    else
+      echo "the profile has no function named:$MISSING (renamed in the source? update NEED in build_pgo.sh): refusing to build" >&2; exit 1
+    fi
+  fi
 else
   # gcc accumulates both runs in $TMP/*.gcda and reads them directly
   if ! ls "$TMP"/*.gcda >/dev/null 2>&1 || [ -z "$(find "$TMP" -name '*.gcda' -size +0c)" ]; then

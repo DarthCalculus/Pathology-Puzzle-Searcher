@@ -629,9 +629,16 @@ static void level_code_text(const BState *s, int exit_pos, char unk, char *buf, 
  * saves most on), within a budget: the live tables may hold at most
  * PTAB_LIVE_MAX_SLOTS hash slots (12 B each) -- a state whose table would not
  * fit exports none and keeps its ancestor's, as before.  The budget is spent
- * in DFS order, so a run's exports (and so its solver work) are deterministic. */
+ * in DFS order, so a run's exports (and so its solver work) are deterministic.
+ * Released tables keep their buffers for reuse by size class (table sizes are
+ * powers of two), at most PTAB_POOL_FREE_MAX slots in all; beyond that a
+ * released buffer is freed.  A new table takes a released buffer of exactly
+ * its size, or a new one: every live buffer is exactly its table's size, so
+ * the pool never holds more than PTAB_LIVE_MAX_SLOTS + PTAB_POOL_FREE_MAX
+ * slots (60 MB). */
 typedef struct { SokRefTable t; int next_free, rc; } PTab;   /* rc: queued states referring to it */
-static PTab *g_ptab = NULL; static int g_ptab_n = 0, g_ptab_cap = 0, g_ptab_free = -1;
+#define PTAB_NCLASS 32                        /* free lists by log2(buffer slots); class 0: entries with no buffer */
+static PTab *g_ptab = NULL; static int g_ptab_n = 0, g_ptab_cap = 0, g_ptab_free1[PTAB_NCLASS];   /* free-list heads + 1 (0 = empty) */
 static int  g_ptab_active = 0;                /* DFS mode only */
 static int  g_no_ptab = 0;                    /* --no-parent-table */
 #ifndef HTP_EXPORT_MAX
@@ -639,6 +646,9 @@ static int  g_no_ptab = 0;                    /* --no-parent-table */
 #endif
 #ifndef PTAB_LIVE_MAX_SLOTS
 #define PTAB_LIVE_MAX_SLOTS (1 << 22)         /* 4M slots = 48 MB of live parent tables */
+#endif
+#ifndef PTAB_POOL_FREE_MAX
+#define PTAB_POOL_FREE_MAX (1 << 20)          /* released tables keep at most 1M buffer slots (12 MB) for reuse */
 #endif
 #if HTP_EXPORT_MAX < 1 || HTP_EXPORT_MAX > (1 << 24)
 #error "HTP_EXPORT_MAX must be 1..2^24"
@@ -669,23 +679,41 @@ static char *xstrdup(const char *t, const char *what) {
     return p;
 }
 static long long g_ptab_saved = 0, g_ptab_used = 0, g_ptab_live = 0, g_ptab_live_peak = 0, g_ptab_live_slots = 0, g_ptab_live_slots_peak = 0;
+static long long g_ptab_free_slots = 0;   /* buffer slots the released tables still hold */
+static long long g_ptab_pool_peak = 0;    /* peak of live + released buffer slots (SUMMARY ptab_mb) */
 /* Hash slots of a parent table of n entries (as sokoban_ref_build sizes it). */
 static long long ptab_slots(long long n) { long long sz = 256; while (sz < 2 * n) sz <<= 1; return sz; }
+static int ptab_pop_free(int cls) {
+    int id = g_ptab_free1[cls] - 1;
+    if (id >= 0) { g_ptab_free1[cls] = g_ptab[id].next_free + 1; g_ptab_free_slots -= g_ptab[id].t.cap; }
+    return id;
+}
 static int ptab_alloc(const uint64_t *k, const int32_t *c, int n) {
-    int id;
-    if (g_ptab_free >= 0) { id = g_ptab_free; g_ptab_free = g_ptab[id].next_free; }
-    else {
+    const int cls = __builtin_ctzll((unsigned long long)ptab_slots(n));   /* this table's size class */
+    int id = ptab_pop_free(cls);                  /* a released buffer of exactly this size ... */
+    if (id < 0) id = ptab_pop_free(0);            /* ... else an entry without one (sokoban_ref_build allocates) */
+    if (id < 0) {
         if (g_ptab_n == g_ptab_cap) { g_ptab_cap = g_ptab_cap ? g_ptab_cap * 2 : 1024; g_ptab = xrealloc(g_ptab, g_ptab_cap * sizeof *g_ptab, "parent-table pool"); memset(g_ptab + g_ptab_n, 0, (g_ptab_cap - g_ptab_n) * sizeof *g_ptab); }
         id = g_ptab_n++;
     }
     PTab *t = &g_ptab[id];
-    sokoban_ref_build(k, c, n, &t->t); t->rc = 0;
+    sokoban_ref_build(k, c, n, &t->t); t->rc = 0;   /* (buffer exactly ptab_slots(n): cap == mask + 1) */
     g_ptab_saved++;
     if (++g_ptab_live > g_ptab_live_peak) g_ptab_live_peak = g_ptab_live;
-    g_ptab_live_slots += t->t.mask + 1; if (g_ptab_live_slots > g_ptab_live_slots_peak) g_ptab_live_slots_peak = g_ptab_live_slots;
+    g_ptab_live_slots += t->t.cap; if (g_ptab_live_slots > g_ptab_live_slots_peak) g_ptab_live_slots_peak = g_ptab_live_slots;
+    if (g_ptab_live_slots + g_ptab_free_slots > g_ptab_pool_peak) g_ptab_pool_peak = g_ptab_live_slots + g_ptab_free_slots;
     return id;
 }
-static void ptab_release(int id) { if (id < 0) return; if (--g_ptab[id].rc > 0) return; g_ptab_live--; g_ptab_live_slots -= g_ptab[id].t.mask + 1; g_ptab[id].next_free = g_ptab_free; g_ptab_free = id; }
+static void ptab_release(int id) {
+    if (id < 0) return;
+    PTab *t = &g_ptab[id];
+    if (--t->rc > 0) return;
+    g_ptab_live--; g_ptab_live_slots -= t->t.cap;
+    int cls = 0;
+    if (t->t.cap && g_ptab_free_slots + t->t.cap <= PTAB_POOL_FREE_MAX) { cls = __builtin_ctz(t->t.cap); g_ptab_free_slots += t->t.cap; }
+    else { free(t->t.hk); free(t->t.hc); t->t.hk = NULL; t->t.hc = NULL; t->t.cap = 0; }   /* not kept */
+    t->next_free = g_ptab_free1[cls] - 1; g_ptab_free1[cls] = id + 1;
+}
 static long long g_ptab_inherited = 0, g_ptab_delta_refs = 0;
 #ifdef REF_CHECK
 static long long g_refchk_n = 0, g_refchk_bad = 0;
@@ -986,6 +1014,21 @@ static void sort_holes(int8_t *hp, int n) {
  * sits in the slots' former tail padding: no memory is added.
  * ------------------------------------------------------------------------- */
 typedef struct { uint64_t k; uint32_t c; } DKey;
+#ifdef DKEY_TEST_KBITS
+#if DKEY_TEST_KBITS < 8 || DKEY_TEST_KBITS > 63
+#error "DKEY_TEST_KBITS must be 8..63"
+#endif
+#endif
+#define DKEY_STR(x) #x
+#define DKEY_XSTR(x) DKEY_STR(x)
+/* Lookups where k matched and c did not (a 64-bit collision the check value
+ * resolved): counted in DKEY_TEST_KBITS test builds only, printed on stderr. */
+#ifdef DKEY_TEST_KBITS
+static long long g_dkey_kmatch = 0;
+#define DKEY_KMATCH(slot_key, slot_chk, key, chk) do { if ((slot_key) == (key) && (slot_chk) != (chk)) g_dkey_kmatch++; } while (0)
+#else
+#define DKEY_KMATCH(slot_key, slot_chk, key, chk) do { } while (0)
+#endif
 
 /* Visited table size — compile-time constant for hot-path speed.
  * Default 24 (16M slots, 256 MB) balances cache locality and per-exit
@@ -1131,6 +1174,15 @@ static DKey state_dkey(const BState *s) {
         h = splitmix64(h ^ v); g = fmix64(g ^ v);
     }
     DKey d; d.k = h ? h : 1; d.c = (uint32_t)(g >> 32);   /* k: exactly state_key(s) */
+#ifdef DKEY_TEST_KBITS
+    /* TEST BUILD ONLY (v2/test_dkey.py): keep DKEY_TEST_KBITS bits of k, so that
+     * distinct states share k often and only the check value tells them apart
+     * (spread over the tables by an odd multiplier, a bijection: never 0). */
+    d.k = ((h >> (64 - (DKEY_TEST_KBITS))) + 1) * 0x9E3779B97F4A7C15ULL;
+#endif
+#ifdef DKEY_TEST_NOCHK
+    d.c = 0;   /* TEST BUILD ONLY: no check value (states are told apart by k alone) */
+#endif
     return d;
 }
 static DKey dedup_key(const BState *s) {
@@ -1164,6 +1216,7 @@ static int dedup_check_and_insert(DKey dk, int depth) {
             g_visited_count++;
             return 0;
         }
+        DKEY_KMATCH(tab[i].key, tab[i].chk, key, dk.c);
         if (tab[i].key == key && tab[i].chk == dk.c) {
             if (tab[i].depth <= depth) return 1;
             tab[i].depth = depth;
@@ -1313,6 +1366,7 @@ static int dedup_two_tables(DKey dk, int depth) {
     size_t i = (size_t)key & SHALLOW_MASK;
     for (size_t probe = 0; probe < SHALLOW_CAP; probe++) {
         if (stab[i].key == 0) break;
+        DKEY_KMATCH(stab[i].key, stab[i].chk, key, chk);
         if (stab[i].key == key && stab[i].chk == chk) {
             seen_shallow = 1;
             if (stab[i].depth <= depth) hit_dup = 1;
@@ -1327,6 +1381,7 @@ static int dedup_two_tables(DKey dk, int depth) {
     i = (size_t)key & RECENT_MASK;
     for (size_t probe = 0; probe < RECENT_CAP; probe++) {
         if (rtab[i].key == 0) break;
+        DKEY_KMATCH(rtab[i].key, rtab[i].chk, key, chk);
         if (rtab[i].key == key && rtab[i].chk == chk) {
             seen_recent = 1;
             rtab[i].clock = now;     /* refresh on hit */
@@ -2883,14 +2938,19 @@ static int bulk_generate(const BState *s) {
  * length >= d+1 = depth(c): c provably has no shortcut and its check (which
  * would return -1) is skipped.  s must have been decided (not UNKNOWN), and the
  * test is off where a check can mean more than "shortcut or not" (axis
- * relaxation, --shortcut-state-cap, the NN surrogate).  A -DDEADEND_CHECK build
+ * relaxation, --shortcut-state-cap, the NN surrogate), and where something
+ * other than the decision is read from a check: beam and rollout modes rank
+ * states by the check's pop count (branch_factor), --harvest, --trace-csv and
+ * --bf-dump record every check (g_deadend_on, set when a run starts).  A
+ * skipped child's branch_factor is 0 ("not run").  A -DDEADEND_CHECK build
  * still runs every skipped check and counts the ones that do not return -1. */
 static long long g_deadend_skips = 0;
+static int g_deadend_on = 0;   /* the plain DFS with no per-check observer (run_exit_search / run_estimate) */
 #ifdef DEADEND_CHECK
 static long long g_deadend_checked = 0, g_deadend_bad = 0;
 #endif
 static int deadend_child(const BState *s, const BState *c, int P, int C, int D, int var, int dref) {
-    if (s->unk_run || P == g_exit_pos || g_axis_both_ways || g_shortcut_state_cap > 0 || g_nn_surrogate_loaded) return 0;
+    if (!g_deadend_on || s->unk_run || P == g_exit_pos || g_axis_both_ways || g_shortcut_state_cap > 0 || g_nn_surrogate_loaded) return 0;
     const uint64_t walls = g_active_mask & ~c->committed_empty;   /* c's puzzle walls (build_partial_puzzle) */
     for (int d = 0; d < 4; d++) {                                 /* (i) */
         int n = g_adj[C][d];
@@ -2918,6 +2978,7 @@ static void try_successor_dead(const BState *c, int dead) {
                 fprintf(stderr, "DEADEND MISMATCH: depth %d var %d solver %d, parent path %s\n", c->depth, g_emit_V, x, pb); } }
     }
 #endif
+    g_last_peak_heap = 0;           /* no check ran: branch_factor 0 */
     try_successor_x(c, 1, -1, 0);   /* -1: no shortcut (proven above); the pre-check prunes and the dedup still run */
 }
 
@@ -4632,6 +4693,7 @@ static void run_estimate(void) {
      * stay off: they only speed checks up, a job's root check has none either. */
     g_bulk_walk_active = bulk_walk_effective();
     g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0; g_deadend_skips = 0;
+    g_deadend_on = g_beam_width == 0 && g_rollout_steps == 0 && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
     g_ptab_active = 0;
     g_emit_D = -1; g_emit_V = -1;   /* the root gets no edge token */
     int saved_best = g_best_depth, saved_overall = g_overall_best_depth;
@@ -5021,6 +5083,7 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
      * record them).  The root listing (run_estimate) uses the same value. */
     g_bulk_walk_active = bulk_walk_effective();
     g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0; g_deadend_skips = 0;
+    g_deadend_on = g_beam_width == 0 && g_rollout_steps == 0 && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
     g_ptab_active = g_beam_width == 0 && g_rollout_steps == 0 && !g_no_ptab;
     g_ptab_saved = g_ptab_used = g_ptab_inherited = g_ptab_delta_refs = 0;
     g_emit_D = -1; g_emit_V = -1;   /* the root gets no edge token */
@@ -5567,11 +5630,19 @@ static void print_version(void) {
     printf("PROTOCOL\t3\n");
     printf("LIMITS\t{\"path_tok_max\":%d,\"max_ncells\":%d,\"max_blocks\":%d,\"state_bits\":%d}\n",
            PATH_TOK_MAX, MAX_NCELLS, MAX_BLOCKS, sokoban_state_bits_max());
-    printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"PTAB_LIVE_MAX_SLOTS\":%lld,\"UNRESOLVED_MAX\":%d,"
+    printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"PTAB_LIVE_MAX_SLOTS\":%lld,"
+           "\"PTAB_POOL_FREE_MAX\":%lld,\"UNRESOLVED_MAX\":%d,"
            "\"UNKNOWN_CHAIN_MAX\":%d,\"UNKNOWN_DEFER_S\":%d,\"PROBE_BUF_MAX\":%d,%s,\"defs\":\"%s\"}\n",
-           (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (long long)(PTAB_LIVE_MAX_SLOTS), (int)UNRESOLVED_MAX,
+           (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (long long)(PTAB_LIVE_MAX_SLOTS),
+           (long long)(PTAB_POOL_FREE_MAX), (int)UNRESOLVED_MAX,
            (int)UNKNOWN_CHAIN_MAX, (int)UNKNOWN_DEFER_S, (int)PROBE_BUF_MAX, sokoban_knobs_json(),
            ""
+#ifdef DKEY_TEST_KBITS
+           "DKEY_TEST_KBITS=" DKEY_XSTR(DKEY_TEST_KBITS) " "
+#endif
+#ifdef DKEY_TEST_NOCHK
+           "DKEY_TEST_NOCHK "
+#endif
 #ifdef REF_CHECK
            "REF_CHECK "
 #endif
@@ -5601,8 +5672,23 @@ static double cpu_seconds(void) {
     if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
     return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
 }
+/* Peak resident set size of the process in MiB (ru_maxrss: bytes on macOS, KiB elsewhere). */
+static long long max_rss_mb(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+#ifdef __APPLE__
+    return ((long long)ru.ru_maxrss + (1 << 20) - 1) >> 20;
+#else
+    return ((long long)ru.ru_maxrss + 1023) >> 10;
+#endif
+}
 static int g_last_unresolved_printed = 0;
-/* SUMMARY: the last protocol line of an exit's run (v2/PROTOCOL3.md §2.2). */
+/* SUMMARY: the last protocol line of an exit's run (v2/PROTOCOL3.md §2.2).
+ * Informational fields beyond the protocol's (the server's whitelist drops
+ * them): max_pops / max_pending (solver headroom), max_rss_mb (peak RSS),
+ * table_grows (push-table growths into a bigger tier), bulk_fallbacks
+ * (multi-start solves decided one start at a time), ptab_mb (peak parent-table
+ * pool, live and released buffers). */
 /* The effective search definition (SUMMARY and LAYERINFO "flags"). */
 static void print_flags_json(FILE *f) {
     fprintf(f, "{\"grid\":\"%dx%d\",\"exit\":%d,\"transit\":%d,\"block_on_exit\":%d,\"max_holes\":%d,\"max_blocks\":%d,\"min_walls\":%d,\"bulk_walk\":%d}",
@@ -5610,17 +5696,25 @@ static void print_flags_json(FILE *f) {
 }
 static void print_summary(const char *st, double elapsed, int verify, const char *err) {
     long long accepted = g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_axis - g_unknown;   /* pruned_cap is part of pruned_short */
+    long long grows = 0;
+    {   long long pg[16] = {0}, mg[16] = {0}; sokoban_table_stats(pg, mg, 16);
+        for (int t = 1; t < 16; t++) grows += pg[t]; }
+#ifdef DKEY_TEST_KBITS
+    fprintf(stderr, "DKEY TEST: %lld lookups matched k but not the check value\n", g_dkey_kmatch);
+#endif
     printf("SUMMARY\t{\"status\":\"%s\",\"seed\":\"", st);
     json_str(stdout, g_seed_text);
     printf("\",\"exit\":%d,\"states\":%lld,\"accepted\":%lld,\"valid\":%lld,\"best\":%d,"
            "\"verify\":%d,\"evict_shallow\":%lld,\"evict_recent\":%lld,\"elapsed\":%.3f,\"solver_calls\":%lld,\"src_hash\":\"%s\","
            "\"protocol\":3,\"cpu_s\":%.3f,\"unknown\":%lld,\"unknown_pq\":%lld,\"unknown_probe\":%lld,\"unknown_big\":%lld,"
            "\"unresolved\":%d,\"unresolved_dropped_max\":%d,\"max_pops\":%lld,\"max_pending\":%lld,"
+           "\"max_rss_mb\":%lld,\"table_grows\":%lld,\"bulk_fallbacks\":%lld,\"ptab_mb\":%lld,"
            "\"flags\":",
            g_exit_pos, g_states_checked, accepted, g_accepted_valid, g_best_depth,
            verify, g_two_tables ? g_evictions_shallow : 0LL, g_two_tables ? g_evictions_recent : 0LL, elapsed, g_solver_calls, SRC_HASH_STR,
            cpu_seconds(), g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big,
-           g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending);
+           g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending,
+           max_rss_mb(), grows, g_bulk_fallbacks, (g_ptab_pool_peak * 12 + (1 << 20) - 1) >> 20);
     print_flags_json(stdout);
     if (err) { printf(",\"%s\":\"", strcmp(st, "error") ? "detail" : "error"); json_str(stdout, err); printf("\""); }
     printf("}\n");
