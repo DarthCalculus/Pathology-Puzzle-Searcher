@@ -157,7 +157,7 @@ python3 volunteer.py --name "Your name" [--workers N] [--server URL] [--port 876
 ```
 
 - Registers (or reuses the token in `~/.pathology_volunteer.json`), then runs
-  a lease loop per worker: lease up to 3 jobs ahead, run
+  a lease loop per worker: at most 2 jobs per worker held (running + queued, §7.6), run
   `backsearch_worker_nt --grid G --two-tables --exit E --seed-path S --time 0
   --split-after <split_after_s> --status-every 250 <extra…>`, parse the lines
   above, POST the report. Reports that fail to send are queued in
@@ -241,15 +241,25 @@ is not acceptable.
    whole local tree (§7.5). A window therefore contains at most ~2 splits and
    a report at most a few hundred nodes.
 3. **Absorb trivial children before hand-back.** Before reporting, spend up to
-   `absorb_total_s` (120) probing each still-open local seed for
-   `absorb_probe_s` (10) seconds; probes that exhaust are reported done, the
-   rest open (a probe that splits is reported open, its partial work dropped).
-   The open pool thus holds only jobs that cost ≥ 10 s or were never examined.
+   `absorb_total_s` (120) probing the still-open local seeds for
+   `absorb_probe_s` (10) seconds each, **deepest first** (REMAINING lists the
+   cursor and the top of the stack first: the cheap entries; review M18). A
+   probe that exhausts is reported done. A probe that splits is kept as a split
+   node with its summary and its REMAINING children (none of its time is lost),
+   and the pass then continues with that probe's own children only: every seed
+   still to come is no deeper than the one that split, i.e. larger. A probe that
+   cannot expand its root in the probe time ends the pass. The open pool thus
+   holds only jobs that cost ≥ 10 s or were never examined.
    (Was 2 s / 60 s; raised after the first load test measured ~1 ms of server
    time per row: the worst-case job rate is now 1,280 / 10 s = 128 jobs/s.)
 4. **The server sets the window.** The lease response carries `split_after_s`:
    `ramp_split_after_s` (120) while open jobs < 3 × (sum of workers of active
-   clients), else the campaign's `split_after_s` (1800).
+   clients), else the campaign's `split_after_s` (1800). The client takes a
+   window's length (and its absorption budget) when the window **starts**, from
+   the latest lease response (or a heartbeat `window`, when the server sends
+   one), not from the lease of that job (review M108); a fingerprint re-run keeps
+   the window its grant carries. A campaign may set `min_window_s` (default 1 s,
+   lower for tests) and `split_after_nodes` (adds `--split-after-nodes N`, tests).
 5. **Tree reports.** `POST /api/v2/report` body:
    `{token, job_id, src_hash, nodes:[{seed, parent, status, summary?, level?}]}`
    where every `seed` extends the job's seed (token prefix, may equal it only
@@ -266,11 +276,17 @@ is not acceptable.
    old `summary`+`remaining` shape stays accepted as the one-node case.
 6. **Client-level batching.** A client sends at most one lease request and one
    `POST /api/v2/reports {token, reports:[…]}` (array of §7.5 bodies) per
-   `batch_interval_s` (10), plus one heartbeat per 30 s. Lease requests ask
-   for enough jobs to keep every worker busy for `lease_ahead_s` (300) at the
-   recent mean job duration, floor 1 per idle worker, ceiling 200 per request;
-   the server caps at `lease_cap` (200) per request and 3 × workers +
-   200 held. Failed batches go to the outbox as one file.
+   `batch_interval_s` (10), plus one heartbeat per 30 s. Lease requests are
+   sized by expected work (review M108): at most 2 × workers jobs are held
+   locally (running + queued), and a worker gets its next job when its current
+   window has less than min(`lease_ahead_s`, window) left; a job's expected
+   work is the mean window time at its depth (a depth nothing is known about
+   counts as a whole window), and an idle worker always gets one. An idle worker
+   with nothing queued may lease sooner than `batch_interval_s` (at least 2 s
+   apart). The local queue runs the server's lease order (largest `est_s`
+   first when the grant carries it, then shallowest, then grant order). The
+   server caps at `lease_cap` (200) per request and 3 × workers + 200 held.
+   Failed batches go to the outbox as one file.
 7. **No throttling between friends.** No per-token rate limit. The per-IP
    limit is a sanity cap honest clients cannot reach (600/min).
 8. **Nothing scales with rows on the request path.** `status` cached 2 s;
@@ -323,10 +339,14 @@ Panel sections (top to bottom):
 2. **What is happening**: per worker: job seed, exit, window time left, local
    stack size, nodes done this window, phase (search / absorbing / reporting),
    current board (grey = undecided cells).
-3. **Levels**: three boards with Pathology codes and copy buttons: best on
-   this machine in the last second, best on this machine in the last hour,
-   best known globally for the selected exit (from `exits`). Each with depth,
-   and for the global one who found it and when.
+3. **Levels**: four boards with Pathology codes and copy buttons: best on
+   this machine in the last second, in the last hour and this session (fed by
+   STATUS samples and LEVEL lines, so short runs count too), and best known
+   globally for the selected exit, or the longest over all exits with "Any exit"
+   (from `exits`; the server joins code rows with newlines, the panel shows and
+   copies them joined with `/`). Each with depth, and for the global one who
+   found it and when. A board is redrawn only when it changes, never under the
+   pointer or a text selection.
 4. **Your stats** (from `me`): jobs done, splits handed back, trivial
    children absorbed locally, CPU hours, states searched, solver calls, your
    deepest level, rank among contributors, first seen, session uptime, jobs

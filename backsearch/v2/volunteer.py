@@ -51,7 +51,7 @@ try:
 except ImportError:          # native Windows: no advisory locks (WSL has them)
     fcntl = None
 
-CLIENT_VERSION = "3.0.0"
+CLIENT_VERSION = "3.1.0"
 PROTOCOL = 3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +87,11 @@ CANDS_PER_REPORT_MAX = 20000 # server CAND_MAX_PER_REPORT
 PATH_TOK_MAX_DEFAULT = 1024
 OUTBOX_FLUSH_S = 15.0
 LOG_QUEUE_MAX = 5000
+MIN_WINDOW_S_DEFAULT = 1.0   # floor of a window and of a run's split time; a campaign may set min_window_s (tests, N18)
+HOLD_PER_WORKER = 2          # M108: jobs running + queued here <= 2 x workers
+LEASE_EARLY_GAP_S = 2.0      # an idle worker with nothing queued may lease this soon after the last request
+DEPTH_HIST_N = 16            # window durations kept per job depth (expected work of a job, M108)
+SEC_BOARD_S = 1.0            # the "last second" board
 
 # The only worker flags a campaign may add (PROTOCOL3 section 3). Anything else makes the
 # client refuse to run: the worker has flags that open files by path, and the campaign
@@ -201,6 +206,37 @@ def nonneg_float(v):
     except (TypeError, ValueError):
         return None
     return f if 0.0 <= f < 1e9 else None
+
+
+def pos_int(v):
+    """An integer >= 1 from a server field, else None."""
+    if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+        return None
+    return v
+
+
+def fmt_s(x):
+    """Seconds for a log line: '1800', '2.5', '0.25'."""
+    return "%.0f" % x if x >= 10 else ("%.2f" % x).rstrip("0").rstrip(".")
+
+
+def seed_depth(seed):
+    return seed.count(",") + 1 if seed else 0
+
+
+def absorb_order(seeds):
+    """M18: absorption probes go deepest first (most tokens). REMAINING is printed cursor first, then the
+    stack from the top (deep) to the bottom (shallow): the deep entries are the cheap ones, and a probe
+    spent on a shallow (large) one usually splits. The sort is stable, so the cursor stays first among
+    equals; the caller's node list (parent before child) is not reordered."""
+    return sorted(seeds, key=seed_depth, reverse=True)
+
+
+def queue_key(job):
+    """M108: the local queue runs the job the server would lease first: largest est_s first (when the
+    grant carries it), then shallowest, then the order the jobs were granted in (jobs.js leaseOrder)."""
+    est = job.get("est_s")
+    return (est is None, -(est or 0.0), job.get("depth", 0), job.get("seq", 0))
 
 
 def parse_extra(extra):
@@ -443,6 +479,24 @@ class Api:
             raise ApiError(200, {"error": "bad json from server"}, True)
 
 
+def open_candidates(e):
+    """Unresolved candidates deeper than an exit's best (PROTOCOL3 section 1), from whichever field
+    the server sends in an exit entry; None when it sends none."""
+    if not isinstance(e, dict):
+        return None
+    for k in ("candidates_open_deeper", "open_candidates", "unresolved_open"):
+        v = e.get(k)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+    c = e.get("candidates")
+    if isinstance(c, dict):
+        for k in ("open_deeper", "open"):
+            v = c.get(k)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+    return None
+
+
 def campaign_state_of(res):
     """'running' | 'complete' | 'closed' from a heartbeat/lease/register response."""
     if not isinstance(res, dict):
@@ -490,7 +544,8 @@ class Slot:
         self.thread = None
         self.proc = None
         self.job = None
-        self.state = "idle"           # idle | running | paused | finishing | retiring | dead
+        self.state = "idle"           # idle | running | paused | finishing | dead (retirement is `retire`)
+        self.frozen = False           # M56: the worker process is SIGSTOPped by us (Pause, Ctrl-Z)
         self.retire = False
         self.started_at = 0.0
         self.stop_sent_at = 0.0
@@ -530,6 +585,8 @@ class Slot:
         return {
             "idx": self.idx,
             "state": self.state,
+            "frozen": self.frozen,
+            "retiring": bool(self.retire and j is not None),
             "pid": self.proc.pid if self.proc and self.proc.poll() is None else None,
             "job_id": j["id"] if j else None,
             "exit": j["exit"] if j else None,
@@ -600,6 +657,10 @@ class Volunteer:
         self.paused = False
         self.job_durations = collections.deque(maxlen=20)
         self.hour_best = collections.deque()         # monotonic deque of (t, depth, code, exit): rolling 1 h max
+        self.sec_levels = collections.deque()        # (t, depth, code, exit) of LEVEL lines: the "last second" board
+        self.depth_hist = {}                         # job depth -> recent window durations (expected work, M108)
+        self.grant_depths = collections.deque(maxlen=20)  # depths of recent grants (lease sizing)
+        self.lease_seq = 0
         self._reset_campaign_state()
 
     def _reset_campaign_state(self):
@@ -635,15 +696,21 @@ class Volunteer:
             self.no_jobs_until = 0.0
             self.last_no_jobs_log = 0.0
             self.exit_applied = self.exit_pref is None
+            self.exit_pending = False             # M58: an exit preference no lease response has answered yet
             self.exit_fallback = False
             self.me = None
             self.exits = None
             self.campaign_status = None
-            self.campaign_status_at = 0.0
+            self.campaign_status_at = 0.0         # last fetch attempt (throttle)
+            self.campaign_status_ok_at = 0.0      # M60: last successful fetch (the age shown)
+            self.window_now = None                # M108: the server's current window {split_after_s, absorb_total_s, mode, at}
             self.job_total_s = 0.0
             self.longest_job_s = 0.0
             self.hour_best.clear()
+            self.sec_levels.clear()
             self.job_durations.clear()
+            self.depth_hist = {}
+            self.grant_depths.clear()
             self.last_reconcile = 0.0
 
     def log(self, msg):
@@ -1281,11 +1348,75 @@ class Volunteer:
         with self.lock:
             extra = list(self.extra)
             grid = str(self.param("grid", "5x5"))
+            nodes = self.split_after_nodes()
         argv = list(self.worker_base) + ["--grid", grid, "--two-tables", "--exit", str(job["exit"])]
         if seed != "":
             argv += ["--seed-path", seed]         # M41: the exit root "" runs without --seed-path
-        return argv + ["--time", "0", "--split-after", "%.1f" % split_after,
-                       "--status-every", str(STATUS_EVERY_MS)] + extra
+        # never 0 (= never split): sub-second windows (N18) keep three decimals
+        argv += ["--time", "0", "--split-after", "%.3f" % max(0.001, split_after)]
+        if nodes:
+            argv += ["--split-after-nodes", str(nodes)]   # deterministic splits (test campaigns, N18)
+        return argv + ["--status-every", str(STATUS_EVERY_MS)] + extra
+
+    def min_window_s(self):
+        """N18: the floor of a window and of every run's split time: 1 s unless the campaign sets
+        min_window_s (test campaigns use sub-second windows)."""
+        v = nonneg_float(self.campaign.get("min_window_s"))
+        return MIN_WINDOW_S_DEFAULT if v is None else min(3600.0, max(0.01, v))
+
+    def split_after_nodes(self):
+        """N18: a campaign's split_after_nodes N adds --split-after-nodes N to every run (the worker then
+        also splits deterministically after N expansions; test campaigns)."""
+        return pos_int(self.campaign.get("split_after_nodes"))
+
+    # ------------------------------------------------------------ windows (M108)
+    def note_window(self, sa, absorb, mode, source):
+        """The server's current window, from every lease response (and a heartbeat that carries one).
+        A job's window is chosen when the window starts, from the latest of these, never frozen at
+        lease time: a job leased while the pool was deep must not run a full window in the endgame."""
+        sa = nonneg_float(sa)
+        if not sa:
+            return
+        w = {"split_after_s": sa, "absorb_total_s": nonneg_float(absorb),
+             "mode": mode if isinstance(mode, str) and mode else None, "at": time.time(), "source": source}
+        with self.lock:
+            prev = self.window_now
+            self.window_now = w
+        # logged when the mode changes (an endgame window varies with the pool at every lease)
+        if w["mode"] and prev is not None and prev.get("mode") != w["mode"]:
+            self.log("the server's window is now %s s (%s); new windows use it" % (fmt_s(sa), w["mode"]))
+
+    def window_for(self, job):
+        """(split_after_s, absorb_total_s, mode) for a window of `job` that starts now."""
+        with self.lock:
+            w = dict(self.window_now) if self.window_now else None
+        sa = job.get("split_after_fixed")             # a fingerprint re-run keeps its own (longer) window
+        if sa is None:
+            sa = w["split_after_s"] if w else job.get("split_after_s")
+        if sa is None:
+            sa = self.fparam("split_after_s", 1800)
+        absorb = job.get("absorb_fixed")              # a per-job absorption budget from the grant
+        if absorb is None and w is not None and w.get("absorb_total_s") is not None:
+            absorb = w["absorb_total_s"]
+        if absorb is None:
+            absorb = job.get("absorb_total_s")
+        if absorb is None:
+            absorb = self.fparam("absorb_total_s", 120)
+        mode = w.get("mode") if w else job.get("window_mode")
+        return max(self.min_window_s(), float(sa)), max(0.0, float(absorb)), mode
+
+    def expected_s(self, depth, full):
+        """Expected wall time of a window of a job at `depth` (caller holds the lock): the mean of the
+        recent windows at that depth, else at the nearest shallower sampled depth (a deeper subtree is
+        rarely larger), else `full` (a job nothing is known about counts as a whole window)."""
+        h = self.depth_hist.get(depth)
+        if h and len(h) >= 2:
+            return sum(h) / len(h)
+        known = [d for d, x in self.depth_hist.items() if d < depth and len(x) >= 2]
+        if known:
+            x = self.depth_hist[max(known)]
+            return min(full, sum(x) / len(x))
+        return full
 
     def fparam(self, key, default):
         try:
@@ -1308,11 +1439,11 @@ class Volunteer:
         return nodes, rbytes
 
     def mean_job_s(self):
-        """Recent mean wall time of a window (job), used to size lease requests."""
+        """Recent mean wall time of a window (job), for the panel."""
         with self.lock:
             if self.job_durations:
                 return max(0.05, sum(self.job_durations) / len(self.job_durations))
-        return max(1.0, self.fparam("split_after_s", 1800))
+        return max(0.05, self.fparam("split_after_s", 1800))
 
     def held_ids(self):
         """Every job this client still owns (caller holds the lock): running, queued, and
@@ -1343,17 +1474,50 @@ class Volunteer:
 
     # ------------------------------------------------------------ leasing (7.6)
     def lease_want(self):
-        """How many more jobs to ask for: lease_ahead_s of work per idle worker at the
-        recent mean job duration, floor 1 per idle worker, minus what is already queued."""
+        """M108: how many jobs to ask for now, and whether an idle worker waits with nothing queued
+        (then the request may come before batch_interval_s is over).
+        - At most HOLD_PER_WORKER x workers jobs are here at once (running + queued): a big batch of
+          leased jobs waits behind the local queue while other clients could run it.
+        - By expected work, not by count: every worker should have its next job here when its current
+          window has less than L = min(lease_ahead_s, window) left. A running window's remaining time is
+          min(time to its split, max(expected - elapsed, elapsed)); a queued job counts its expected
+          work (expected_s: a job of a depth nothing is known about counts as a whole window, so shallow
+          jobs count as large and deep trivial ones as small). An idle worker always gets one."""
+        now = time.time()
         with self.lock:
-            idle = sum(1 for s in self.slots if s.job is None and not s.retire
-                       and s.thread is not None and s.thread.is_alive())
-            queued = len(self.queue)
-        if idle == 0:
-            return 0
-        per_worker = max(1, int(math.ceil(self.fparam("lease_ahead_s", 300) / self.mean_job_s())))
+            active = [s for s in self.slots if not s.retire and s.thread is not None and s.thread.is_alive()]
+            if not active:
+                return 0, False
+            running = sum(1 for s in self.slots if s.job is not None)
+            queued = list(self.queue)
+            w = self.window_now
+            sa = w["split_after_s"] if w else self.fparam("split_after_s", 1800)
+            ab = w["absorb_total_s"] if w and w.get("absorb_total_s") is not None else self.fparam("absorb_total_s", 120)
+            sa = max(self.min_window_s(), sa)
+            full = sa + max(0.0, ab)
+            horizon = min(max(1.0, self.fparam("lease_ahead_s", 300)), sa)
+            need, idle = 0.0, 0
+            for s in active:
+                if s.job is None:
+                    idle += 1
+                    need += horizon
+                    continue
+                e = self.expected_s(s.job.get("depth", seed_depth(s.job["seed"])), full)
+                el = max(0.0, now - s.started_at) if s.started_at else 0.0
+                to_end = s.window_end - now if s.window_end else full
+                rem = max(0.0, min(to_end, max(e - el, el)))
+                need += max(0.0, horizon - rem)
+            need -= sum(self.expected_s(j.get("depth", 0), full) for j in queued)
+            room = HOLD_PER_WORKER * len(active) - running - len(queued)
+            # a new grant is expected to look like the recent ones (their depths, valued with what is known now)
+            e_new = (sum(self.expected_s(d, full) for d in self.grant_depths) / len(self.grant_depths)
+                     if self.grant_depths else full)
+        if room <= 0:
+            return 0, False
+        floor = max(0, idle - len(queued))           # every idle worker gets a job
+        n = max(floor, int(math.ceil(need / max(0.05, e_new))) if need > 0 else 0)
         cap = int(self.fparam("lease_cap", LEASE_CAP))
-        return max(0, min(cap, idle * per_worker) - queued)
+        return max(0, min(n, room, cap)), idle > 0 and not queued
 
     def leaser_loop(self):
         while True:
@@ -1370,8 +1534,14 @@ class Volunteer:
     def _lease_once(self):
         if self.paused or time.time() < self.no_jobs_until:
             return
-        want = self.lease_want()
-        if want <= 0 or time.time() - self.last_lease_at < self.fparam("batch_interval_s", 10):
+        want, early = self.lease_want()
+        if want <= 0:
+            return
+        since = time.time() - self.last_lease_at
+        interval = self.fparam("batch_interval_s", 10)
+        # one request per batch_interval_s; sooner (LEASE_EARLY_GAP_S) only for an idle worker with
+        # nothing queued, so a short queue does not idle workers in a phase of trivial jobs (M108)
+        if since < interval and not (early and since >= min(interval, LEASE_EARLY_GAP_S)):
             return
         self.last_lease_at = time.time()
         body = {"token": self.token, "n": want}
@@ -1412,14 +1582,12 @@ class Volunteer:
                 self.log("the campaign ended while a lease was in flight; %d granted job(s) are not started" % len(jobs))
             return
         jobs = res.get("jobs")
-        try:
-            resp_sa = float(res.get("split_after_s")) if res.get("split_after_s") is not None else None
-        except (TypeError, ValueError):
-            resp_sa = None
+        resp_sa = nonneg_float(res.get("split_after_s"))
         # the absorption budget of this lease (jobs.js windowFor, M109): 0 in the endgame, so that
         # small windows hand their children back to idle clients; absent = the campaign's absorb_total_s
         resp_abs = nonneg_float(res.get("absorb_total_s"))
         mode = res.get("window_mode") if isinstance(res.get("window_mode"), str) else None
+        self.note_window(resp_sa, resp_abs, mode, "lease")
         good, bad_seed = [], []
         for j in jobs or []:
             if not isinstance(j, dict):
@@ -1433,16 +1601,16 @@ class Volunteer:
             if len(seed) > 4 * self.path_tok_max or not valid_seed(seed, self.path_tok_max):
                 bad_seed.append({"id": jid, "exit": ex, "seed": seed})
                 continue
-            try:
-                sa = float(j["split_after_s"]) if j.get("split_after_s") is not None else resp_sa
-            except (TypeError, ValueError):
-                sa = resp_sa
-            if sa is None:
-                sa = self.fparam("split_after_s", 1800)
-            ab = nonneg_float(j.get("absorb_total_s"))
-            good.append({"id": jid, "exit": ex, "seed": seed, "split_after_s": max(1.0, sa),
-                         "absorb_total_s": ab if ab is not None else resp_abs, "window_mode": mode,
-                         "leased_at": time.time()})
+            sa_job = nonneg_float(j.get("split_after_s"))   # only a fingerprint re-run carries its own window
+            depth = j.get("depth") if isinstance(j.get("depth"), int) and not isinstance(j.get("depth"), bool) else seed_depth(seed)
+            with self.lock:
+                self.lease_seq += 1
+                seq = self.lease_seq
+            good.append({"id": jid, "exit": ex, "seed": seed, "depth": depth, "est_s": nonneg_float(j.get("est_s")),
+                         "split_after_fixed": sa_job if sa_job else None,
+                         "split_after_s": resp_sa, "absorb_total_s": resp_abs,
+                         "absorb_fixed": nonneg_float(j.get("absorb_total_s")), "window_mode": mode,
+                         "dup": bool(j.get("dup")), "stolen": bool(j.get("stolen")), "leased_at": time.time(), "seq": seq})
         for j in bad_seed:
             self.log("!!! job %d has a seed this client cannot run (%d chars); reporting it as a failure"
                      % (j["id"], len(j["seed"])))
@@ -1460,15 +1628,23 @@ class Volunteer:
                 fresh.append(g)
             if dups:
                 self.stats["grants_deduped"] += len(dups)
+            if pref is not None and self.exit_pref == pref:
+                # M58: the first lease response after a change settles it: applied (a job of that exit
+                # came), or no open job there (jobs of other exits came: the server's fallback or stolen
+                # jobs); with no job at all the preference is simply tried again at the next lease
+                self.exit_pending = False
+                if any(j["exit"] == pref for j in good):
+                    self.exit_applied = True
+                    self.exit_fallback = False
+                elif good:
+                    if not self.exit_fallback:
+                        self.log("the server had no open jobs for exit %d; it handed out jobs of other exits%s"
+                                 % (pref, "" if fallback else " (taken from other clients' queues)"))
+                    self.exit_fallback = True
             if fresh:
+                self.grant_depths.extend(g["depth"] for g in fresh)
                 self.queue.extend(fresh)
                 self.cond.notify_all()
-                if pref is not None and self.exit_pref == pref:
-                    if any(j["exit"] == pref for j in fresh):
-                        self.exit_applied = True
-                    if fallback and not self.exit_fallback:
-                        self.log("the server had no open jobs for exit %d; it fell back to other exits" % pref)
-                    self.exit_fallback = fallback
             elif not good:
                 wait = max(5.0, self.fparam("batch_interval_s", 10))
                 self.no_jobs_until = time.time() + wait
@@ -1486,7 +1662,8 @@ class Volunteer:
                 if self.stopping or slot.retire or self.paused or self.draining:
                     return None
                 if self.queue:
-                    job = self.queue.popleft()
+                    job = min(self.queue, key=queue_key)     # M108: the server's lease order, not FIFO
+                    self.queue.remove(job)
                     slot.job = job
                     slot.drop_requested = False
                     return job
@@ -1552,7 +1729,9 @@ class Volunteer:
         ONE tree report. Returns 'ok' (a report was queued), 'fail' (J's run was void and a
         failure was reported), 'none' (nothing for J; the job is left untouched) or 'abandoned'."""
         start = time.time()
-        deadline = start + job["split_after_s"]
+        window_s, absorb_total, mode = self.window_for(job)     # M108: chosen now, not at lease time
+        min_w = self.min_window_s()
+        deadline = start + window_s
         nodes = []            # in insertion order: J first, then children (parent precedes child)
         index = {}
         root = {"seed": job["seed"], "parent": None, "status": "open"}
@@ -1568,9 +1747,9 @@ class Volunteer:
             slot.nodes_done = 0
             slot.phase = "window"
             slot.killed_by_client = False
-        self.log("worker %d: job %d exit %d window %.0f s%s seed %s"
-                 % (slot.idx, job["id"], job["exit"], job["split_after_s"],
-                    " (%s)" % job["window_mode"] if job.get("window_mode") not in (None, "full") else "",
+        self.log("worker %d: job %d exit %d window %s s%s seed %s"
+                 % (slot.idx, job["id"], job["exit"], fmt_s(window_s),
+                    " (%s)" % mode if mode not in (None, "full") else "",
                     job["seed"] or "(exit root)"))
         first = True
         while stack and not self.stopping:
@@ -1578,7 +1757,7 @@ class Volunteer:
             if now >= deadline and not first:
                 break
             seed = stack.pop()
-            res = self.run_worker(slot, job, seed, max(1.0, deadline - now))
+            res = self.run_worker(slot, job, seed, max(min_w, deadline - now))
             node = index[seed]
             if res.kind != "ok":
                 if slot.killed_by_client or slot.drop_requested:
@@ -1639,47 +1818,68 @@ class Volunteer:
                 slot.job = None
                 slot.phase = None
             return "none"
-        # absorption pass: probe every still-open local seed briefly
-        open_seeds = [n["seed"] for n in nodes if n["status"] == "open"]
-        absorb_total = job.get("absorb_total_s")
-        if absorb_total is None:
-            absorb_total = self.fparam("absorb_total_s", 120)
-        if open_seeds and not self.stopping and absorb_total > 0:
-            probe = max(0.5, self.fparam("absorb_probe_s", 10))
+        # absorption pass (DESIGN 7.3, review M18): probe the still-open local seeds briefly, deepest first
+        # (the cheap ones: REMAINING lists the cursor and the top of the stack first). A probe that
+        # finishes makes its node done. A probe that splits is kept as a split node with its summary and
+        # its REMAINING children, so none of its probe time is lost; the pass then goes on with that
+        # probe's own children only (deeper, the ones near its cursor are trivial): every seed still to
+        # come is no deeper than the one that split, i.e. larger. A probe that cannot even expand its
+        # root in the probe time ends the pass the same way. The budget is absorb_total_s.
+        todo = absorb_order([n["seed"] for n in nodes if n["status"] == "open"])
+        absorbed = probe_splits = 0
+        if todo and not self.stopping and absorb_total > 0:
+            probe = max(min(0.5, min_w), self.fparam("absorb_probe_s", 10))
             absorb_end = time.time() + absorb_total
             with self.lock:
                 slot.phase = "absorb"
                 slot.window_end = absorb_end
-            for seed in reversed(open_seeds):     # most recent (deepest) first
+                slot.stack = todo
+            while todo:
                 left = absorb_end - time.time()
-                if self.stopping or left < 0.5 or slot.drop_requested:
+                if self.stopping or left < min(0.5, min_w) or slot.drop_requested:
                     break
+                seed = todo.pop(0)
                 # spend up to absorb_total_s (PROTOCOL3 section 3): the last probe gets what is left
                 res = self.run_worker(slot, job, seed, min(probe, left), probe_run=True)
+                node = index[seed]
                 if res.kind != "ok":
                     if slot.killed_by_client:
                         break
-                    continue
+                    if res.reason == "not_expanded":
+                        break               # its root alone outlasts a probe: the rest is no deeper
+                    continue                # a void probe: the node stays open (searched again anyway)
                 run_hash = run_hash or res.hash
                 self._account(res.summary)
+                if res.level:               # a probe's level is real whatever the probe's outcome
+                    node["level"] = res.level
+                    self._note_level(job, res.level)
                 if res.summary["status"] == "exhausted":
-                    node = index[seed]
                     node["status"] = "done"
                     node["summary"] = res.summary
                     if res.unresolved:
                         node["unresolved"] = res.unresolved
-                    if res.level:
-                        node["level"] = res.level
-                        self._note_level(job, res.level)
+                    absorbed += 1
                     with self.lock:
                         slot.nodes_done += 1
-                else:
-                    # a probe that splits is reported open (its partial coverage is dropped, and its
-                    # candidates are found again by whoever searches the node), but a level it found is
-                    # real and must not be lost: the server accepts a level on an open node
-                    if res.level:
-                        index[seed]["level"] = res.level
-                        self._note_level(job, res.level)
+                    continue
+                new = [r for r in res.remaining if r not in index]
+                if not new:
+                    break                   # no usable split: the node stays open (with its level)
+                node["status"] = "split"
+                node["summary"] = res.summary
+                if res.unresolved:
+                    node["unresolved"] = res.unresolved
+                for r in new:
+                    child = {"seed": r, "parent": seed, "status": "open"}
+                    nodes.append(child)
+                    index[r] = child
+                probe_splits += 1
+                todo = absorb_order(new)    # only the split probe's own (deeper) children from here on
+                with self.lock:
+                    slot.stack = todo
+            if absorbed or probe_splits:
+                self.log("worker %d: job %d absorption: %d node(s) finished, %d probe(s) split and kept"
+                         % (slot.idx, job["id"], absorbed, probe_splits))
             if slot.killed_by_client or slot.drop_requested:
                 with self.lock:
                     slot.job = None
@@ -1718,6 +1918,10 @@ class Volunteer:
         dur = time.time() - start
         with self.lock:
             self.job_durations.append(dur)
+            d = job.get("depth", seed_depth(job["seed"]))
+            if d not in self.depth_hist and len(self.depth_hist) >= 512:
+                self.depth_hist.pop(next(iter(self.depth_hist)))
+            self.depth_hist.setdefault(d, collections.deque(maxlen=DEPTH_HIST_N)).append(dur)
             self.job_total_s += dur
             self.longest_job_s = max(self.longest_job_s, dur)
             self.stats["jobs_done"] += 1
@@ -1751,11 +1955,19 @@ class Volunteer:
             self.stats["runs"] += 1
 
     def _note_level(self, job, level):
+        """A run's LEVEL line. M66: it also feeds the last-hour and last-second boards (a run shorter
+        than one STATUS interval, or a level found after the last STATUS, never reaches them otherwise)."""
+        now = time.time()
         with self.lock:
             ex = str(job["exit"])
             cur = self.best_per_exit.get(ex)
             if cur is None or level["depth"] > cur["depth"]:
-                self.best_per_exit[ex] = {"depth": level["depth"], "code": level["code"], "job_id": job["id"]}
+                self.best_per_exit[ex] = {"depth": level["depth"], "code": level["code"], "job_id": job["id"],
+                                          "exit": job["exit"], "at": now}
+            self._hour_best_add(now, level["depth"], level["code"], job["exit"])
+            self.sec_levels.append((now, level["depth"], level["code"], job["exit"]))
+            while self.sec_levels and (now - self.sec_levels[0][0] > SEC_BOARD_S or len(self.sec_levels) > 256):
+                self.sec_levels.popleft()
 
     def queue_failure(self, job, reason, detail, run_hash):
         """PROTOCOL3 section 3 failure report {"job": id, "failed": reason}: the server counts
@@ -1805,6 +2017,7 @@ class Volunteer:
             slot.watchdog_fired = False
             slot.watchdog_why = ""
             slot.grace_killed = False
+            slot.frozen = False
             slot.stderr_tail.clear()
             slot.state = "running"
         pg = {"process_group": 0} if sys.version_info >= (3, 11) else {"preexec_fn": os.setpgrp}
@@ -1825,6 +2038,7 @@ class Volunteer:
             self._write_pidfile()
             if self.paused:
                 self._signal(slot, signal.SIGSTOP)
+                slot.frozen = True
                 slot.state = "paused"
             elif self.stopping:
                 slot.stop_pending = True   # SIGINT once the worker has printed its first line
@@ -1914,6 +2128,7 @@ class Volunteer:
             err_thread.join(2.0)
         with self.lock:
             slot.proc = None
+            slot.frozen = False
             slot.state = "idle"
             self._write_pidfile()
             # 'client': killed on purpose (drop, lease lost), nothing of this window is reported;
@@ -2405,6 +2620,11 @@ class Volunteer:
         first line yet may not have installed its handler: defer until it does."""
         if slot.proc is None:
             return
+        if slot.frozen:                      # a paused worker must run to print anything
+            self._signal(slot, signal.SIGCONT)
+            slot.frozen = False
+            if slot.state == "paused":
+                slot.state = "running"
         if not slot.saw_output:
             slot.stop_pending = True
             return
@@ -2431,42 +2651,74 @@ class Volunteer:
         with self.lock:
             self.exit_pref = ex
             self.exit_applied = ex is None
+            self.exit_pending = ex is not None       # until the next lease response settles it (M58)
             self.exit_fallback = False
         self.log("exit preference: %s (applies to the next lease request)" % ("any" if ex is None else ex))
         return True, None
 
     def pause(self):
+        """M56: every live worker except one handing back its work (after Stop or the watchdog) is
+        frozen, retiring ones included; `frozen` records it (never the state string)."""
         with self.lock:
+            self.resume_requested_at = 0.0           # M57: a click is answered either way
             if self.paused or self.stopping:
+                self.pause_requested_at = 0.0
                 return
             self.paused = True
             for s in self.slots:
-                if s.proc and s.state == "running":
+                if s.proc and not s.frozen and s.state != "finishing":
                     self._signal(s, signal.SIGSTOP)
-                    s.state = "paused"
-        with self.lock:
+                    s.frozen = True
+                    if s.state == "running":
+                        s.state = "paused"
             self.pause_requested_at = 0.0
         self.log("paused (workers stopped with SIGSTOP; their memory stays allocated)")
         self.heartbeat_now = True
 
     def resume(self):
         with self.lock:
+            self.pause_requested_at = 0.0
             if not self.paused:
+                self.resume_requested_at = 0.0
                 return
             self.paused = False
             now = time.time()
             for s in self.slots:
-                if s.proc and s.state == "paused":
+                if s.proc and s.frozen:
                     self._signal(s, signal.SIGCONT)
-                    s.state = "running"
+                    s.frozen = False
+                    if s.state == "paused":
+                        s.state = "running"
                     # the watchdog counts silence and overrun only while running: a worker whose split
                     # time passed during the pause splits at once, and gets the usual slack to do it
                     s.last_line_at = now
                     s.split_at = max(s.split_at, now)
-        with self.lock:
             self.resume_requested_at = 0.0
         self.log("resumed")
         self.heartbeat_now = True
+
+    def _on_sigtstp(self, *_):
+        """Ctrl-Z (M61): the workers run in their own process group, so the terminal's SIGTSTP reaches
+        only the client. Freeze them with it (a stopped client would otherwise leave them running
+        unsupervised), stop, and thaw exactly those when the shell continues us (fg / SIGCONT)."""
+        froze = []
+        with self.lock:
+            for s in self.slots:
+                if s.proc and not s.frozen:
+                    self._signal(s, signal.SIGSTOP)
+                    s.frozen = True
+                    froze.append((s, s.proc))
+        try:
+            sys.stderr.write("\n[volunteer] Ctrl-Z: client and workers stopped; `fg` continues them\n")
+        except (OSError, ValueError):
+            pass
+        os.kill(os.getpid(), signal.SIGSTOP)
+        with self.lock:                        # continued
+            for s, p in froze:
+                if s.proc is p and s.frozen:
+                    self._signal(s, signal.SIGCONT)
+                    s.frozen = False
+        self.log("continued after Ctrl-Z (%d worker(s) resumed)" % len(froze))
 
     def request_stop(self, reason="stop requested", user=False):
         with self.lock:
@@ -2539,8 +2791,8 @@ class Volunteer:
                 s.state = "idle"
                 s.thread = threading.Thread(target=self.slot_loop, args=(s,), name="worker-%d" % s.idx, daemon=True)
                 s.thread.start()
-            elif s.retire and s.job is not None:
-                s.state = "retiring"
+            # M56: retirement is `s.retire` (shown by the panel); the process state is never overwritten,
+            # so Pause, Resume, the watchdog and the stop grace keep working on a retiring worker
 
     # ------------------------------------------------------------ heartbeat / wake
     def boards(self):
@@ -2591,6 +2843,13 @@ class Volunteer:
             return res
         if not self.apply_campaign(res.get("campaign")):
             return res
+        # the server's current window, when the heartbeat carries it (M108): windows starting now use it
+        win = res.get("window")
+        if isinstance(win, dict):
+            self.note_window(win.get("split_after_s"), win.get("absorb_total_s"), win.get("mode") or win.get("window_mode"),
+                             "heartbeat")
+        elif res.get("split_after_s_now") is not None:
+            self.note_window(res.get("split_after_s_now"), res.get("absorb_total_s_now"), res.get("window_mode_now"), "heartbeat")
         hashes = [str(h).lower() for h in (self.campaign.get("hashes") or [])]
         if hashes and self.src_hash not in hashes and not self.stopping:
             self.fatal_stop(2, "The campaign's accepted worker hashes changed.\n" + self.hash_refusal(hashes))
@@ -2663,6 +2922,7 @@ class Volunteer:
         if isinstance(st, dict):
             with self.lock:
                 self.campaign_status = st
+                self.campaign_status_ok_at = time.time()     # M60: the age shown counts from here
 
     def pending_flags(self, now):
         """Human-readable 'working...' phases for controls that are not instantaneous (8.1)."""
@@ -2675,9 +2935,10 @@ class Volunteer:
         elif fresh and now - self.workers_changed_at < 60 and self.workers > self.workers_prev and not self.paused:
             p["workers"] = "%d new worker%s waiting for a job (next lease within %d s)…" % (
                 len(fresh), "" if len(fresh) == 1 else "s", int(self.fparam("batch_interval_s", 10)))
-        if self.exit_pref is not None and not self.exit_applied and not self.stopping:
+        if self.exit_pref is not None and self.exit_pending and not self.stopping and not self.draining:
             p["exit"] = "current jobs finish first; new leases use exit %d" % self.exit_pref
-        running = [s for s in self.slots if s.proc and s.state == "running"]
+        # M56/M57: workers still to freeze = live, not frozen, not handing back their work
+        running = [s for s in self.slots if s.proc and not s.frozen and s.state != "finishing"]
         if self.pause_requested_at and (not self.paused or running) and not self.stopping:
             p["pause"] = "freezing %d worker%s…" % (len(running), "" if len(running) == 1 else "s")
         elif self.resume_requested_at and self.paused and not self.stopping:
@@ -2722,9 +2983,10 @@ class Volunteer:
         with self.lock:
             held = []
             for s in self.slots:
-                if s.proc and s.state == "running":
+                if s.proc and not s.frozen and s.state == "running":
                     self._signal(s, signal.SIGSTOP)
-                    held.append(s)
+                    s.frozen = True
+                    held.append((s, s.proc))
         deadline = time.time() + WAKE_HEARTBEAT_RETRY_S
         res = None
         while res is None and time.time() < deadline and not self.stopping:
@@ -2746,11 +3008,16 @@ class Volunteer:
                     self.log("dropping queued jobs whose lease expired: %s" % dropped)
                     self.queue = collections.deque(j for j in self.queue if j["id"] in valid)
             now = time.time()
-            for s in held:
+            for s, p in held:
                 s.last_line_at = now
                 s.split_at = max(s.split_at, now)     # the sleep is not a hang (watchdog baseline)
-                if s.proc and not self.paused and s.state == "running":
+                if s.proc is not p or not s.frozen:
+                    continue                          # finished, killed or stopped meanwhile
+                if self.paused:
+                    s.state = "paused"                # paused meanwhile: stays frozen until Resume (M56)
+                else:
                     self._signal(s, signal.SIGCONT)
+                    s.frozen = False
 
     # ------------------------------------------------------------ closing summary (new feature)
     def closing_summary(self, session=True):
@@ -2821,6 +3088,9 @@ class Volunteer:
             if e.get("roots") is not None:
                 cov = e.get("roots_covered")
                 tags.append("%s/%s roots covered" % ("?" if cov is None else cov, e.get("roots")))
+            nc = open_candidates(e)
+            if nc:
+                tags.append("%d unresolved candidate(s) deeper than the best" % nc)
             rows.append("exit %s: longest level %s moves%s%s" % (
                 k, b.get("moves") if b else "?", " by %s" % b.get("by") if b and b.get("by") else "",
                 " (%s)" % "; ".join(tags) if tags else ""))
@@ -2837,9 +3107,20 @@ class Volunteer:
                 w = sn.get("win")
                 if w and (best_second is None or w["depth"] > best_second["depth"]):
                     best_second = dict(w, exit=sn.get("exit"))
+            while self.sec_levels and now - self.sec_levels[0][0] > SEC_BOARD_S:
+                self.sec_levels.popleft()
+            for t, d, code, ex in self.sec_levels:        # M66: LEVEL lines of runs that just ended
+                if best_second is None or d > best_second["depth"]:
+                    best_second = {"depth": d, "code": code, "exit": ex}
             while self.hour_best and now - self.hour_best[0][0] > 3600:
                 self.hour_best.popleft()
             hb = self.hour_best
+            best_session = None
+            for b in self.best_per_exit.values():
+                if best_session is None or b["depth"] > best_session["depth"]:
+                    best_session = dict(b)
+            n_active = sum(1 for x in self.slots if not x.retire)
+            status_age = round(now - self.campaign_status_ok_at) if self.campaign_status_ok_at else None
             return {
                 "name": self.name,
                 "client_version": CLIENT_VERSION,
@@ -2856,10 +3137,16 @@ class Volunteer:
                 "server": {"url": self.api.server, "connected": self.api.connected,
                            "last_ok": self.api.last_ok, "last_error": self.api.last_error,
                            "last_heartbeat_ok": self.last_heartbeat_ok},
-                "campaign": {k: self.campaign.get(k) for k in ("id", "title", "grid", "extra", "split_after_s", "lease_s",
-                                                             "workers_max", "paused_max_s", "batch_interval_s",
-                                                             "lease_ahead_s", "absorb_total_s", "absorb_probe_s",
-                                                             "heartbeat_s", "lease_cap")},
+                "campaign": {k: self.campaign.get(k) for k in ("id", "title", "grid", "extra", "split_after_s",
+                                                             "ramp_split_after_s", "lease_s", "workers_max", "paused_max_s",
+                                                             "batch_interval_s", "lease_ahead_s", "absorb_total_s",
+                                                             "absorb_probe_s", "heartbeat_s", "lease_cap", "min_window_s",
+                                                             "split_after_nodes", "release")},
+                "phase": self.phase_name,
+                "keep_going": bool(getattr(self.args, "keep_going", False)),
+                "stop_on_close": not getattr(self.args, "no_stop_on_close", False),
+                "window_now": self.window_now,
+                "hold_cap": HOLD_PER_WORKER * n_active,
                 "mean_job_s": round(self.mean_job_s(), 1),
                 "src_hash": self.src_hash,
                 "outbox": len(self.outbox_meta),
@@ -2873,14 +3160,18 @@ class Volunteer:
                 # section 8
                 "exit_pref": self.exit_pref,
                 "exit_applied": self.exit_applied,
+                "exit_pending": self.exit_pending,
                 "exit_fallback": self.exit_fallback,
                 "campaign_exits": self.campaign.get("exits"),
                 "pending_flags": self.pending_flags(now),
                 "me": self.me,
                 "exits": self.exits,
                 "campaign_status": self.campaign_status,
-                "campaign_status_age": round(now - self.campaign_status_at) if self.campaign_status else None,
+                # M60: counted from the last successful fetch; stale after 90 s
+                "campaign_status_age": status_age if self.campaign_status else None,
+                "campaign_status_stale": bool(self.campaign_status and (status_age is None or status_age > 90)),
                 "best_second": best_second,
+                "best_session": best_session,
                 "best_hour": ({"depth": hb[0][1], "code": hb[0][2], "exit": hb[0][3], "at": hb[0][0]} if hb else None),
                 "session": {
                     "uptime_s": round(now - self.session_start),
@@ -2904,6 +3195,8 @@ class Volunteer:
         signal.signal(signal.SIGTERM, lambda *_: self._async_stop("SIGTERM"))
         if hasattr(signal, "SIGHUP"):     # M14: closing the terminal = Stop, never a silent death
             signal.signal(signal.SIGHUP, lambda *_: self._async_stop("SIGHUP (terminal closed)"))
+        if hasattr(signal, "SIGTSTP"):    # M61: Ctrl-Z stops the workers with the client
+            signal.signal(signal.SIGTSTP, self._on_sigtstp)
 
     def _async_stop(self, reason):
         if self.phase_name in ("startup", "waiting"):
@@ -3105,7 +3398,7 @@ class Volunteer:
                 if s.stop_pending and s.proc and now - s.run_started_at > 5.0:
                     s.saw_output = True      # silent for 5 s: assume it is up and signal it
                     self._send_stop(s)
-                if s.proc and s.state == "running" and not s.watchdog_fired and not self.paused:
+                if s.proc and s.state == "running" and not s.frozen and not s.watchdog_fired and not self.paused:
                     quiet_since = max(s.last_line_at, s.split_at)
                     overrun = now > s.split_at + max(600.0, s.split_after_s)
                     if now - quiet_since > slack or overrun:
@@ -3283,7 +3576,8 @@ class Volunteer:
 def main():
     ap = argparse.ArgumentParser(description="Pathology collective search volunteer client (protocol %d)" % PROTOCOL)
     ap.add_argument("--name", help="your display name (fixed at first registration)")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
+    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="search processes, one core and about 0.5 GB of memory each (default: half the logical cores)")
     ap.add_argument("--exit", type=int, default=None, help="prefer jobs of this exit (default: any)")
     ap.add_argument("--server", default=os.environ.get("VOLUNTEER_SERVER", DEFAULT_SERVER))
     ap.add_argument("--port", type=int, default=8765, help="local GUI port (127.0.0.1 only)")

@@ -19,6 +19,7 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
   body { padding: 14px 16px 40px; max-width: 1200px; margin: 0 auto; }
+  body.stale section { opacity: .45; }
   h1 { font-size: 22px; margin: 0 0 2px; }
   h2 { font-size: 16px; margin: 0 0 8px; color: var(--muted); font-weight: 600; letter-spacing: .3px; }
   h2 .n { display: inline-block; width: 22px; height: 22px; border-radius: 50%; background: var(--panel2); color: var(--text); text-align: center; line-height: 22px; font-size: 13px; margin-right: 8px; }
@@ -28,6 +29,7 @@
   label { color: var(--muted); font-size: 12.5px; display: block; }
   input[type=text] { background: var(--panel2); color: var(--muted); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 5px 8px; width: 160px; max-width: 100%; }
   input[type=number] { width: 64px; background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 4px 6px; }
+  input.unapplied { border-color: var(--warn); }
   select { background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); border-radius: 5px; padding: 5px 6px; max-width: 100%; }
   button { background: var(--accent); color: #000; border: none; border-radius: 6px; padding: 6px 14px; font-weight: 600; cursor: pointer; }
   button.secondary { background: var(--panel2); color: var(--text); border: 1px solid rgb(90,90,90); font-weight: 500; }
@@ -35,13 +37,16 @@
   button.small { padding: 3px 9px; font-size: 12px; }
   button:disabled { opacity: .4; cursor: default; }
   .hint { color: var(--muted); font-size: 12.5px; }
+  .note { color: var(--warn); font-size: 12.5px; margin-top: 4px; min-height: 0; }
   .working { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px 10px; border-radius: 6px; background: var(--panel2); border-left: 3px solid var(--warn); font-size: 13px; }
   .working::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--warn); border-right-color: transparent; border-radius: 50%; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .banner { background: var(--panel2); border-left: 4px solid var(--warn); padding: 8px 12px; border-radius: 6px; margin-top: 10px; }
   .banner.bad { border-left-color: var(--bad); }
   .banner.good { border-left-color: var(--good); }
+  .banner .big { font-size: 17px; font-weight: 700; }
   .banner pre { white-space: pre-wrap; margin: 6px 0 0; font: 13px/1.45 Consolas, Menlo, monospace; }
+  .banner .close { margin-top: 6px; font-weight: 600; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px 16px; }
   .tile-k { color: var(--muted); font-size: 12px; }
   .tile-v { font-size: 18px; font-weight: 600; word-break: break-word; }
@@ -49,17 +54,17 @@
   .dot.ok { background: var(--good); } .dot.bad { background: var(--bad); } .dot.warn { background: var(--warn); }
   .workers { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
   .worker { background: var(--panel2); border-radius: 8px; padding: 10px 12px; display: flex; gap: 12px; flex-wrap: wrap; }
-  .worker .facts { flex: 1 1 150px; font-size: 13px; }
+  .worker .facts { flex: 1 1 150px; font-size: 13px; min-width: 0; }
   .worker .facts div { margin: 1px 0; }
   .worker .k { color: var(--muted); }
   .seed { font-family: Consolas, Menlo, monospace; font-size: 12px; word-break: break-all; }
   .boards { display: flex; gap: 16px; flex-wrap: wrap; }
-  .board { flex: 0 1 auto; max-width: 100%; }
+  .board { flex: 0 1 auto; max-width: 100%; min-width: 0; }
   .board .cap { color: var(--muted); font-size: 12.5px; margin-bottom: 3px; }
   .board .cap b { color: var(--text); }
   .board .who { color: var(--muted); font-size: 12px; margin-top: 3px; }
-  .code { display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
-  .code code { font-family: Consolas, Menlo, monospace; font-size: 11.5px; background: var(--bg); padding: 3px 6px; border-radius: 4px; word-break: break-all; }
+  .code { display: flex; gap: 6px; align-items: center; margin-top: 4px; flex-wrap: wrap; max-width: 260px; }
+  .code code { font-family: Consolas, Menlo, monospace; font-size: 11.5px; background: var(--bg); padding: 3px 6px; border-radius: 4px; word-break: break-all; user-select: all; }
   .lvlgrid { display: grid; gap: 2px; background: var(--bg); padding: 8px; border-radius: 4px; width: max-content; font-weight: 400; max-width: 100%; }
   .tile { position: relative; background: var(--level-grid); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; user-select: none; }
   .tile.visited { background: var(--level-grid-used); }
@@ -76,31 +81,34 @@
   th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid rgb(80,80,80); white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; }
   td.num, th.num { text-align: right; }
+  td.ok { color: var(--good); } td.warn { color: var(--warn); }
   tr.sel td { background: rgba(90, 160, 255, .12); }
   dl { margin: 0; }
   dt { font-weight: 600; margin-top: 8px; }
   dd { margin: 2px 0 0; color: var(--muted); font-size: 13.5px; }
   pre.log { background: var(--panel2); border-radius: 6px; padding: 8px 10px; font-size: 12px; max-height: 180px; overflow: auto; white-space: pre-wrap; margin: 8px 0 0; }
   details summary { cursor: pointer; color: var(--muted); }
+  #fresh { font-size: 12px; color: var(--muted); }
+  #fresh.bad { color: var(--bad); font-weight: 600; }
   @media (max-width: 480px) { body { padding: 10px 10px 30px; } section { padding: 12px; } .tile-v { font-size: 16px; } .workers { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <h1>Pathology volunteer</h1>
-<p class="sub">Control panel for the search client on this machine. This page talks only to <code>127.0.0.1</code>; the client talks to <code id="serverUrl"></code>.</p>
+<p class="sub">Control panel for the search client on this machine. This page talks only to <code>127.0.0.1</code>; the client talks to <code id="serverUrl"></code>. <span id="fresh"></span></p>
 <div id="banner" class="banner" hidden></div>
 
 <section id="controls">
   <h2><span class="n">1</span>Controls</h2>
   <div class="row">
     <div><label>Name (fixed after registration)<input type="text" id="name" readonly></label></div>
-    <div><label>Workers</label><div class="row" style="gap:6px"><input type="number" id="workers" min="1" max="64"> <button class="secondary" id="applyWorkers">Apply</button></div></div>
+    <div><label for="workers">Workers</label><div class="row" style="gap:6px"><input type="number" id="workers" min="1" max="32"> <button class="secondary" id="applyWorkers">Apply</button></div><div class="note" id="workersNote"></div></div>
     <div><label>Exit to work on</label><select id="exitSel"><option value="">Any exit</option></select></div>
     <div class="row" style="gap:8px"><button id="pauseBtn">Pause</button><button id="resumeBtn" class="secondary">Resume</button><button id="stopBtn" class="danger">Stop</button></div>
   </div>
   <div id="pendingBox"></div>
   <div id="fallback" class="banner" hidden></div>
-  <p class="hint" style="margin:10px 0 0"><b>Pause</b> freezes the worker processes: they keep their memory (up to several GB each) and their jobs stay reserved for you (<span id="pausedMax">12 h</span>). <b>Stop</b> makes every worker hand back the exact unexplored part of its job within seconds, sends the last report and exits the client. Fewer workers: the extra ones finish their current job first. More workers: they start with the next lease. The exit choice applies to the next lease request; running jobs are not interrupted.</p>
+  <p class="hint" style="margin:10px 0 0"><b>Pause</b> freezes the worker processes: they keep their memory (about 0.5 GB each) and their jobs stay reserved for you <span id="pausedMax">for up to 12 h after each lease</span>, as long as this client stays online. <b>Stop</b> makes every worker hand back the exact unexplored part of its job within seconds, sends the last report and exits the client. Fewer workers: the extra ones finish their current job first. More workers: they start with the next lease. The exit choice applies to the next lease request; running jobs are not interrupted. Type a worker count and press Enter or Apply.</p>
   <div class="tiles" style="margin-top:12px">
     <div><div class="tile-k">Server</div><div class="tile-v" id="conn"><span class="dot"></span>…</div></div>
     <div><div class="tile-k">Leased ahead</div><div class="tile-v" id="queued">0</div></div>
@@ -112,13 +120,15 @@
 <section>
   <h2><span class="n">2</span>What is happening</h2>
   <div class="workers" id="workersBox"></div>
-  <p class="hint" style="margin:8px 0 0">Each worker owns one <b>job</b> (a subtree named by its seed path) for a <b>window</b>. Inside the window it keeps a local stack of sub-trees; at the end it briefly probes what is left (absorbing) and reports the whole tree once. Grey cells in the board are not decided yet.</p>
+  <p class="hint" style="margin:8px 0 0">Each worker owns one <b>job</b> (a subtree named by its seed path) for a <b>window</b>. Inside the window it keeps a local stack of sub-trees; at the end it briefly probes what is left, deepest first (absorbing), and reports the whole tree once. Grey cells in the board are not decided yet.</p>
 </section>
 
 <section>
   <h2><span class="n">3</span>Levels</h2>
-  <div class="boards" id="levels"></div>
-  <p class="hint" style="margin:8px 0 0">Depth = number of moves the level needs. The codes are Pathology level codes (rows separated by <code>/</code>): copy one to play it.</p>
+  <div class="boards" id="levels">
+    <div class="board" id="bSecond"></div><div class="board" id="bHour"></div><div class="board" id="bSession"></div><div class="board" id="bGlobal"></div>
+  </div>
+  <p class="hint" style="margin:8px 0 0">Depth = number of moves the level needs. The codes are Pathology level codes (rows separated by <code>/</code>): copy one to play it. A board holds still while the pointer is on it, so its code can be copied or selected.</p>
 </section>
 
 <section>
@@ -130,20 +140,21 @@
 
 <section>
   <h2><span class="n">5</span>Campaign</h2>
-  <div class="tablewrap"><table id="campTable"><thead><tr><th>Exit</th><th class="num">Roots covered</th><th class="num">Open</th><th class="num">Leased</th><th class="num">CPU hours</th><th class="num">Best</th><th>By</th></tr></thead><tbody></tbody></table></div>
+  <div class="tablewrap"><table id="campTable"><thead id="campHead"></thead><tbody id="campBody"></tbody></table></div>
   <div class="tiles" style="margin-top:10px" id="campTotals"></div>
-  <p class="hint" style="margin:8px 0 0">"Roots covered" counts the top-level jobs whose whole subtree is finished. The total amount of work is unknown until it is done, so no percentage of the search is shown anywhere.</p>
+  <p class="hint" style="margin:8px 0 0">"Roots covered" counts the top-level jobs whose whole subtree is finished. An exit is <b>exact</b> when it is covered and every unresolved candidate (a state whose shortcut check hit a capacity limit) deeper than its best has been checked. The total amount of work is unknown until it is done, so no percentage of the search is shown anywhere.</p>
 </section>
 
 <section>
   <h2><span class="n">6</span>How it works</h2>
   <dl>
     <dt>A job</dt><dd>One node of the search tree and everything below it, named by its <i>seed path</i> (a list of backward moves such as <code>U2,R3,L1</code>). Any worker given the same seed explores exactly the same subtree, so nothing depends on who runs it or when.</dd>
-    <dt>Windows and splitting</dt><dd>A worker keeps a job for a window of <span id="windowLen">30 min</span>. A job that outlives its window prints the exact list of subtrees it has not finished; those become new jobs and the parent is marked split. The pieces are disjoint and together they are precisely the unexplored part, so nothing is lost or repeated. Trivial pieces are finished on this machine and never reach the server.</dd>
-    <dt>Pausing</dt><dd>Pause freezes the worker processes (SIGSTOP). They keep their memory, and their jobs stay reserved for up to <span id="pausedMax2">12 h</span>, so a paused laptop resumes exactly where it was.</dd>
-    <dt>Stopping</dt><dd>Stop asks each worker to hand back its remaining work. That takes seconds: the worker prints its remaining subtrees, the client reports them, and only then exits. Closing this tab also stops the client.</dd>
+    <dt>Windows and splitting</dt><dd>A worker keeps a job for a window of <span id="windowLen">30 min</span> (the server shortens it near the end of a campaign; each window uses the length current when it starts). A job that outlives its window prints the exact list of subtrees it has not finished; those become new jobs and the parent is marked split. The pieces are disjoint and together they are precisely the unexplored part, so nothing is lost or repeated. Trivial pieces are finished on this machine and never reach the server.</dd>
+    <dt>Pausing</dt><dd>Pause freezes the worker processes (SIGSTOP). They keep their memory, and while this client stays online their jobs stay reserved <span id="pausedMax2">for up to 12 h after each lease</span>. A paused laptop that also sleeps or goes offline for longer than that loses them; the work is simply done by someone else.</dd>
+    <dt>Stopping</dt><dd>Stop asks each worker to hand back its remaining work. That takes seconds: the worker prints its remaining subtrees, the client reports them, and only then exits. <span id="closeText">Closing this tab also stops the client.</span></dd>
+    <dt>When the campaign is complete</dt><dd>The client stops asking for work, delivers its last reports, shows the result here and in the terminal, and exits by itself (with <code>--keep-going</code> it waits for the next campaign instead).</dd>
     <dt>Changing the worker count</dt><dd>Extra workers finish their current job and then retire; new workers start with the next lease (within <span id="batchLen">10 s</span>).</dd>
-    <dt>Leases</dt><dd>A job is reserved for the client that took it for <span id="leaseLen">1.0 h</span>. If that client vanishes (crash, power loss), the job simply returns to the pool afterwards and someone else picks it up.</dd>
+    <dt>Leases</dt><dd>A job is reserved for the client that took it for <span id="leaseLen">1.0 h</span>, renewed by every heartbeat. If that client vanishes (crash, power loss), the job simply returns to the pool afterwards and someone else picks it up. The client keeps at most two jobs per worker, so nothing waits here that another volunteer could run.</dd>
     <dt>"Done" fractions</dt><dd>An exit is proven when every root job is covered: finished, or split with all children covered. The panel shows covered roots out of all roots plus CPU hours spent. Roots differ enormously in size, so this is not a percentage of the total work, and no such percentage exists before the end.</dd>
   </dl>
   <details style="margin-top:10px"><summary>Client log</summary><pre class="log" id="log"></pre></details>
@@ -152,16 +163,58 @@
 
 <script>
 'use strict';
-/* Tile renderer copied from PathologyRecords/server/public/collective.js, with one
-   addition: '?' cells (uncommitted in the search cursor) render grey as "unknown". */
+/* ==== BEGIN PURE (no DOM; test_client.sh test y runs these helpers in node) ==== */
+/* Level codes (M55): the server joins rows with '\n', the worker with '/'. Rows of level characters only. */
+function levelRows(code) {
+  const rows = String(code == null ? '' : code).trim().split(/[\/\r\n]+/).filter(r => r.length);
+  if (!rows.length || !rows.every(r => /^[0-9A-Z?]+$/.test(r))) return null;
+  return rows;
+}
+/* the one form shown and copied: rows joined with '/' (what the site accepts on paste) */
+function codeText(code) { const r = levelRows(code); return r ? r.join('/') : null; }
+/* M59: with no exit preference, the exit whose best is the longest (ties: the lowest exit) */
+function globalExit(exits, pref) {
+  if (pref != null) return String(pref);
+  let best = null;
+  for (const e of Object.keys(exits || {})) {
+    const b = exits[e] && exits[e].best;
+    if (!b || b.moves == null) continue;
+    const cur = best == null ? null : exits[best].best.moves;
+    if (cur == null || b.moves > cur || (b.moves === cur && Number(e) < Number(best))) best = e;
+  }
+  return best;
+}
+/* unresolved candidates deeper than the exit's best, from whichever field the server sends (null = none sent) */
+function openCands(x) {
+  if (!x) return null;
+  for (const k of ['candidates_open_deeper', 'open_candidates', 'unresolved_open']) if (Number.isInteger(x[k])) return x[k];
+  const c = x.candidates;
+  if (c && typeof c === 'object') for (const k of ['open_deeper', 'open']) if (Number.isInteger(c[k])) return c[k];
+  return null;
+}
+function exactLabel(x) {
+  if (!x) return ['', ''];
+  if (x.exact === true) return ['exact', 'ok'];
+  if (x.clean === true) return ['covered; candidates open', 'warn'];
+  if (x.clean === false) return ['in progress', ''];
+  return ['not audited yet', ''];
+}
+function fmtH(sec) { return (Number(sec || 0) / 3600).toFixed(2); }
+function fmtDur(sec) { sec = Math.round(Number(sec || 0)); if (sec < 90) return sec + ' s'; if (sec < 5400) return Math.round(sec / 60) + ' min'; if (sec < 172800) return (sec / 3600).toFixed(1) + ' h'; return Math.round(sec / 86400) + ' d'; }
+function fmtN(n) { return n == null ? '–' : Number(n).toLocaleString(); }
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+/* ==== END PURE ==== */
+
+/* Tile renderer copied from PathologyRecords/server/public/collective.js, with two additions:
+   '?' cells (uncommitted in the search cursor) render grey as "unknown", and rows may differ in length. */
 const CHAR_TO_MASK = { '2': 15, '6': 8, '7': 1, '8': 2, '9': 4, 'A': 9, 'B': 3, 'C': 6, 'D': 12, 'E': 7, 'F': 14, 'G': 13, 'H': 11, 'I': 10, 'J': 5 };
-function renderLevel(code, moves, scale = 30) {
-  const grid = String(code).trim().split('\n'); const rows = grid.length, cols = grid[0].length;
+function renderLevel(rows, moves, scale) {
+  const nr = rows.length, nc = Math.max(...rows.map(r => r.length));
   const div = document.createElement('div'); div.className = 'lvlgrid';
-  div.style.gridTemplateColumns = `repeat(${cols}, ${scale}px)`;
+  div.style.gridTemplateColumns = `repeat(${nc}, ${scale}px)`;
   const bw = Math.round(scale / 4.5);
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const ch = grid[r][c], t = document.createElement('div'); t.className = 'tile';
+  for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) {
+    const ch = rows[r][c] || '?', t = document.createElement('div'); t.className = 'tile';
     t.style.width = t.style.height = scale + 'px';
     if (ch === '1') t.classList.add('wall');
     else if (ch === '5') { t.classList.add('hole'); t.style.borderWidth = bw + 'px'; }
@@ -184,19 +237,20 @@ const $ = id => document.getElementById(id);
 /* Every POST carries this page's per-session secret: the client refuses control requests without it
    (a page from another site never sees it), and answers only for Host 127.0.0.1/localhost. */
 const SECRET = (document.querySelector('meta[name="volunteer-secret"]') || {}).content || '';
-const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const SCALE = window.innerWidth < 480 ? 16 : 20;
-function boardText(code) {
-  const s = String(code || '');
-  if (!/^[0-9A-Z?]+(\/[0-9A-Z?]+)*$/.test(s)) return null;   // only level characters get through
-  return s.split('/').join('\n');
-}
-function fmtH(sec) { return (Number(sec || 0) / 3600).toFixed(2); }
-function fmtDur(sec) { sec = Math.round(Number(sec || 0)); if (sec < 90) return sec + ' s'; if (sec < 5400) return Math.round(sec / 60) + ' min'; if (sec < 172800) return (sec / 3600).toFixed(1) + ' h'; return Math.round(sec / 86400) + ' d'; }
 function fmtWhen(ts) { if (!ts) return ''; const d = new Date(Number(ts) * 1000); return isNaN(d) ? '' : d.toLocaleString(); }
-function fmtN(n) { return n == null ? '–' : Number(n).toLocaleString(); }
+
+/* M63: nothing is rebuilt unless its content changed, and never under the pointer or a text selection */
+function setHTML(el, html) { if (el && el._html !== html) { el._html = html; el.innerHTML = html; } }
+function setText(el, t) { t = String(t == null ? '' : t); if (el && el.textContent !== t) el.textContent = t; }
+function hovered(el) { try { return !!(el && el.matches && el.matches(':hover')); } catch (e) { return false; } }
+function selectionIn(el) {
+  const s = window.getSelection ? window.getSelection() : null;
+  return !!(s && s.rangeCount && !s.isCollapsed && el && el.contains && el.contains(s.anchorNode));
+}
+
 function copyText(txt, btn) {
-  const done = () => { const o = btn.textContent; btn.textContent = 'copied'; setTimeout(() => { btn.textContent = o; }, 1200); };
+  const done = () => { btn.textContent = 'copied'; setTimeout(() => { btn.textContent = 'copy'; }, 1200); };
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done, () => fallbackCopy(txt, done));
   else fallbackCopy(txt, done);
 }
@@ -204,24 +258,39 @@ function fallbackCopy(txt, done) {
   const ta = document.createElement('textarea'); ta.value = txt; ta.style.position = 'fixed'; ta.style.opacity = '0';
   document.body.appendChild(ta); ta.select(); try { document.execCommand('copy'); done(); } catch (e) {} document.body.removeChild(ta);
 }
-/* A board with caption, depth, optional attribution, and the Pathology code with a copy button. */
-function boardEl(caption, b, opts = {}) {
-  const wrap = document.createElement('div'); wrap.className = 'board';
+/* one delegated listener: a copy button works even if its board was redrawn since the page loaded */
+document.addEventListener('click', ev => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-copy]') : null;
+  if (btn) copyText(btn.getAttribute('data-copy'), btn);
+});
+
+/* A board (caption, depth, optional attribution, the level, its code with a copy button), redrawn only on change. */
+function updateBoard(el, caption, b, opts = {}) {
+  const rows = b ? levelRows(b.code) : null;
+  const key = JSON.stringify([caption, b ? b.depth : null, b ? b.exit : null, rows, opts.who || '', opts.empty || '', opts.code !== false]);
+  if (el._key === key) return;
+  if (el._key !== undefined && (hovered(el) || selectionIn(el))) return;
+  el._key = key;
+  el.innerHTML = '';
   const cap = document.createElement('div'); cap.className = 'cap';
   cap.innerHTML = `${esc(caption)}${b && b.depth != null ? ` · depth <b>${esc(b.depth)}</b>` : ''}${b && b.exit != null && opts.showExit ? ` · exit ${esc(b.exit)}` : ''}`;
-  wrap.appendChild(cap);
-  const txt = b && boardText(b.code);
-  if (txt) {
-    wrap.appendChild(renderLevel(txt, null, opts.scale || SCALE));
-    if (opts.who) { const w = document.createElement('div'); w.className = 'who'; w.textContent = opts.who; wrap.appendChild(w); }
+  el.appendChild(cap);
+  if (rows) {
+    const nc = Math.max(...rows.map(r => r.length));
+    const scale = Math.max(10, Math.min(opts.scale || SCALE, Math.floor((opts.maxPx || 200) / nc)));
+    el.appendChild(renderLevel(rows, null, scale));
+    if (opts.who) { const w = document.createElement('div'); w.className = 'who'; w.textContent = opts.who; el.appendChild(w); }
     if (opts.code !== false) {
+      const txt = rows.join('/');
       const c = document.createElement('div'); c.className = 'code';
-      const code = document.createElement('code'); code.textContent = b.code; c.appendChild(code);
-      const btn = document.createElement('button'); btn.className = 'secondary small'; btn.textContent = 'copy'; btn.onclick = () => copyText(b.code, btn); c.appendChild(btn);
-      wrap.appendChild(c);
+      const code = document.createElement('code'); code.textContent = txt; c.appendChild(code);
+      const btn = document.createElement('button'); btn.className = 'secondary small'; btn.textContent = 'copy'; btn.setAttribute('data-copy', txt); c.appendChild(btn);
+      el.appendChild(c);
     }
-  } else { const ph = document.createElement('div'); ph.className = 'placeholder'; ph.textContent = opts.empty || (b && b.depth != null ? 'depth only' : 'nothing yet'); wrap.appendChild(ph); }
-  return wrap;
+  } else {
+    const ph = document.createElement('div'); ph.className = 'placeholder';
+    ph.textContent = opts.empty || (b && b.depth != null ? 'depth only' : 'nothing yet'); el.appendChild(ph);
+  }
 }
 
 async function post(path, body) {
@@ -231,102 +300,150 @@ async function post(path, body) {
   } catch (e) { return { error: String(e) }; }
 }
 
-let nameSet = false, workersEdited = false, lastSlots = '', exitOptions = '', exitEditing = false;
-$('workers').addEventListener('input', () => { workersEdited = true; });
-$('applyWorkers').onclick = async () => { const n = Number($('workers').value); if (n >= 1) await post('/workers', { workers: n }); workersEdited = false; };
+let nameSet = false, workersEdited = false, exitOptions = '', exitEditing = false, lastWorkers = null;
+let clickHold = {};   /* M57: a clicked button stays disabled until /state answers it (or 2 s) */
+function hold(id) { clickHold[id] = Date.now() + 2000; $(id).disabled = true; }
+function held(id) { return clickHold[id] && Date.now() < clickHold[id]; }
+
+/* M68: Enter or Apply sends the count; a typed value that was not sent is marked; the clamp is explained */
+async function applyWorkers() {
+  const want = Math.round(Number($('workers').value));
+  if (!(want >= 1)) { setText($('workersNote'), 'enter a number of at least 1'); return; }
+  const r = await post('/workers', { workers: want });
+  workersEdited = false; $('workers').classList.remove('unapplied');
+  if (r && r.workers != null && Number(r.workers) !== want) setText($('workersNote'), `limited to ${r.workers} (the campaign allows 1 to ${$('workers').max})`);
+  else setText($('workersNote'), r && r.error ? r.error : '');
+  if (r && r.workers != null) $('workers').value = r.workers;
+}
+$('workers').addEventListener('input', () => { workersEdited = true; setText($('workersNote'), ''); });
+$('workers').addEventListener('keydown', ev => { if (ev.key === 'Enter') { ev.preventDefault(); applyWorkers(); } });
+$('workers').addEventListener('blur', () => {
+  if (workersEdited && lastWorkers != null && Number($('workers').value) !== lastWorkers) {
+    $('workers').classList.add('unapplied'); setText($('workersNote'), 'not applied yet: press Enter or Apply');
+  } else if (workersEdited) { workersEdited = false; $('workers').classList.remove('unapplied'); }
+});
+$('applyWorkers').onclick = applyWorkers;
 $('exitSel').addEventListener('focus', () => { exitEditing = true; });
 $('exitSel').addEventListener('blur', () => { exitEditing = false; });
 $('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; const r = await post('/exit', { exit: v === '' ? null : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
-$('pauseBtn').onclick = () => post('/pause');
-$('resumeBtn').onclick = () => post('/resume');
-$('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands back its remaining work (seconds), then the client exits.')) post('/stop'); };
+$('pauseBtn').onclick = () => { hold('pauseBtn'); post('/pause'); };
+$('resumeBtn').onclick = () => { hold('resumeBtn'); post('/resume'); };
+$('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands back its remaining work (seconds), then the client exits.')) { hold('stopBtn'); post('/stop'); } };
 
 function renderExitSelector(st) {
   const exits = Array.isArray(st.campaign_exits) ? st.campaign_exits : Object.keys(st.exits || {}).map(Number);
-  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open]; }));
+  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open, x.exact]; }));
   if (key !== exitOptions && !exitEditing) {
     exitOptions = key;
     const sel = $('exitSel'); sel.innerHTML = '<option value="">Any exit</option>';
     for (const e of exits) {
       const x = (st.exits || {})[String(e)];
       const o = document.createElement('option'); o.value = String(e);
-      o.textContent = x ? `Exit ${e} — ${x.roots_covered}/${x.roots} roots covered, ${x.open} open` : `Exit ${e}`;
+      o.textContent = x ? `Exit ${e} — ${x.roots_covered ?? '?'}/${x.roots ?? '?'} roots covered, ${x.open} open${x.open === 0 ? ' (no open jobs)' : ''}` : `Exit ${e}`;
       sel.appendChild(o);
     }
   }
   if (!exitEditing) $('exitSel').value = st.exit_pref == null ? '' : String(st.exit_pref);
 }
 
-function render(st) {
-  $('serverUrl').textContent = st.server.url;
-  if (!nameSet && st.name) { $('name').value = st.name; nameSet = true; }
-  if (!workersEdited && document.activeElement !== $('workers')) $('workers').value = st.workers;
-  $('pauseBtn').disabled = st.paused || st.stopping;
-  $('resumeBtn').disabled = !st.paused || st.stopping;
-  $('stopBtn').disabled = st.stopping;
-  $('exitSel').disabled = st.stopping;
-  renderExitSelector(st);
-
+/* the top banner: completion first (the feature the volunteer must not miss), then stop / pause states */
+function renderBanner(st) {
   const banner = $('banner');
   const done = st.completion && Array.isArray(st.completion.lines) ? st.completion : null;
-  if (done && (st.waiting_next || st.draining || st.stopping || st.end_reason === 'complete' || done.fatal)) {
-    banner.hidden = false; banner.className = done.fatal ? 'banner bad' : 'banner good';
-    banner.innerHTML = `<b>${done.fatal ? 'The client refused to run' : 'Campaign complete'}</b>` +
-      (st.waiting_next ? ' · waiting for the next campaign (--keep-going)' : '') + `<pre>${esc(done.lines.join('\n'))}</pre>`;
-  }
-  else if (st.waiting_next) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Waiting for the next campaign (--keep-going).'; }
-  else if (st.draining) { banner.hidden = false; banner.className = 'banner good'; banner.textContent = 'The campaign is complete: finishing and delivering the last reports, then the client exits.'; }
-  else if (st.stopping) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Stopping: ' + st.stop_reason + '.'; }
-  else if (st.paused) { banner.hidden = false; banner.className = 'banner'; banner.textContent = 'Paused. Workers are frozen and still hold their memory; their jobs stay reserved for you.'; }
-  else banner.hidden = true;
+  let cls = '', html = null;
+  if (done && done.fatal) {
+    cls = 'banner bad'; html = `<div class="big">The client refused to run</div><pre>${esc(done.lines.join('\n'))}</pre>` +
+      `<div class="close">It exits now; fix the cause shown above and start it again. You can close this window.</div>`;
+  } else if (done && (st.waiting_next || st.draining || st.stopping || st.end_reason === 'complete' || st.campaign_state === 'complete')) {
+    cls = 'banner good';
+    html = `<div class="big">Campaign complete</div><pre>${esc(done.lines.join('\n'))}</pre>` +
+      `<div class="close">${st.waiting_next ? 'The client is waiting for the next campaign (--keep-going); leave it running, or press Stop.' : 'The client has finished and exits now. You can close this window.'}</div>`;
+  } else if (st.waiting_next) { cls = 'banner'; html = 'Waiting for the next campaign (--keep-going). Nothing is running; press Stop to quit.'; }
+  else if (st.draining) { cls = 'banner good'; html = '<div class="big">The campaign is complete</div>Finishing and delivering the last reports; then the result appears here and the client exits.'; }
+  else if (st.stopping) { cls = 'banner'; html = 'Stopping: ' + esc(st.stop_reason) + '.'; }
+  else if (st.paused) { cls = 'banner'; html = 'Paused. Workers are frozen and still hold their memory; their jobs stay reserved for you while this client is online.'; }
+  if (html == null) { banner.hidden = true; return; }
+  banner.hidden = false; if (banner.className !== cls) banner.className = cls;
+  setHTML(banner, html);
+}
 
-  const pf = st.pending_flags || {}; const pb = $('pendingBox'); pb.innerHTML = '';
-  for (const k of ['stop', 'pause', 'workers', 'exit']) if (pf[k]) { const d = document.createElement('div'); d.className = 'working'; d.textContent = pf[k]; pb.appendChild(d); pb.appendChild(document.createElement('br')); }
+function render(st) {
+  setText($('serverUrl'), st.server.url);
+  if (!nameSet && st.name) { $('name').value = st.name; nameSet = true; }
+  const c = st.campaign || {};
+  lastWorkers = st.workers;
+  if (c.workers_max) $('workers').max = String(c.workers_max);
+  if (!workersEdited && document.activeElement !== $('workers')) $('workers').value = st.workers;
+  if (!held('pauseBtn')) $('pauseBtn').disabled = st.paused || st.stopping || st.draining;
+  if (!held('resumeBtn')) $('resumeBtn').disabled = !st.paused || st.stopping;
+  if (!held('stopBtn')) $('stopBtn').disabled = st.stopping;
+  $('exitSel').disabled = st.stopping || st.draining;
+  renderExitSelector(st);
+  renderBanner(st);
+
+  const pf = st.pending_flags || {};
+  setHTML($('pendingBox'), ['stop', 'pause', 'workers', 'exit'].filter(k => pf[k]).map(k => `<div class="working">${esc(pf[k])}</div><br>`).join(''));
   const fb = $('fallback');
-  if (st.exit_pref != null && st.exit_fallback) { fb.hidden = false; fb.textContent = `Exit ${st.exit_pref} had no open jobs when the last lease was requested, so the server handed out jobs from other exits instead. Your preference stays and is tried again at each lease.`; }
-  else fb.hidden = true;
+  if (st.exit_pref != null && st.exit_fallback && !st.exit_pending) {
+    fb.hidden = false; setText(fb, `Exit ${st.exit_pref} had no open jobs at the last lease, so this client got jobs of other exits. Your preference stays and is tried again at every lease.`);
+  } else fb.hidden = true;
 
   const age = st.server.last_ok ? st.time - st.server.last_ok : Infinity;
-  const cls = st.server.connected ? (age < 120 ? 'ok' : 'warn') : 'bad';
-  $('conn').innerHTML = `<span class="dot ${cls}"></span>${st.server.connected ? 'connected' : 'unreachable'}` +
-    (st.server.last_error ? `<div class="hint" style="font-size:11px">${esc(st.server.last_error)}</div>` : '');
-  $('queued').textContent = st.queued;
-  $('pendingReports').textContent = st.pending;
-  $('outbox').textContent = st.outbox; $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
-  const c = st.campaign || {};
-  if (c.paused_max_s) { $('pausedMax').textContent = fmtDur(c.paused_max_s); $('pausedMax2').textContent = fmtDur(c.paused_max_s); }
-  if (c.split_after_s) $('windowLen').textContent = fmtDur(c.split_after_s);
-  if (c.lease_s) $('leaseLen').textContent = fmtDur(c.lease_s);
-  if (c.batch_interval_s) $('batchLen').textContent = fmtDur(c.batch_interval_s);
+  const hb = st.server.last_heartbeat_ok ? st.time - st.server.last_heartbeat_ok : null;
+  const dcls = st.server.connected ? (age < 120 ? 'ok' : 'warn') : 'bad';
+  setHTML($('conn'), `<span class="dot ${dcls}"></span>${st.server.connected ? 'connected' : 'unreachable'}` +
+    `<div class="hint" style="font-size:11px">${hb != null ? 'heartbeat ' + esc(fmtDur(hb)) + ' ago' : 'no heartbeat yet'}${st.server.last_error ? ' · ' + esc(st.server.last_error) : ''}</div>`);
+  setText($('queued'), st.queued + (st.hold_cap ? ` / ${st.hold_cap}` : ''));
+  setText($('pendingReports'), st.pending);
+  setText($('outbox'), st.outbox); $('outbox').style.color = st.outbox ? 'var(--warn)' : '';
+  /* M67: the campaign's own reservation, counted from each lease, while the client is online */
+  if (c.paused_max_s) {
+    const t = `for up to ${fmtDur(Number(c.paused_max_s) + Number(c.lease_s || 0))} after each lease`;
+    setText($('pausedMax'), t); setText($('pausedMax2'), t);
+  }
+  const w = st.window_now && st.window_now.split_after_s ? st.window_now.split_after_s : c.split_after_s;
+  if (w) setText($('windowLen'), fmtDur(w) + (st.window_now && st.window_now.mode && st.window_now.mode !== 'full' ? ` (now: ${st.window_now.mode})` : ''));
+  if (c.lease_s) setText($('leaseLen'), fmtDur(c.lease_s));
+  if (c.batch_interval_s) setText($('batchLen'), fmtDur(c.batch_interval_s));
+  setText($('closeText'), st.stop_on_close === false ? 'This client was started with --no-stop-on-close: closing this tab does not stop it.' : 'Closing this tab also stops the client (start it with --no-stop-on-close to keep it running without the page).');
 
-  /* 2. workers */
+  /* 2. workers: one card per slot, updated in place */
   const box = $('workersBox');
-  const want = st.slots.map(s => s.idx).join(',');
-  if (want !== lastSlots) { box.innerHTML = ''; lastSlots = want; for (const s of st.slots) { const d = document.createElement('div'); d.className = 'worker'; d.id = 'w' + s.idx; box.appendChild(d); } }
-  if (!st.slots.length) box.innerHTML = '<div class="empty">No workers.</div>';
-  for (const s of st.slots) {
-    const d = $('w' + s.idx); if (!d) continue;
-    const phase = s.state === 'paused' ? 'paused' : s.state === 'finishing' ? 'handing back' : s.phase === 'absorb' ? 'absorbing' : s.phase === 'window' ? 'searching' : s.state === 'retiring' ? 'finishing, then retiring' : 'waiting for a job';
-    const facts = document.createElement('div'); facts.className = 'facts';
-    facts.innerHTML = `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
-      (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
-        `<div class="seed">${esc(s.seed)}</div>` +
-        (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') +
-        `<div><span class="k">${s.phase === 'absorb' ? 'absorbing, ' : 'window, '}</span>${esc(s.window_left)} s left</div>` +
-        `<div><span class="k">local stack</span> ${esc(s.stack_size)} · <span class="k">nodes done</span> ${esc(s.nodes_done)} · <span class="k">running</span> ${esc(s.elapsed)} s</div>`
-        : `<div class="k">${s.state === 'idle' && !st.paused ? 'waiting for the next lease' : ''}</div>`);
-    d.innerHTML = ''; d.appendChild(facts);
-    d.appendChild(boardEl('current node', s.cur, { code: false, empty: 'no board yet' }));
+  if (!st.slots.length) setHTML(box, '<div class="empty">No workers.</div>');
+  else {
+    if (box._html !== undefined) { box._html = undefined; box.innerHTML = ''; }
+    const want = new Set(st.slots.map(s => 'w' + s.idx));
+    for (const el of Array.from(box.children)) if (!want.has(el.id)) box.removeChild(el);
+    for (const s of st.slots) {
+      let d = $('w' + s.idx);
+      if (!d) {
+        d = document.createElement('div'); d.className = 'worker'; d.id = 'w' + s.idx;
+        const f = document.createElement('div'); f.className = 'facts'; d.appendChild(f);
+        const b = document.createElement('div'); b.className = 'board'; d.appendChild(b);
+        box.appendChild(d);
+      }
+      const phase = s.frozen || s.state === 'paused' ? 'paused' : s.state === 'finishing' ? 'handing back' : s.phase === 'absorb' ? 'absorbing' : s.phase === 'window' ? 'searching' : 'waiting for a job';
+      const retiring = s.retiring ? ' · retires after this job' : '';
+      setHTML(d.children[0], `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${esc(retiring)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
+        (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
+          `<div class="seed">${esc(s.seed || '(exit root)')}</div>` +
+          (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') +
+          `<div><span class="k">${s.phase === 'absorb' ? 'absorbing, ' : 'window, '}</span>${esc(s.window_left)} s left</div>` +
+          `<div><span class="k">${s.phase === 'absorb' ? 'still to probe' : 'local stack'}</span> ${esc(s.stack_size)} · <span class="k">nodes done</span> ${esc(s.nodes_done)} · <span class="k">running</span> ${esc(s.elapsed)} s</div>`
+          : `<div class="k">${s.state === 'idle' && !st.paused && !st.draining && !st.stopping ? 'waiting for the next lease' : ''}</div>`));
+      updateBoard(d.children[1], 'current node', s.cur, { code: false, empty: 'no board yet', maxPx: 150 });
+    }
   }
 
   /* 3. levels */
-  const lv = $('levels'); lv.innerHTML = '';
-  lv.appendChild(boardEl('best here, last second', st.best_second, { showExit: true, empty: 'nothing in the last second' }));
-  lv.appendChild(boardEl('best here, last hour', st.best_hour, { showExit: true, empty: 'nothing in the last hour' }));
-  const selExit = st.exit_pref != null ? String(st.exit_pref) : (st.exits ? Object.keys(st.exits).sort((a, b) => a - b).find(e => st.exits[e].best) : null);
+  updateBoard($('bSecond'), 'best here, last second', st.best_second, { showExit: true, empty: 'nothing in the last second' });
+  updateBoard($('bHour'), 'best here, last hour', st.best_hour, { showExit: true, empty: 'nothing in the last hour' });
+  updateBoard($('bSession'), 'best here, this session', st.best_session, { showExit: true, empty: 'nothing yet' });
+  const selExit = st.exits ? globalExit(st.exits, st.exit_pref) : (st.exit_pref != null ? String(st.exit_pref) : null);
   const g = selExit != null && st.exits && st.exits[selExit] ? st.exits[selExit].best : null;
   const gb = g ? { depth: g.moves, code: g.code, exit: Number(selExit) } : null;
-  lv.appendChild(boardEl(selExit != null ? `best known globally, exit ${selExit}` : 'best known globally', gb, { showExit: false, who: g ? `found by ${g.by || 'unknown'}${g.at ? ' on ' + fmtWhen(g.at) : ''}` : '', empty: st.exits ? 'no level yet for this exit' : 'waiting for the server' }));
+  const gcap = st.exit_pref != null ? `best known globally, exit ${selExit}` : selExit != null ? `best known overall (exit ${selExit})` : 'best known globally';
+  updateBoard($('bGlobal'), gcap, gb, { who: g ? `found by ${g.by || 'unknown'}${g.at ? ' on ' + fmtWhen(g.at) : ''}` : '', empty: st.exits ? 'no level yet for this exit' : 'waiting for the server' });
 
   /* 4. me + session */
   const me = st.me;
@@ -334,51 +451,78 @@ function render(st) {
     const tiles = [['Jobs done', fmtN(me.jobs_done)], ['Splits handed back', fmtN(me.splits)], ['Nodes finished', fmtN(me.nodes_done)],
       ['CPU hours', fmtH(me.cpu_s)], ['States searched', fmtN(me.states)], ['Solver calls', fmtN(me.solver_calls)],
       ['Your deepest level', me.best ? `${me.best.moves} moves (exit ${me.best.exit})` : '–'], ['Rank', me.rank ? `${me.rank} of ${me.contributors}` : '–'], ['First seen', me.first_seen ? fmtWhen(me.first_seen) : '–']];
-    $('meBox').innerHTML = tiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join('');
+    setHTML($('meBox'), tiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join(''));
   }
-  const se = st.session || {};
+  const se = st.session || {}, ss = st.stats || {};
   const stiles = [['Uptime', fmtDur(se.uptime_s)], ['Jobs this session', fmtN(se.jobs)], ['Mean job length', se.mean_job_s != null ? fmtDur(se.mean_job_s) : '–'], ['Longest job', se.jobs ? fmtDur(se.longest_job_s) : '–'],
-    ['Children absorbed', fmtN(se.absorbed)], ['Splits handed back', fmtN(se.splits)], ['Open pieces handed back', fmtN(se.open_handed_back)], ['CPU hours', fmtH(st.stats.cpu_seconds)]];
-  $('sessionBox').innerHTML = stiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join('');
+    ['Children absorbed', fmtN(se.absorbed)], ['Splits handed back', fmtN(se.splits)], ['Open pieces handed back', fmtN(se.open_handed_back)], ['CPU hours', fmtH(ss.cpu_seconds)],
+    ['Unresolved candidates sent', fmtN(ss.unresolved)], ['Failed runs reported', fmtN(ss.failures_reported)]];
+  setHTML($('sessionBox'), stiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v">${esc(v)}</div></div>`).join(''));
 
   /* 5. campaign */
-  const tb = $('campTable').querySelector('tbody'); tb.innerHTML = '';
   const exits = st.exits || {};
-  let totalCpu = 0;
-  for (const e of Object.keys(exits).sort((a, b) => a - b)) {
+  const keys = Object.keys(exits).sort((a, b) => a - b);
+  const anyCands = keys.some(e => openCands(exits[e]) != null);
+  setHTML($('campHead'), `<tr><th>Exit</th><th class="num">Roots covered</th><th class="num">Open</th><th class="num">Leased</th><th class="num">CPU hours</th><th class="num">Best</th><th>By</th><th>Status</th>${anyCands ? '<th class="num">Unresolved</th>' : ''}</tr>`);
+  let totalCpu = 0, rows = '';
+  for (const e of keys) {
     const x = exits[e]; totalCpu += Number(x.cpu_s || 0);
-    const tr = document.createElement('tr'); if (String(st.exit_pref) === e) tr.className = 'sel';
-    tr.innerHTML = `<td>${esc(e)}</td><td class="num">${esc(x.roots_covered)} / ${esc(x.roots)}</td><td class="num">${esc(x.open)}</td><td class="num">${esc(x.leased)}</td><td class="num">${fmtH(x.cpu_s)}</td><td class="num">${x.best ? esc(x.best.moves) : '–'}</td><td>${x.best ? esc(x.best.by || '') : ''}</td>`;
-    tb.appendChild(tr);
+    const [lab, lcls] = exactLabel(x), nc = openCands(x);
+    rows += `<tr${String(st.exit_pref) === e ? ' class="sel"' : ''}><td>${esc(e)}</td><td class="num">${esc(x.roots_covered ?? '?')} / ${esc(x.roots ?? '?')}</td><td class="num">${esc(x.open)}</td><td class="num">${esc(x.leased)}</td><td class="num">${fmtH(x.cpu_s)}</td><td class="num">${x.best ? esc(x.best.moves) : '–'}</td><td>${x.best ? esc(x.best.by || '') : ''}</td><td class="${lcls}">${esc(lab)}</td>${anyCands ? `<td class="num">${nc == null ? '–' : esc(nc)}</td>` : ''}</tr>`;
   }
-  if (!Object.keys(exits).length) tb.innerHTML = '<tr><td colspan="7" class="empty">Waiting for the first heartbeat…</td></tr>';
-  const cs = st.campaign_status || {};
-  const tot = [['Total CPU hours', cs.cpu_hours != null ? Number(cs.cpu_hours).toFixed(2) : fmtH(totalCpu)], ['Active volunteers', cs.active_clients != null ? fmtN(cs.active_clients) : (Array.isArray(cs.clients) ? fmtN(cs.clients.length) : '–')],
-    ['Campaign', c.title || '–'], ['Grid', c.grid || '–'], ['Status age', st.campaign_status_age != null ? st.campaign_status_age + ' s' : 'not fetched yet']];
-  $('campTotals').innerHTML = tot.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v" style="font-size:15px">${esc(v)}</div></div>`).join('');
+  setHTML($('campBody'), keys.length ? rows : '<tr><td colspan="8" class="empty">Waiting for the first heartbeat…</td></tr>');
+  /* M60: /api/v2/status fields are totals.cpu_h and totals.clients; the age counts from the last successful fetch */
+  const cs = st.campaign_status || {}, tot = cs.totals || {};
+  const cpu = tot.cpu_h != null ? Number(tot.cpu_h).toFixed(2) : cs.cpu_hours != null ? Number(cs.cpu_hours).toFixed(2) : fmtH(totalCpu);
+  const vols = tot.clients != null ? fmtN(tot.clients) : cs.active_clients != null ? fmtN(cs.active_clients) : (Array.isArray(cs.clients) ? fmtN(cs.clients.length) : '–');
+  const sage = st.campaign_status_age != null ? fmtDur(st.campaign_status_age) + (st.campaign_status_stale ? ' (stale)' : '') : 'not fetched yet';
+  const ttiles = [['Total CPU hours', cpu], ['Active volunteers', vols], ['Campaign', c.title || '–'], ['Grid', c.grid || '–'], ['Status age', sage]];
+  setHTML($('campTotals'), ttiles.map(([k, v]) => `<div><div class="tile-k">${esc(k)}</div><div class="tile-v" style="font-size:15px">${esc(v)}</div></div>`).join(''));
 
-  $('workerPath').textContent = st.worker_path || ''; $('hash').textContent = st.src_hash || '';
-  $('log').textContent = (st.log || []).join('\n');
+  setText($('workerPath'), st.worker_path || ''); setText($('hash'), st.src_hash || '');
+  const logEl = $('log'), lt = (st.log || []).join('\n');
+  if (logEl.textContent !== lt && !selectionIn(logEl)) logEl.textContent = lt;
 }
 
-let failures = 0, lastState = null;
-async function poll() {
-  try { const r = await fetch('/state', { cache: 'no-store' }); const st = await r.json(); render(st); lastState = st; failures = 0; }
-  catch (e) {
-    if (++failures === 8) {
-      const b = $('banner'); b.hidden = false;
-      const done = lastState && lastState.completion && Array.isArray(lastState.completion.lines) ? lastState.completion : null;
-      if (done) {
-        b.className = done.fatal ? 'banner bad' : 'banner good';
-        b.innerHTML = `<b>${done.fatal ? 'The client refused to run and exited' : 'Campaign complete: the client has exited'}</b><pre>${esc(done.lines.join('\n'))}</pre>You can close this tab.`;
-      } else if (lastState && lastState.stopping) {
-        b.className = 'banner'; b.textContent = 'The client stopped (' + (lastState.stop_reason || 'stop') + ') and exited. You can close this tab.';
-      } else { b.className = 'banner bad'; b.textContent = 'The client is not answering (stopped or exited). You can close this tab.'; }
-    }
+/* M61: one poll at a time, 2 s timeout, and a visible age; M62: the last stop reason survives the client */
+let inFlight = false, failures = 0, lastOkAt = 0, lastState = null, lastStopReason = '', gone = false;
+function renderGone() {
+  const b = $('banner'); b.hidden = false;
+  const st = lastState, done = st && st.completion && Array.isArray(st.completion.lines) ? st.completion : null;
+  if (done) {
+    b.className = done.fatal ? 'banner bad' : 'banner good';
+    setHTML(b, `<div class="big">${done.fatal ? 'The client refused to run and has exited' : 'Campaign complete: the client has exited'}</div><pre>${esc(done.lines.join('\n'))}</pre><div class="close">You can close this window.</div>`);
+  } else if (lastStopReason) {
+    b.className = 'banner'; setHTML(b, `The client stopped (${esc(lastStopReason)}) and has exited. You can close this window.`);
+  } else {
+    b.className = 'banner bad'; setHTML(b, 'The client is not answering: it has exited, or it is frozen (Ctrl-Z, sleep). The page reconnects if it comes back; otherwise you can close this window.');
   }
+}
+function freshness() {
+  const age = lastOkAt ? (Date.now() - lastOkAt) / 1000 : null;
+  const stale = age != null && age > 3;
+  document.body.classList.toggle('stale', stale);
+  const f = $('fresh');
+  f.className = stale ? 'bad' : '';
+  setText(f, age == null ? 'connecting to the client…' : stale ? `no answer from the client for ${Math.round(age)} s` : '');
+  if (!gone && failures >= 8 && (age == null || age > 2)) { gone = true; renderGone(); }
+}
+async function poll() {
+  if (inFlight) return;
+  inFlight = true;
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = setTimeout(() => { if (ctl) ctl.abort(); }, 2000);
+  try {
+    const r = await fetch('/state', { cache: 'no-store', signal: ctl ? ctl.signal : undefined });
+    const st = await r.json();
+    lastOkAt = Date.now(); failures = 0; gone = false; lastState = st;
+    if (st.stopping && st.stop_reason) lastStopReason = st.stop_reason;
+    render(st);
+  } catch (e) { failures++; }
+  finally { clearTimeout(timer); inFlight = false; freshness(); }
 }
 setInterval(poll, 250); poll();
-/* Window close = Stop (DESIGN 4). The client waits 3 s for a new /state poll (a reload) before stopping. */
+/* Window close = Stop (DESIGN 4) unless --no-stop-on-close. The client waits 3 s for a new /state poll (a reload) before stopping. */
 window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': SECRET }, body: '{}' }); } catch (e) {} });
 </script>
 </body>

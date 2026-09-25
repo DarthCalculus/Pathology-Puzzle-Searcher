@@ -42,6 +42,16 @@
 #                  'hang'; frozen after Stop: the stop grace does not count the sleep.
 # x  grace_kill    an absorption probe killed after Stop's grace leaves its node open and the window
 #                  is still reported; a lease with absorb_total_s 0 (endgame) runs no probes.
+# y  absorb_order  M18: probes go deepest first; the first probe that splits is kept as a split node,
+#                  the pass goes on into its children only; shallower siblings are never probed.
+# z  lease         M108: at most 2 jobs per worker held; a queued job starts with the server's CURRENT
+#                  window (not the one of its lease); N18: sub-second windows (min_window_s) and
+#                  --split-after-nodes reach the worker.
+# pw pause_workers M56: Pause, fewer workers, Resume leaves no worker stopped; fewer workers, then Pause
+#                  freezes the retiring ones too; M61: Ctrl-Z (SIGTSTP) freezes the workers, fg thaws them.
+# ui panel         the panel's script in node with a small DOM stand-in: 6x6 boards, the global board with
+#                  the server's newline codes (M55), 'Any exit' = the longest best (M59), no redraw of an
+#                  unchanged board (M63), the completion banner, paused_max_s (M67). Skipped without node.
 #
 # Ports: TEST_SERVER_PORT (default 19131) and TEST_UI_PORT (default 19166, +1 for a second
 # client); the script refuses to run when one is already taken. FAKE_SEED seeds the fake
@@ -202,8 +212,8 @@ test_a() {
   tree_ok
   sn=$(stat split_nodes); sl=$(stat split_nodes_with_level); ol=$(stat open_nodes_with_level)
   [ "$sl" -ge 1 ] && [ "$sl" = "$sn" ] && ok "every split node ($sn) carried its level; $ol open probe node(s) carried one too" || bad "split nodes $sn, with level $sl"
-  cv=$(aq "a['client_versions']")
-  case "$cv" in *3.0.0*) ok "requests carried client_version 3.0.0 ($cv)";; *) bad "client versions seen: $cv";; esac
+  cv=$(aq "a['client_versions']"); want_cv=$(sed -n 's/^CLIENT_VERSION = "\(.*\)"/\1/p' "$HERE/volunteer.py")
+  case "$cv" in *"'$want_cv'"*) ok "requests carried client_version $want_cv ($cv)";; *) bad "client versions seen: $cv (want $want_cv)";; esac
   wait_leases_expired 20 && ok "no lease left on the server after Stop" || bad "leases still held after 20 s"
   FAKE_MIN_S=4.5 FAKE_MAX_S=6 start_client a2.log --workers 2 --no-ui || return
   wait_rc "$CLIENT_PID" 75; rc=$RC; CLIENT_PID=""
@@ -326,7 +336,12 @@ test_e() {
   [ "$rb" -ge 10 ] && ok "$rb reports in ~11 s with 2 workers" || bad "only $rb reports"
   [ "$one" -ge 10 ] && ok "$one of them were one-node reports (trivial jobs)" || bad "one-node reports: $one"
   [ "$bp" -ge 1 ] && [ $(( bp * 3 )) -le "$rb" ] && ok "sent as $bp batch(es) (largest $mb): at most one POST /reports per 10 s" || bad "$bp batches for $rb reports"
-  [ "$lr" -le 3 ] && ok "$lr lease request(s) (at most one per 10 s, sized for 300 s of work)" || bad "$lr lease requests"
+  # M108: at most 2 jobs per worker held, so trivial jobs are leased in small batches: one request per
+  # batch interval, plus one sooner (>= 2 s apart) when a worker is idle with nothing queued
+  [ "$lr" -le 8 ] && ok "$lr lease request(s) in ~11 s (one per 10 s, plus early ones >= 2 s apart for idle workers)" || bad "$lr lease requests"
+  # (the server's own held count also includes finished jobs whose report waits for the next batch)
+  [ "$(stat max_lease_n)" -le 4 ] && ok "requests of at most $(stat max_lease_n) jobs (2 workers: at most 2 per worker running + queued)" \
+    || bad "lease sizes: max n $(stat max_lease_n)"
   grep -q "exit=2" "$SLOG" && ok "lease requests carried the exit preference (--exit 2)" || bad "no exit preference in lease requests"
   no_bang e.log
   stop_server; done_test
@@ -583,7 +598,7 @@ test_r() {
 
 test_s() {
   say "test s: units (allowlist, env, classification)"
-  "$PY" - "$HERE" "$TMP" <<'EOF' 2>"$TMP/s.err" && ok "parse_extra / worker_env / classify / valid_seed / parse_unresolved / run judging / wake baselines / 413 requeue behave as specified" \
+  "$PY" - "$HERE" "$TMP" <<'EOF' 2>"$TMP/s.err" && ok "parse_extra / worker_env / classify / valid_seed / parse_unresolved / run judging / wake baselines / 413 requeue / absorb order / queue order / window at start / lease sizing / panel flags behave as specified" \
     || { bad "unit checks failed"; tail -5 "$TMP/s.err"; }
 import sys; sys.path.insert(0, sys.argv[1]); import volunteer as v
 ok = lambda x: v.parse_extra(x)[1] is None
@@ -674,6 +689,78 @@ vol.pending = [{"job_id": i, "nodes": []} for i in range(4)]
 assert vol.send_pending() is False
 assert sent == [[0, 1], [2, 3]] and [r["job_id"] for r in vol.pending] == [2, 3], (sent, vol.pending)
 assert v.nonneg_float(0) == 0.0 and v.nonneg_float("12.5") == 12.5 and v.nonneg_float(-1) is None and v.nonneg_float(True) is None
+# M18: absorption probes deepest first, stable (the cursor stays first among equals)
+assert v.absorb_order(["U1,R1", "U1,R1,R1,R1", "U1,L2", "U1,R2,R2"]) == ["U1,R1,R1,R1", "U1,R2,R2", "U1,R1", "U1,L2"]
+# M108: the local queue runs largest est_s first, then shallowest, then in grant order
+q = [{"depth": 9, "seq": 1}, {"depth": 5, "seq": 2}, {"depth": 5, "seq": 3}, {"depth": 12, "seq": 4, "est_s": 50.0}]
+assert [x["seq"] for x in sorted(q, key=v.queue_key)] == [4, 2, 3, 1]
+# M108: the window is chosen when it starts (the latest lease/heartbeat window), a re-run keeps its own
+vol.slots = []; vol.campaign = {"grid": "5x5", "split_after_s": 1800, "absorb_total_s": 120}
+job2 = {"id": 2, "exit": 0, "seed": "U1", "depth": 1, "split_after_s": 1800.0, "absorb_total_s": 120.0, "window_mode": "full"}
+assert vol.window_for(job2) == (1800.0, 120.0, "full")
+vol.note_window(120, 60, "ramp", "lease")
+assert vol.window_for(job2) == (120.0, 60.0, "ramp"), vol.window_for(job2)
+assert vol.window_for(dict(job2, split_after_fixed=3600.0))[0] == 3600.0
+assert vol.window_for(dict(job2, absorb_fixed=0.0))[1] == 0.0
+# N18: windows are clamped to min_window_s (1 s unless the campaign lowers it); --split-after keeps 3 decimals
+vol.note_window(0.3, 0, "endgame", "heartbeat")
+assert vol.window_for(job2)[0] == 1.0
+vol.campaign["min_window_s"] = 0.05
+assert vol.window_for(job2)[0] == 0.3
+vol.worker_base = ["w"]; vol.campaign["split_after_nodes"] = 7
+a = vol.worker_argv(job2, "U1", 0.3)
+assert a[a.index("--split-after") + 1] == "0.300" and a[a.index("--split-after-nodes") + 1] == "7", a
+del vol.campaign["split_after_nodes"]; assert "--split-after-nodes" not in vol.worker_argv(job2, "U1", 0.3)
+a = vol.worker_argv(job2, "", 0.0004); assert a[a.index("--split-after") + 1] == "0.001"
+# M108: lease sizing holds at most 2 jobs per worker (running + queued), an idle worker always gets one
+class Th:
+    def is_alive(self): return True
+def slots(n, busy):
+    out = []
+    for i in range(n):
+        s = v.Slot(i); s.thread = Th()
+        if i < busy:
+            s.job = {"id": 100 + i, "exit": 0, "seed": "U1", "depth": 1}; s.started_at = _t.time() - 1; s.window_end = _t.time() + 1799
+        out.append(s)
+    return out
+vol.campaign = {"grid": "5x5", "split_after_s": 1800, "absorb_total_s": 120, "lease_ahead_s": 300}; vol.window_now = None
+vol.depth_hist = {}; vol.grant_depths.clear(); vol.queue.clear()
+vol.slots = slots(4, 0); assert vol.lease_want() == (4, True), vol.lease_want()
+vol.slots = slots(4, 4); assert vol.lease_want()[0] == 0          # long windows far from their end: nothing ahead
+vol.depth_hist = {1: v.collections.deque([0.2, 0.3, 0.25])}; vol.grant_depths.extend([1] * 5)
+vol.slots = slots(4, 4); assert vol.lease_want()[0] == 4          # trivial jobs: capped at 2 x 4 - 4 running
+vol.queue.extend({"id": 200 + i, "depth": 1, "seed": "U1"} for i in range(3))
+assert vol.lease_want()[0] == 1 and vol.lease_want()[1] is False
+vol.queue.clear(); vol.depth_hist = {}; vol.grant_depths.clear()
+# M57: redundant clicks leave no stale request timestamp
+vol.slots = []; vol.paused = False; vol.stopping = False
+vol.pause_requested_at = 5.0; vol.pause(); vol.pause_requested_at = 6.0; vol.pause()
+assert vol.pause_requested_at == 0.0 and vol.paused
+vol.resume_requested_at = 7.0; vol.resume(); vol.resume_requested_at = 8.0; vol.resume()
+assert vol.resume_requested_at == 0.0 and not vol.paused and vol.pending_flags(_t.time())["pause"] is None
+# M58: the first lease response after an exit change settles the pending flag
+vol.campaign = {"grid": "5x5", "exits": [0, 1], "split_after_s": 1800, "batch_interval_s": 0}
+vol.set_exit(1); assert vol.pending_flags(_t.time())["exit"]
+vol.lease_want = lambda: (1, True); vol.last_lease_at = 0.0; vol.no_jobs_until = 0.0
+vol.api.post = lambda path, body, timeout=20: {"jobs": [{"id": 9, "exit": 0, "seed": "U1"}], "split_after_s": 60, "exit_fallback": True}
+vol._lease_once()
+assert vol.pending_flags(_t.time())["exit"] is None and vol.exit_fallback and not vol.exit_applied
+vol.set_exit(1); vol.last_lease_at = 0.0
+vol.api.post = lambda path, body, timeout=20: {"jobs": [{"id": 10, "exit": 1, "seed": "U2"}], "split_after_s": 60}
+vol._lease_once(); assert vol.exit_applied and not vol.exit_fallback and not vol.exit_pending
+assert vol.window_now["split_after_s"] == 60.0 and [j["id"] for j in vol.queue] == [9, 10]
+vol.queue.clear()
+# M66: a LEVEL line feeds the last-hour and last-second boards (short runs print no STATUS)
+vol._note_level({"id": 3, "exit": 1}, {"depth": 40, "code": "3000/0000"})
+st = vol.state()
+assert st["best_hour"]["depth"] == 40 and st["best_second"]["depth"] == 40 and st["best_session"]["depth"] == 40, st["best_hour"]
+# M60: the status age counts from the last successful fetch
+vol.campaign_status = {"totals": {}}; vol.campaign_status_ok_at = _t.time() - 120
+st = vol.state(); assert st["campaign_status_age"] >= 119 and st["campaign_status_stale"]
+# closing summary: unresolved candidates per exit when the server sends a count
+assert v.open_candidates({"candidates_open_deeper": 2}) == 2 and v.open_candidates({"candidates": {"open_deeper": 1}}) == 1
+vol.campaign_result = None; vol.exits = {"0": {"best": {"moves": 50, "by": "X"}, "exact": False, "clean": True, "candidates_open_deeper": 3}}
+assert "3 unresolved candidate(s)" in vol.result_rows()[0], vol.result_rows()
 EOF
   done_test
 }
@@ -797,7 +884,201 @@ test_x() {
   stop_server; done_test
 }
 
-ALL="a b c d e f g h i j k l m n o p q r s t u v w x"
+test_y() {
+  say "test y: absorb_order (deepest first; a split probe is kept and only its children follow)"
+  # J (depth 8, 60-80 s) splits at its 3 s window into children +5,+4,+3 (cursor and stack top: trivial)
+  # and three +1 (stack bottom: 3-4 s each, a 2 s probe splits). Budget 6 s (the new pass needs about 4.5 s).
+  # The old shallow-first order spent it all on the three +1 children (every probe split and was dropped)
+  # and never probed the deep ones.
+  start_server 1 60 3 --absorb-total-s 6 --absorb-probe-s 2 --batch-interval-s 1 --exits 0 --heartbeat-s 2 || return
+  FAKE_REMAINING_DEPTHS=5,4,3,1,1,1 FAKE_DEPTH_DECAY=0.05 FAKE_MIN_S=60 FAKE_MAX_S=80 start_client y.log --workers 1 --no-ui || return
+  wait_true 30 eval '[ "$(aq "len(a[\"report_log\"])")" -ge 1 ]' || { bad "no report within 30 s: $(tail -3 "$TMP/y.log")"; return; }
+  kill -INT "$CLIENT_PID"; wait_exit "$CLIENT_PID" 20; CLIENT_PID=""
+  r=$(aq "a['report_log'][0]['nodes']")
+  "$PY" - "$r" <<'EOF' && ok "J's report: its deep children done, one +1 probe kept as a split with all its children done, the other two +1 never probed: $r" || bad "report nodes: $r"
+import sys, ast
+nodes = ast.literal_eval(sys.argv[1])
+by = {}
+for d, st, el in nodes:
+    by.setdefault(d, []).append(st)
+assert nodes[0][:2] == [8, "split"], nodes[0]
+assert sorted(by[9]) == ["open", "open", "split"], by[9]          # the probe that split is kept, siblings untouched
+assert all(st == "done" for d, sts in by.items() if d >= 10 for st in sts), by   # every deeper node absorbed
+assert sum(len(v) for d, v in by.items() if d >= 10) == 9, by     # 3 deep children of J + 6 children of the probe
+EOF
+  grep -q "absorption: 9 node(s) finished, 1 probe(s) split and kept" "$TMP/y.log" && ok "logged: $(grep -o 'absorption: .*' "$TMP/y.log" | head -1)" || bad "no absorption log: $(grep absorption "$TMP/y.log" | head -2)"
+  [ "$(stat grants_of_absorbed)" = 0 ] && ok "no absorbed node was ever leased" || bad "$(stat grants_of_absorbed) absorbed nodes leased"
+  no_bang y.log
+  stop_server; done_test
+}
+
+test_z() {
+  say "test z: lease (2 jobs per worker; the window is chosen when it starts; N18 sub-second and node splits)"
+  # 1 worker, 5-6 s jobs, 30 s windows: one job runs, one waits (hold 2). The owner then shortens the
+  # window to 2 s; the waiting job, leased with 30 s, must start with 2 s.
+  start_server 6 60 30 --batch-interval-s 1 --exits 0 --heartbeat-s 1 --heartbeat-window --absorb-total-s 0 || return
+  FAKE_MIN_S=5 FAKE_MAX_S=6 start_client z1.log --workers 1 --no-ui || return
+  wait_true 15 eval '[ "$(stat lease_grants)" -ge 2 ]' || bad "no second job leased ahead: $(grep 'lease ' "$SLOG" | tail -2)"
+  admin '{"op": "set", "params": {"split_after_s": 2, "ramp_split_after_s": 2}}'
+  wait_log z1.log "window 2 s" 20 || bad "no window of 2 s: $(grep -o 'window [0-9.]* s' "$TMP/z1.log" | sort | uniq -c | tr '\n' ' ')"
+  jid=$(grep -o 'job [0-9]* exit [0-9]* window 2 s' "$TMP/z1.log" | head -1 | awk '{print $2}')
+  [ -n "$jid" ] && grep -Eq "lease Tester .*-> \[([0-9]+, )*$jid(, [0-9]+)*\] \(split_after_s 30" "$SLOG" \
+    && ok "job $jid, leased with a 30 s window, started with the server's current 2 s window" \
+    || bad "job '$jid' was not leased with 30 s: $(grep 'lease Tester' "$SLOG" | head -3)"
+  kill -INT "$CLIENT_PID"; wait_exit "$CLIENT_PID" 20; CLIENT_PID=""
+  [ "$(stat max_lease_n)" -le 2 ] && [ "$(stat max_held)" -le 3 ] \
+    && ok "1 worker: requests of at most $(stat max_lease_n) job(s), at most $(stat max_held) held (2 + a report in flight)" \
+    || bad "max n $(stat max_lease_n), max held $(stat max_held)"
+  no_bang z1.log
+  stop_server
+  # N18: min_window_s 0.1 lets a 0.6 s window through (no clamp to 1 s), and split_after_nodes 1 reaches
+  # the worker: J splits after one step (about 0.1 s), long before its 0.6 s split time
+  start_server 1 60 0.6 --min-window-s 0.1 --split-after-nodes 1 --batch-interval-s 1 --exits 0 --heartbeat-s 2 --absorb-total-s 0 || return
+  FAKE_MIN_S=60 FAKE_MAX_S=80 start_client z2.log --workers 1 --no-ui || return
+  wait_log z2.log "window 0.6 s" 10 && ok "a 0.6 s window ran as such (campaign min_window_s 0.1)" || bad "window: $(grep -o 'window [0-9.]* s' "$TMP/z2.log" | head -2)"
+  wait_true 15 eval '[ "$(aq "len(a[\"report_log\"])")" -ge 1 ]'
+  kill -INT "$CLIENT_PID"; wait_exit "$CLIENT_PID" 20; CLIENT_PID=""
+  j=$(aq "a['report_log'][0]['nodes'][0]")
+  "$PY" -c 'import sys,ast; d,st,el=ast.literal_eval(sys.argv[1]); sys.exit(0 if st=="split" and el is not None and el < 0.45 else 1)' "$j" \
+    && ok "J split after one step (--split-after-nodes 1): $j" || bad "J: $j"
+  stop_server; done_test 100
+}
+
+test_pw() {
+  say "test pw: pause_workers (M56) and Ctrl-Z (M61)"
+  start_server 8 60 60 --heartbeat-s 5 || return
+  FAKE_MIN_S=40 FAKE_MAX_S=50 start_client pw.log --workers 3 --no-browser || return
+  pids=""
+  for _ in $(seq 1 60); do pids=$(state_field "' '.join(str(w['pid']) for w in s['slots'] if w['pid'])" 2>/dev/null); [ "$(echo $pids | wc -w | tr -d ' ')" = 3 ] && break; sleep 0.25; done
+  [ "$(echo $pids | wc -w | tr -d ' ')" = 3 ] || { bad "expected 3 running workers: $(http_get http://127.0.0.1:$UPORT/state | head -c 200)"; return; }
+  stats_of() { for p in $pids; do ps -o stat= -p "$p" 2>/dev/null | cut -c1; done | tr -d ' \n'; }
+  all_T() { [ "$(stats_of)" = TTT ]; }
+  none_T() { case "$(stats_of)" in *T*) return 1;; *) return 0;; esac; }
+  sec=$(ui_secret "$UPORT")
+  http_post "http://127.0.0.1:$UPORT/pause" '{}' "$sec" >/dev/null
+  wait_true 5 all_T && ok "Pause: all 3 workers stopped" || bad "after Pause: '$(stats_of)'"
+  http_post "http://127.0.0.1:$UPORT/workers" '{"workers": 1}' "$sec" >/dev/null
+  http_post "http://127.0.0.1:$UPORT/resume" '{}' "$sec" >/dev/null
+  wait_true 5 none_T && ok "Pause, workers 3 -> 1, Resume: no worker left stopped (the 2 retiring ones run again)" || bad "after Resume: '$(stats_of)'"
+  [ "$(state_field "sum(1 for w in s['slots'] if w['retiring'])")" = 2 ] && ok "the panel shows 2 workers retiring" || bad "retiring: $(state_field "[w['retiring'] for w in s['slots']]")"
+  http_post "http://127.0.0.1:$UPORT/pause" '{}' "$sec" >/dev/null
+  wait_true 5 all_T && ok "workers 3 -> 1, then Pause: the retiring workers are frozen too" || bad "after the second Pause: '$(stats_of)'"
+  pf=$(state_field "s['pending_flags']['pause']")
+  [ "$pf" = None ] && ok "no stale 'freezing' flag once all are frozen" || bad "pause flag: $pf"
+  http_post "http://127.0.0.1:$UPORT/pause" '{}' "$sec" >/dev/null      # a redundant click (M57)
+  http_post "http://127.0.0.1:$UPORT/resume" '{}' "$sec" >/dev/null
+  wait_true 5 none_T || bad "after the second Resume: '$(stats_of)'"
+  sleep 0.5
+  pf=$(state_field "s['pending_flags']['pause']")
+  [ "$pf" = None ] && ok "a redundant Pause click leaves no 'freezing…' flag after Resume (M57)" || bad "pause flag after Resume: $pf"
+  kill -TSTP "$CLIENT_PID"
+  wait_true 5 all_T && ok "Ctrl-Z (SIGTSTP): the workers stopped with the client" || bad "after SIGTSTP: '$(stats_of)'"
+  case "$(ps -o stat= -p "$CLIENT_PID" | cut -c1)" in T) ok "the client itself is stopped";; *) bad "client state $(ps -o stat= -p "$CLIENT_PID")";; esac
+  kill -CONT "$CLIENT_PID"
+  wait_true 5 none_T && ok "SIGCONT (fg): the workers run again" || bad "after SIGCONT: '$(stats_of)'"
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 30; rc=$RC; CLIENT_PID=""
+  [ "$rc" = 0 ] && ok "Stop: exit 0" || bad "exit $rc"
+  [ "$(fake_workers_alive)" = 0 ] && ok "no worker left behind" || bad "workers left"
+  stop_server; done_test
+}
+
+test_ui() {
+  say "test ui: the panel script in node (6x6 boards, newline codes, completion)"
+  command -v node >/dev/null 2>&1 || { ok "skipped: node is not installed"; return; }
+  start_server 4 60 60 --grid 6x6 --exits 0,1,2,7,8,14 --extra "--allow-exit-transit --num-holes 0" --paused-max-s 7200 \
+      --heartbeat-s 1 --batch-interval-s 1 --absorb-total-s 0 || return
+  FAKE_MIN_S=1.5 FAKE_MAX_S=2.5 start_client ui.log --workers 1 --no-browser || return
+  wait_true 20 eval '[ "$(state_field "any(e.get(\"best\") for e in (s[\"exits\"] or {}).values())")" = True ]' || { bad "no best level in /state"; return; }
+  http_get "http://127.0.0.1:$UPORT/state" > "$TMP/ui_state1.json"
+  "$PY" - "$TMP/ui_state1.json" <<'EOF' && ok "/state: campaign paused_max_s 7200 (M67); the server's best codes use newlines (as jobs.js)" || bad "state checks failed: $(head -c 300 "$TMP/ui_state1.json")"
+import sys, json
+s = json.load(open(sys.argv[1]))
+assert s["campaign"]["paused_max_s"] == 7200, s["campaign"]
+codes = [e["best"]["code"] for e in s["exits"].values() if e.get("best")]
+assert codes and all("\n" in c and "/" not in c for c in codes), codes
+assert all(len(r) == 6 for c in codes for r in c.split("\n")) and all(len(c.split("\n")) == 6 for c in codes), codes
+EOF
+  for _ in $(seq 1 120); do                      # follow the client to its completion (the panel's view of it)
+    http_get "http://127.0.0.1:$UPORT/state" > "$TMP/ui_state2.json.tmp" 2>/dev/null || break
+    [ -s "$TMP/ui_state2.json.tmp" ] && mv "$TMP/ui_state2.json.tmp" "$TMP/ui_state2.json"
+    grep -q '"completion": {' "$TMP/ui_state2.json" 2>/dev/null && break
+    sleep 0.25
+  done
+  wait_rc "$CLIENT_PID" 30; rc=$RC; CLIENT_PID=""
+  [ "$rc" = 0 ] && ok "the campaign completed, exit 0" || bad "exit $rc"
+  grep -q '"completion": {' "$TMP/ui_state2.json" && ok "the panel saw the completion state" || bad "no completion in the last /state"
+  cat > "$TMP/ui_test.js" <<'EOF'
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+const script = html.split('<script>')[1].split('</script>')[0];
+const st1 = JSON.parse(fs.readFileSync(process.argv[3], 'utf8')), st2 = JSON.parse(fs.readFileSync(process.argv[4], 'utf8'));
+class CL { constructor(e) { this.e = e; this.s = new Set(); } add(c) { this.s.add(c); } remove(c) { this.s.delete(c); } toggle(c, on) { if (on === undefined ? !this.s.has(c) : on) this.s.add(c); else this.s.delete(c); } contains(c) { return this.s.has(c); } }
+class El {
+  constructor(tag) { this.tagName = tag; this.children = []; this.style = {}; this.attrs = {}; this._inner = ''; this._text = ''; this.classList = new CL(this); this.hidden = false; this.className = ''; this.value = ''; this.disabled = false; this.sets = 0; this.max = ''; }
+  set innerHTML(v) { this._inner = String(v); this.children = []; this._text = ''; this.sets++; }
+  get innerHTML() { return this._inner; }
+  set textContent(v) { this._text = String(v); this.children = []; }
+  get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
+  appendChild(c) { this.children.push(c); c.parentNode = this; if (c.id) byId[c.id] = c; return c; }
+  removeChild(c) { this.children = this.children.filter(x => x !== c); if (c.id && byId[c.id] === c) delete byId[c.id]; }
+  setAttribute(k, v) { this.attrs[k] = String(v); } getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+  addEventListener() {} matches() { return false; } contains() { return false; } closest() { return null; }
+}
+const byId = {};           // the page's own ids exist from the start; others only once appended (as in a browser)
+for (const m of html.split('<script>')[0].matchAll(/ id="([^"]+)"/g)) byId[m[1]] = Object.assign(new El('div'), { id: m[1] });
+const document = { getElementById: id => byId[id] || null, createElement: t => new El(t),
+  querySelector: () => null, addEventListener() {}, body: new El('body'), activeElement: null, execCommand() {} };
+const states = [st1];
+const ctx = { document, window: { innerWidth: 1200, getSelection: () => ({ rangeCount: 0, isCollapsed: true }), addEventListener() {} },
+  navigator: {}, console, JSON, Math, Date, Number, String, Array, Object, Set, Map, WeakMap, Promise, Error,
+  setInterval() {}, setTimeout: (f, ms) => 0, clearTimeout() {}, AbortController, alert() {}, confirm: () => false,
+  fetch: async () => ({ json: async () => states[0] }) };
+vm.createContext(ctx);
+vm.runInContext(script, ctx);
+(async () => {
+  await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
+  const run = code => vm.runInContext(code, ctx);
+  // pure helpers
+  assert.strictEqual(JSON.stringify(run(`levelRows('030000\\n000400\\n0?0000')`)), '["030000","000400","0?0000"]');
+  assert.strictEqual(run(`codeText('0300\\n0040')`), '0300/0040');
+  assert.strictEqual(run(`codeText('0300/0040')`), '0300/0040');
+  assert.strictEqual(run(`levelRows('03<b>')`), null);
+  assert.strictEqual(run(`globalExit({'0': {best: {moves: 127}}, '1': {best: {moves: 149}}, '2': {best: null}}, null)`), '1');
+  assert.strictEqual(run(`globalExit({'0': {best: {moves: 127}}, '1': {best: {moves: 149}}}, 0)`), '0');
+  assert.strictEqual(run(`openCands({candidates_open_deeper: 3})`), 3);
+  assert.strictEqual(run(`openCands({candidates: {open_deeper: 2}})`), 2);
+  assert.strictEqual(run(`openCands({})`), null);
+  // the page rendered st1 at load (poll); render again: an unchanged board is not redrawn (M63)
+  const g = byId.bGlobal;
+  assert.ok(g && g._key, 'the global board was drawn');
+  const tiles = el => (el.className === 'tile' ? 1 : 0) + el.children.reduce((n, c) => n + tiles(c), 0);
+  assert.strictEqual(tiles(g), 36, 'a 6x6 global board has 36 tiles, got ' + tiles(g));
+  const codeEl = (function find(el) { if (el.tagName === 'code') return el; for (const c of el.children) { const x = find(c); if (x) return x; } return null; })(g);
+  assert.ok(codeEl && /^[0-9A-Z?]{6}(\/[0-9A-Z?]{6}){5}$/.test(codeEl.textContent), 'the global code is shown with / rows: ' + (codeEl && codeEl.textContent));
+  assert.ok(/best known overall \(exit \d+\)/.test(g.children[0].innerHTML), 'Any exit: caption ' + g.children[0].innerHTML);
+  const before = g.children[0];
+  run('render(' + JSON.stringify(st1) + ')');
+  assert.strictEqual(g.children[0], before, 'an unchanged board was redrawn');
+  assert.ok(/7200|2\.\d h|2 h/.test(byId.pausedMax.textContent) || /h after each lease/.test(byId.pausedMax.textContent), 'paused max: ' + byId.pausedMax.textContent);
+  for (const s of st1.slots) { const w = byId['w' + s.idx]; assert.ok(w, 'worker card ' + s.idx); }
+  // completion: the banner says so and says the window can be closed
+  run('render(' + JSON.stringify(st2) + ')');
+  const b = byId.banner.innerHTML;
+  assert.ok(!byId.banner.hidden && /Campaign complete/.test(b) && /You can close this window/.test(b), 'completion banner: ' + b.slice(0, 300));
+  assert.ok(/Result per exit/.test(b), 'the result is in the banner');
+  // the client exits: after 8 failed polls the banner keeps the result
+  run('lastState = ' + JSON.stringify(st2) + '; failures = 8; lastOkAt = Date.now() - 5000; gone = false; freshness();');
+  assert.ok(/the client has exited/.test(byId.banner.innerHTML) && /You can close this window/.test(byId.banner.innerHTML), 'gone banner: ' + byId.banner.innerHTML.slice(0, 200));
+  assert.ok(document.body.classList.contains('stale'), 'the page is marked stale');
+  console.log('ui ok: 36 tiles, code ' + codeEl.textContent);
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+EOF
+  out=$(node "$TMP/ui_test.js" "$HERE/volunteer_ui.html" "$TMP/ui_state1.json" "$TMP/ui_state2.json" 2>&1) \
+    && ok "panel script: $out" || bad "panel script failed: $(echo "$out" | head -8)"
+  stop_server; done_test
+}
+
+ALL="a b c d e f g h i j k l m n o p q r s t u v w x y z pw ui"
 which="${*:-all}"
 [ "$which" = all ] && which="$ALL"
 start=$(date +%s)

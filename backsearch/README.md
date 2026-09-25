@@ -1,6 +1,6 @@
 # backsearch
 
-**Collective search (2026-09):** volunteers run `python3 v2/volunteer.py --name "You" --workers N`; see [v2/README.md](v2/README.md).
+**Collective search (2026-09):** volunteers run `python3 v2/volunteer.py --name "You" --workers N` from this directory; see [VOLUNTEERS.md](VOLUNTEERS.md) and [v2/README.md](v2/README.md).
 
 Backward-DFS Sokoban puzzle generator with task-partitioned parallelism.
 
@@ -199,8 +199,9 @@ position in that order.  Hence:
   (re-estimating heavy prefixes at a deeper layer, spliced in place) and cuts
   the DFS order into contiguous chunks of roughly equal estimated work; each
   chunk is a range `[range_from, range_until)` whose interior cut points are its
-  parallel sub-ranges.  `run_chunks.py` runs chunks from the tracker at
-  pathology.georgespahn.com and prints the report block it accepts.
+  parallel sub-ranges.  `run_chunks.py` ran chunks from the tracker at
+  pathology.georgespahn.com (retired in September 2026 for the v2 collective
+  search, see [VOLUNTEERS.md](VOLUNTEERS.md)).
 
 The explicit push-off-exit seeds were removed the same day: the root's own
 new-block push-back children are the same states, and a node must have one

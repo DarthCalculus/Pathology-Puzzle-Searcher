@@ -7,6 +7,7 @@ It never spins: the "search" is a sequence of short sleeps.
 Behaviour
   --version                 SRC_HASH, GIT_SHA, PROTOCOL 3, LIMITS, KNOBS (tab-separated) and exit 0
   --split-after S           split after S seconds (0 = never)
+  --split-after-nodes N     split after N iterations of the fake search loop (deterministic, 0 = never)
   --status-every MS         STATUS line cadence
   --seed-path S             the job's seed (omitted = the exit root "")
   --exit E, --grid RxC, --time T, --two-tables, --allow-exit-transit, --num-holes N,
@@ -23,11 +24,14 @@ Environment knobs
   FAKE_SEED                 RNG seed salt (default 1)
   FAKE_MIN_S / FAKE_MAX_S   run duration range in seconds (default 1 / 4); deeper seeds
                             (more tokens than 8) run shorter so that a split tree terminates
+  FAKE_DEPTH_DECAY          duration factor per token beyond 8 (default 0.6)
   FAKE_DIE                  exit 1 without SUMMARY after 0.5 s (a crash)
   FAKE_STATUS               bad_seed | path_overflow | error: end with that status and its exit code
   FAKE_NO_LEVEL             emit no LEVEL line
   FAKE_REMAINING_N          on a split, print exactly N REMAINING lines (default 1..4)
   FAKE_REMAINING_TOKS       extra tokens per REMAINING line (long seeds; default 0)
+  FAKE_REMAINING_DEPTHS     on a split, REMAINING lines this many tokens deeper than the seed, in this
+                            order (e.g. "5,4,3,1,1,1": cursor and stack top deep, stack bottom shallow)
   FAKE_REMAINING_SELF       on a split, print REMAINING == the seed (interrupted before expanding)
   FAKE_BAD_REMAINING        one malformed REMAINING line among the valid ones
   FAKE_UNRESOLVED           print this many UNRESOLVED candidates (deeper than the best)
@@ -72,7 +76,7 @@ def out(line):
 
 
 def parse_args(argv):
-    a = {"grid": "5x5", "exit": 0, "seed": "", "split_after": 0.0, "status_every": 250,
+    a = {"grid": "5x5", "exit": 0, "seed": "", "split_after": 0.0, "split_after_nodes": 0, "status_every": 250,
          "version": False, "transit": 0, "block_on_exit": 0, "holes": 3, "blocks": 32, "walls": 0}
     i = 0
     while i < len(argv):
@@ -88,6 +92,8 @@ def parse_args(argv):
             a["seed"] = nxt; i += 1
         elif t == "--split-after" and nxt is not None:
             a["split_after"] = float(nxt); i += 1
+        elif t == "--split-after-nodes" and nxt is not None:
+            a["split_after_nodes"] = int(nxt); i += 1
         elif t == "--status-every" and nxt is not None:
             a["status_every"] = int(nxt); i += 1
         elif t == "--num-holes" and nxt is not None:
@@ -174,7 +180,7 @@ def main():
     min_s = float(os.environ.get("FAKE_MIN_S", "1"))
     max_s = float(os.environ.get("FAKE_MAX_S", "4"))
     extra_depth = max(0, depth0 - 8)
-    duration = rng.uniform(min_s, max_s) * (0.6 ** extra_depth)
+    duration = rng.uniform(min_s, max_s) * (float(os.environ.get("FAKE_DEPTH_DECAY", "0.6")) ** extra_depth)
     if targeted and os.environ.get("FAKE_DIE"):
         time.sleep(0.5)
         out("fake worker: dying without SUMMARY on purpose")
@@ -193,6 +199,8 @@ def main():
     t_cpu0 = time.process_time()
     last_status = -1.0
     split_after = args["split_after"]
+    split_nodes = args["split_after_nodes"]
+    iters = 0
     every = max(0.05, args["status_every"] / 1000.0)
     best = depth0
     depth = depth0
@@ -219,6 +227,10 @@ def main():
                 split = True
                 break
             if split_after > 0 and now >= split_after:
+                split = True
+                break
+            iters += 1
+            if split_nodes > 0 and iters >= split_nodes:
                 split = True
                 break
             if now >= duration:
@@ -248,7 +260,11 @@ def main():
                 n_env = os.environ.get("FAKE_REMAINING_N")
                 pad = int(os.environ.get("FAKE_REMAINING_TOKS", "0") or 0)
                 lines = []
-                if n_env:
+                depths_env = os.environ.get("FAKE_REMAINING_DEPTHS")
+                if depths_env:
+                    for k, w in enumerate(int(x) for x in depths_env.split(",") if x.strip()):
+                        lines.append(",".join(seed_tokens + [TOKENS[(k + 5 * j) % 12] for j in range(w)]))
+                elif n_env:
                     n = int(n_env)
                     width = 1
                     while 12 ** width < n:

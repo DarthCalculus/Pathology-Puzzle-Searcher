@@ -13,7 +13,8 @@ failure reports with fail_count and quarantine (3 failures from >= 2 clients, or
 regrant to the failing client within --fail-regrant-s, lease `reclaimed` (an open job the client
 still listed at its last heartbeat goes back to it, never as a second copy in `jobs`),
 campaign_state running/complete/closed, a body cap answered with 413, and several
-campaigns (admin route to close one and open the next).
+campaigns (admin route to close one and open the next). Level codes are stored and returned
+with rows joined by '\n', like jobs.js (M55).
 
   python3 fake_server.py --port 19131 --roots 8 --lease-s 6 --split-after-s 3 --hashes fa4e000...
 
@@ -65,12 +66,13 @@ class Store:
                       "failures": 0, "quarantined": 0, "candidates": 0, "stopping_heartbeats": 0,
                       "http_413": 0, "http_426": 0, "http_410": 0, "http_403": 0, "registers": 0,
                       "dup_grants_sent": 0, "steals": 0, "released": 0, "drops": 0, "reclaimed": 0,
-                      "rejected_reports": 0}
+                      "rejected_reports": 0, "max_lease_n": 0, "max_held": 0}
         self.failure_reasons = {}
         self.last_heartbeat = {}          # name -> {holding, running, stopping, at}
         self.client_versions = set()
         self.candidates = []
         self.reports = []
+        self.report_log = []              # first reports: [(depth, status), ...] per report (absorption tests)
         self.inserted_done = set()        # ids of nodes that arrived already done inside a tree report
         self.clients = {}
         self.campaigns = {}
@@ -107,6 +109,8 @@ class Store:
             "batch_interval_s": o.batch_interval_s, "lease_ahead_s": o.lease_ahead_s,
             "absorb_total_s": o.absorb_total_s, "absorb_probe_s": o.absorb_probe_s,
             "lease_cap": o.lease_cap, "heartbeat_s": o.heartbeat_s,
+            "min_window_s": spec.get("min_window_s", o.min_window_s),
+            "split_after_nodes": spec.get("split_after_nodes", o.split_after_nodes),
             "min_client_version": spec.get("min_client_version", o.min_client_version),
             "min_protocol": int(spec.get("min_protocol", o.min_protocol)),
             "release": "v%s" % spec.get("min_client_version", o.min_client_version),
@@ -136,8 +140,8 @@ class Store:
         keys = ("id", "title", "grid", "extra", "exits", "hashes", "max_clients", "workers_max", "job_target_s",
                 "split_after_s", "ramp_split_after_s", "lease_s", "paused_max_s", "batch_interval_s", "lease_ahead_s",
                 "absorb_total_s", "absorb_probe_s", "lease_cap", "heartbeat_s", "status", "min_client_version",
-                "min_protocol", "release")
-        return {k: c[k] for k in keys}
+                "min_protocol", "release", "min_window_s", "split_after_nodes")
+        return {k: c[k] for k in keys if c.get(k) is not None}
 
     def state_of(self, c):
         return {"open": "running", "complete": "complete", "closed": "closed"}[c["status"]]
@@ -326,6 +330,10 @@ class Store:
         res = {"ok": True, "leases": leases, "drop": drop, "reclaimed": reclaimed, "released": released,
                "campaign": self.public(camp), "campaign_state": self.state_of(camp),
                "me": self.me_for(c["name"], camp), "exits": self.exits_summary(camp)}
+        if self.opts.heartbeat_window:
+            # the current window (M108 fix note: jobs.js does not send this yet); clients use it for
+            # windows that start after it arrives
+            res["window"] = {"split_after_s": self.window_now(camp), "mode": "full"}
         if camp["status"] == "complete" and self.opts.result:
             res["result"] = {e: {"exit": int(e), "best": d["best"]["moves"] if d["best"] else None,
                                  "clean": d["roots_covered"] == d["roots"], "exact": d["roots_covered"] == d["roots"]}
@@ -394,10 +402,10 @@ class Store:
                 granted.append({"id": j["id"], "exit": j["exit"], "seed": j["seed"], "depth": j["depth"]})
                 self.stats["dup_grants_sent"] += 1
         self.stats["lease_grants"] += len(granted)
-        open_jobs = sum(1 for j in self.jobs.values() if j["campaign_id"] == camp["id"] and j["status"] == "open")
-        active_workers = sum(cl["workers"] for cl in self.clients.values() if cl["campaign_id"] == camp["id"]
-                             and time.time() - cl["last_seen"] < 180 and not cl["revoked"])
-        sa = camp["ramp_split_after_s"] if open_jobs < 3 * active_workers else camp["split_after_s"]
+        self.stats["max_lease_n"] = max(self.stats["max_lease_n"], int(body.get("n", 1)))
+        held_now = sum(1 for j in self.jobs.values() if j["status"] == "leased" and j["client_token"] == c["token"])
+        self.stats["max_held"] = max(self.stats["max_held"], held_now)
+        sa = self.window_now(camp)
         self.update_complete(camp)
         self.log("lease %s n=%d exit=%s -> %s (split_after_s %g%s)" % (c["name"], n, pref, [g["id"] for g in granted], sa,
                                                                         ", fallback" if fallback else ""))
@@ -409,6 +417,12 @@ class Store:
         if fallback:
             res["exit_fallback"] = True
         return 200, res
+
+    def window_now(self, camp):
+        open_jobs = sum(1 for j in self.jobs.values() if j["campaign_id"] == camp["id"] and j["status"] == "open")
+        active_workers = sum(cl["workers"] for cl in self.clients.values() if cl["campaign_id"] == camp["id"]
+                             and time.time() - cl["last_seen"] < 180 and not cl["revoked"])
+        return camp["ramp_split_after_s"] if open_jobs < 3 * active_workers else camp["split_after_s"]
 
     def steal(self, c, camp, need, t):
         """PROTOCOL3 section 4: take queued jobs from the client holding the most, never a job
@@ -570,6 +584,10 @@ class Store:
             if lv is not None and not (isinstance(lv, dict) and isinstance(lv.get("depth"), int)
                                        and isinstance(lv.get("code"), str) and 0 < len(lv["code"]) <= 2000):
                 return bad("bad level")
+            if lv is not None:
+                # like jobs.js parseLevel: rows split on '/' or newlines, stored joined with '\n' (M55)
+                n = dict(n, level=dict(lv, code="\n".join(r for r in re.split(r"[/\n]+", lv["code"].strip()) if r)))
+                nodes[k] = n
             un = n.get("unresolved")
             if un is not None:
                 if st == "open" or not isinstance(un, list) or len(un) > CAND_MAX_PER_NODE:
@@ -620,6 +638,10 @@ class Store:
                 self.stats["split_nodes"] += 1
                 if n.get("level"):
                     self.stats["split_nodes_with_level"] += 1
+        if len(self.report_log) < 200:
+            self.report_log.append({"job_id": jid, "depth": len(seed_toks),
+                                    "nodes": [[len(toks_of(n["seed"])), n["status"],
+                                               (n.get("summary") or {}).get("elapsed")] for n in nodes]})
         self.stats["max_nodes"] = max(self.stats["max_nodes"], len(nodes))
         if len(nodes) > 1:
             self.stats["tree_reports"] += 1
@@ -807,6 +829,7 @@ class Store:
                      "failure_reasons": self.failure_reasons, "last_heartbeat": self.last_heartbeat,
                      "client_versions": sorted(self.client_versions),
                      "candidates": self.candidates[:50],
+                     "report_log": [r for r in self.report_log if self.jobs[r["job_id"]]["campaign_id"] == camp["id"]][:100],
                      "fail_counts": {str(j["id"]): j["fail_count"] for j in js if j["fail_count"]},
                      "clean": bool(roots) and not uncovered and counts["quarantined"] == 0}
 
@@ -901,6 +924,10 @@ def main():
     ap.add_argument("--lease-absorb-total-s", type=float, default=None,
                     help="send this absorb_total_s (and window_mode) in every lease response, like jobs.js")
     ap.add_argument("--lease-cap", type=int, default=200)
+    ap.add_argument("--min-window-s", type=float, default=None, help="campaign client param min_window_s (N18)")
+    ap.add_argument("--split-after-nodes", type=int, default=None, help="campaign client param split_after_nodes (N18)")
+    ap.add_argument("--heartbeat-window", action="store_true",
+                    help="heartbeat responses carry the current window {split_after_s, mode} (jobs.js does not yet)")
     ap.add_argument("--heartbeat-s", type=float, default=30)
     ap.add_argument("--grid", default="5x5")
     ap.add_argument("--extra", default="--allow-exit-transit --num-holes 3")
