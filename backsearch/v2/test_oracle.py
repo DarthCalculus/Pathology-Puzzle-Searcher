@@ -29,18 +29,32 @@ each config and exit the test asserts:
      --mode bf (brute force over every level + a covering DP over all optimal solutions), T and E
      identical, on the configs small enough for bf;
   6. the oracle's judge agrees with the site's solver6 (PathologyRecords/solver/solver6.c, --batch) on
-     every T level and on a seeded random sample of arbitrary levels (solvable or not).
+     every T level and on a seeded random sample of arbitrary levels (solvable or not);
+  7. wide6 (review M89 fix 3): on real 6x6 0-hole subtrees, every traced level with >= 10 blocks (a
+     state wider than 64 bits: its checks ran the 128-bit solver, 93% of campaign #2's solver time at
+     exit 14) is re-solved by solver6 and must take exactly its depth.  The oracle cannot enumerate
+     6x6; the wide path's completeness (no false shortcut) is checked on the small grids with
+     --narrow-bits (below).
 The full run also runs the review's mode matrix on bigger configs (4x4 exit 0 <=3 holes, 5x5 exit 7
 <=3 blocks, 6x6 exit 14 0 holes <=2 blocks; skip with --no-matrix): worker vs worker, the canonical
 valid-level sets must be identical across all modes.
 
   python3 test_oracle.py WORKER            full run (about 5 CPU-minutes; each config well under 2 minutes)
   python3 test_oracle.py WORKER --quick    smoke test (about 20 s)
-  options: --solver6 SRC|none, --only NAME (repeatable; also filters the matrix, e.g. --only matrix-6x6),
-           --no-matrix, --no-modes, --no-cross, --timeout S
+  options: --solver6 SRC|none, --only NAME (repeatable; also filters the matrix and wide6 rows, e.g.
+           --only matrix-6x6; a filter that selects nothing fails), --no-matrix, --no-modes, --no-cross,
+           --no-wide6, --timeout S
+  test builds (TEST-ONLY binaries from --src, which must be WORKER's source: its SRC_HASH is checked):
+    --narrow-bits N   states wider than N bits take the 128-bit solver instead of the 64-bit one, so
+                      the oracle checks the wide path exactly on grids it enumerates (0 = every solve
+                      wide; 20 = 4x5 states with >= 4 blocks); uses the worker's SOK_NARROW_BITS_MAX
+                      knob if it has one, else a patched copy of sokoban_bfs.c in the temp dir
+    --build-knobs "K=V ..."   macro definitions (the -D is optional), e.g. "SHALLOW_LG2=10 RECENT_LG2=10"
+                      (B1), "MS_LG2=4" (B4); knobs that cause capacity (UNKNOWN) results make the sets
+                      incomparable and fail by design
 Exit status 0 = all passed, 1 = a failure.  One process at a time.
 """
-import argparse, json, os, random, shutil, subprocess, sys, tempfile, time
+import argparse, json, os, random, re, shutil, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -216,6 +230,57 @@ def random_levels(R, C, n, rng, max_holes):
     return out
 
 
+# 6x6 0-hole subtrees (campaign #2's flags) whose levels mostly have >= 10 blocks: 6 bits per cell, so
+# 6 * (1 + blocks) > 64 and every check of such a level runs the 128-bit ("wide") solver.  The worker's
+# traced levels with >= 10 blocks are all re-solved forward by solver6 (review M89 fix 3): each must be
+# solvable in exactly its depth.  (name, exit, seed, in --quick)
+_T23 = 'U2,U1,U1,R1,R1,D1,D1,D1,D1,L1,L1,R2,R1,U1,U1,U1,U1,L1,L1,D1,D1,L1,D1'
+WIDE6 = [
+    # 40 tokens down the path of e14-t23's best level: 51k states, best 120, ~2k levels with >= 10 blocks (~2 s)
+    ('wide6-e14-t40', 14, _T23 + ',D1,U2,U1,R2,U1,U1,R1,R1,D1,D1,D1,D1,L1,D1,L1,L1,L1', True),
+    # test_split_exact's 66-e14-t23: 1.5M states, best 120, ~16k levels with >= 10 blocks (~35 s + ~30 s)
+    ('wide6-e14-t23', 14, _T23, False),
+]
+WIDE_BLOCKS = 10
+
+
+def nblocks(code):
+    return sum(1 for ch in code if ch not in '01345/')
+
+
+def wide6(worker, s6, tmp, timeout, rows, out):
+    """Forward-verify the worker's wide-path levels on real 6x6 subtrees with solver6.  Returns failures."""
+    fails = []
+    flags = ['--allow-exit-transit', '--num-holes', '0']
+    for name, e, seed, _ in rows:
+        t0 = time.time()
+        r = TS.run_job(worker, '6x6', e, flags, seed, tmp, timeout)
+        TS.check_run(worker, r, split_expected=False, grid='6x6', exit_=e, extra=flags)
+        if r.summary['status'] != 'exhausted' or r.summary.get('unknown', 0):
+            out(f'FAIL {name}: status {r.summary["status"]}, unknown {r.summary.get("unknown", 0)}')
+            fails.append(name)
+            continue
+        wide = sorted(((d, c) for d, c, _ in r.levels if nblocks(c) >= WIDE_BLOCKS), reverse=True)
+        if len(wide) < 100:
+            out(f'FAIL {name}: only {len(wide)} traced levels with >= {WIDE_BLOCKS} blocks: the wide path is not exercised')
+            fails.append(name)
+            continue
+        inp = ''.join(c.replace('/', '|') + '\n' for _, c in wide)
+        b = subprocess.run([s6, '20', '0.25', '--batch'], input=inp, capture_output=True, text=True, timeout=1200)
+        res = [json.loads(x) for x in b.stdout.splitlines()]
+        if len(res) != len(wide):
+            raise Fail(f'{name}: {len(wide)} levels to solver6, {len(res)} answers')
+        bad = [(d, c, j) for (d, c), j in zip(wide, res) if not (j.get('solvable') is True and j.get('moves') == d)]
+        for d, c, j in bad[:5]:
+            out(f'    {name}: level {c} traced at depth {d}, solver6 says {j}')
+        out(f'  {"FAIL " if bad else ""}{name}: {r.summary["states"]} states, best {r.summary["best"]}, '
+            f'{len(r.levels)} levels, {len(wide)} with >= {WIDE_BLOCKS} blocks (deepest {wide[0][0]}, '
+            f'{max(nblocks(c) for _, c in wide)} blocks): solver6 disagrees on {len(bad)} ({time.time() - t0:.0f}s)')
+        if bad:
+            fails.append(name)
+    return fails
+
+
 MATRIX = [   # (name, grid, exit, flags); about 5 s, 2 minutes and 15 s for all modes
     ('matrix-4x4h3e0', '4x4', 0, ['--allow-exit-transit', '--num-holes', '3']),
     ('matrix-5x5e7b3', '5x5', 7, ['--allow-exit-transit', '--num-blocks', '3']),
@@ -223,9 +288,8 @@ MATRIX = [   # (name, grid, exit, flags); about 5 s, 2 minutes and 15 s for all 
 ]
 
 
-def matrix(worker, tmp, timeout, out, only=()):
+def matrix(worker, tmp, timeout, out, cfgs):
     """Worker vs worker across A/B modes on bigger configs (review M89 fix (2)): identical level sets."""
-    cfgs = [c for c in MATRIX if not only or any(o in c[0] for o in only)]
     modes = [m for m in MODES if worker.supports(m)]
     fails = 0
     for label, grid, exit_, flags in cfgs:
@@ -286,7 +350,17 @@ def main():
     ap.add_argument('--timeout', type=float, default=120.0, help='per worker run')
     ap.add_argument('--random', type=int, default=2000, help='random levels per grid for the judge check')
     ap.add_argument('--judge-sample', type=int, default=3000, help='oracle levels per config for the judge check')
+    ap.add_argument('--no-wide6', action='store_true', help='skip the 6x6 wide-path forward verification')
+    ap.add_argument('--narrow-bits', type=int, help='test a TEST-ONLY build of --src whose states wider than N bits '
+                    'take the 128-bit solver (production: 64); 0 = every solve is wide')
+    ap.add_argument('--build-knobs', default='', help='test a TEST-ONLY build of --src with these knobs, e.g. '
+                    '"MS_LG2=4" or --build-knobs="-DMS_LG2=4" (review builds B1/B4); capacity knobs that cause '
+                    'UNKNOWN results fail by design')
+    ap.add_argument('--src', default=os.path.dirname(HERE), help='worker sources for --narrow-bits / --build-knobs '
+                    '(must be WORKER\'s: its SRC_HASH is checked)')
+    ap.add_argument('--allow-src-mismatch', action='store_true')
     a = ap.parse_args()
+    TS.install_signal_handlers()
     t_start = time.time()
     tmp = tempfile.mkdtemp(prefix='oracle_')
     failures = []
@@ -295,6 +369,17 @@ def main():
         print(s, flush=True)
     try:
         worker = TS.Worker(a.worker)
+        knobs = [k if k.startswith('-D') else '-D' + k for k in a.build_knobs.split()]
+        if any(not re.match(r'^-D[A-Z][A-Z0-9_]*(=.*)?$', k) for k in knobs):
+            raise Fail(f'--build-knobs takes macro definitions only: {a.build_knobs!r}')
+        if knobs or a.narrow_bits is not None:
+            out(TS.check_src_matches(worker, a.src, a.allow_src_mismatch, out))
+            t0 = time.time()
+            vb = TS.build_worker(a.src, tmp, knobs, 'bs_oracle_variant', narrow_bits=a.narrow_bits)
+            worker = TS.Worker(vb)
+            what = ' '.join(knobs + ([f'narrow bits {a.narrow_bits}'] if a.narrow_bits is not None else []))
+            out(f'testing the TEST-ONLY build {worker.version.get("SRC_HASH")} ({what}; built in '
+                f'{time.time() - t0:.0f}s) instead of {a.worker}')
         exe, s6 = build(tmp, a.solver6)
         modes = [] if a.no_modes else [m for m in MODES if worker.supports(m)]
         if a.quick:
@@ -304,7 +389,19 @@ def main():
             f'{" ".join(modes)}{"; split trees via --split-after-nodes" if nodes else "; no --split-after-nodes: split trees skipped"}'
             f'; judge cross-check: {"solver6" if s6 else "SKIPPED (--solver6 none)"}')
         names = QUICK if a.quick else [c[0] for c in CONFIGS]
-        cfgs = [c for c in CONFIGS if c[0] in names and (not a.only or any(o in c[0] for o in a.only))]
+        cfgs = [c for c in CONFIGS if c[0] in names]
+        w6rows = [] if a.no_wide6 else [c for c in WIDE6 if c[3] or not a.quick]
+        mrows = [] if (a.quick or a.no_matrix) else list(MATRIX)
+        if a.only:
+            def sel(rows):
+                return [c for c in rows if any(o in c[0] for o in a.only)]
+            cfgs, w6rows, mrows = sel(cfgs), sel(w6rows), sel(mrows)
+            if not (cfgs or w6rows or mrows):
+                raise Fail(f'--only {" ".join(a.only)} matches no config, wide6 row or matrix row'
+                           f'{" (--quick runs no matrix)" if a.quick else ""}')
+        if w6rows and not s6:
+            out('  wide6: SKIPPED (needs solver6; --solver6 none given)')
+            w6rows = []
         judged = {}
         rng = random.Random(20260924)
         exits_checked = set()
@@ -374,9 +471,9 @@ def main():
                 if b1 + b2 + wrong:
                     failures.append(f'judge-{grid}')
             out(f'  judge total: {tot} levels, {bad} disagreements')
-        if not a.quick and not a.no_matrix:
-            if matrix(worker, tmp, a.timeout, out, a.only):
-                failures.append('matrix')
+        failures += wide6(worker, s6, tmp, a.timeout, w6rows, out)
+        if mrows and matrix(worker, tmp, a.timeout, out, mrows):
+            failures.append('matrix')
     except Fail as e:
         print(f'FAIL: {e}')
         failures.append('error')

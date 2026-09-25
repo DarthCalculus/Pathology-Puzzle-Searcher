@@ -35,9 +35,11 @@
  *                falls into), mask bits are added when used, untouched cells end as walls.  Each
  *                sequence reaching the exit yields tight(S), kept iff the judge's optimum equals |S|.
  *                Prunes (sound; neither can cut an optimal S): |S| + manhattan(player, exit) > dmax,
- *                and "the configuration is reachable in fewer moves in the partial level with the
- *                unknown cells as walls" (the final level relaxes it).  Memo on exact (partial level,
- *                configuration, t) keys.
+ *                and "the same labeled configuration (each block where S has it) is reachable in
+ *                fewer moves in the partial level with the unknown cells as walls" (every such move
+ *                sequence is legal in the final level, so S would not be optimal; the test is
+ *                labeled because blocks with equal partial masks may end with different masks).
+ *                Memo on exact (partial level, configuration, t) keys.
  *   --mode back  a deliberately naive backward DFS: states are (touched cells, player, blocks with
  *                used masks, open holes); moves undo a walk, a push, a push of a block that then rests
  *                forever (new block), a fall into a hole; a state is kept iff the judge's optimum of
@@ -151,10 +153,15 @@ static St start_state(const Level *L) {
 }
 static long long g_solves = 0, g_solve_states = 0;
 /* Optimum of L if it is <= maxd, else -1 (also for unsolvable).  target != NULL: instead the BFS
- * distance of that configuration if it is < maxd, else -1 (the lazy generator's shortcut test). */
+ * distance of that LABELED configuration if it is < maxd, else -1 (the lazy generator's shortcut test).
+ * The target search dedups on labeled keys: in a partial level two blocks with equal partial masks may
+ * still get different final masks, so reaching the configuration with those two blocks swapped is not
+ * a shortcut in the final level; reaching the same labeled configuration is (every move of the partial
+ * level is a move of the final one). */
 static int bfs(const Level *L, int maxd, const Key *target) {
     bfs_reset(); g_solves++;
-    St s0 = start_state(L); Key k; mkkey(L, &s0, 0, &k); int nw;
+    const int lab = target != NULL;
+    St s0 = start_state(L); Key k; mkkey(L, &s0, lab, &k); int nw;
     if (s0.pl == L->exitc) return 0;
     bfs_find(&k, &s0, 0, 1, &nw);
     if (target && !memcmp(k.b, target->b, sizeof k.b)) return 0;
@@ -165,7 +172,7 @@ static int bfs(const Level *L, int maxd, const Key *target) {
             St v; int b, l, r = try_move(L, &u, d, &v, &b, &l);
             if (r == NOMOVE) continue;
             if (v.pl == L->exitc) { if (!target) { g_solve_states += NS; return du + 1; } continue; }
-            mkkey(L, &v, 0, &k); bfs_find(&k, &v, du + 1, 1, &nw);
+            mkkey(L, &v, lab, &k); bfs_find(&k, &v, du + 1, 1, &nw);
             if (nw && target && !memcmp(k.b, target->b, sizeof k.b)) { g_solve_states += NS; return du + 1; }
         }
     }
@@ -294,7 +301,7 @@ static void gen(Gen *g) {
     if (g->t + manh(p, EXITC) > DMAX) { g_prune_depth++; return; }
     if (p == EXITC) { emit_level(g, g->t); return; }     /* the move just made ended on the exit: a win */
     if (g->t >= 2) {
-        Level P; int ext; gen_level(g, &P, &ext); Key tk; mkkey(&P, &g->cur, 0, &tk);
+        Level P; int ext; gen_level(g, &P, &ext); Key tk; mkkey(&P, &g->cur, 1, &tk);   /* labeled: see bfs() */
         if (bfs(&P, g->t, &tk) >= 0) { g_prune_short++; return; }
         if (gen_memo_seen(g)) { g_prune_memo++; return; }
     }

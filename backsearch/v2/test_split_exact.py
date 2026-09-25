@@ -29,9 +29,10 @@ The worker argv is the client's (volunteer.py worker_argv: --grid G --two-tables
 still matches the client's when volunteer.py is importable.  The config after `--` must therefore give
 --grid and --exit, plus the campaign flags (always --allow-exit-transit).
 
-Resource bounds: one worker process at a time; every run is killed (process group) after --timeout
-seconds and the test fails; trace files are deleted as soon as they are read; a run that traces more
-than --max-levels levels aborts the test (memory bound).
+Resource bounds: one worker process at a time; every run is killed after --timeout seconds and the
+test fails (SIGTERM / SIGHUP of the harness also kill it and remove the temp files); trace files are
+deleted as soon as they are read; a run that traces more than --max-levels levels aborts the test
+(memory bound).  An --only filter that selects no config fails.
 
   python3 test_split_exact.py WORKER [--split S | --split-nodes N | --sigint --split S] [--root SEED] \\
           [--timeout 120] [--expect-evictions] -- --grid 4x4 --exit 0 --allow-exit-transit --num-holes 3
@@ -43,12 +44,17 @@ Suites (each config about 2 minutes or less on one CPU; see build_suites): 'quic
 subtrees), <=3 holes with unbounded blocks on 4x4, real campaign-#1 subtrees (deep paths, 8-11 blocks),
 SIGINT splits, and eviction runs on a test-only build with tiny dedup tables (-DSHALLOW_LG2=12
 -DRECENT_LG2=12, built from --src into a temp dir, its SRC_HASH marked TEST-BUILD and checked to differ
-from the tested worker's, its KNOBS checked to be smaller; never a volunteer binary).  When the worker
-has --split-after-nodes, 'campaign' also runs deterministic node-count splits (4x4, 5x5, 6x6).
-The whole 'campaign' suite is about 10-12 CPU-minutes; run it config by config with --only if needed.
+from the tested worker's, its KNOBS checked to be smaller; never a volunteer binary), and a path-limit
+run on a -DPATH_TOK_MAX=16 test build (review B5: path_overflow with exit code 4 and no REMAINING,
+bad_seed with exit code 3 for a 17-token seed).  Test builds need --src to be the tested worker's
+source (its sha256 must equal the worker's SRC_HASH; --allow-src-mismatch downgrades that to a
+warning), or prebuilt variants (--evict-worker, --pathmax-worker).  When the worker has
+--split-after-nodes, 'campaign' also runs deterministic node-count splits (3x4 and 3x5 <=3 holes on
+every canonical exit, 4x4, 5x5, 6x6).
+The whole 'campaign' suite is about 12-15 CPU-minutes; run it config by config with --only if needed.
 Exit status 0 = all passed, 1 = a failure (the message says which).
 """
-import argparse, glob, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+import argparse, glob, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEED_RE = re.compile(r"^(?:[URDL][123])(?:,[URDL][123])*$")
@@ -58,6 +64,29 @@ STATUS_EVERY_MS = 250           # volunteer.py's value; refreshed from volunteer
 
 class Fail(Exception):
     pass
+
+
+def _exit_on_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def install_signal_handlers():
+    """SIGTERM / SIGHUP (e.g. cpuslot's time limit, a closed terminal) raise SystemExit, so the running
+    worker is killed (run_job's except path) and the temp dirs are removed (the finally blocks) instead
+    of Python dying on the default action and leaving both behind.  All three harness mains call this."""
+    for sg in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sg, _exit_on_signal)
+
+
+def select_only(items, only, key=lambda c: c[0]):
+    """Filter configs by --only substrings; a filter that selects nothing is a failure (a typo in an
+    acceptance command must not pass with nothing run)."""
+    if not only:
+        return list(items)
+    sel = [c for c in items if any(o in key(c) for o in only)]
+    if not sel:
+        raise Fail(f'--only {" ".join(only)} matches no config')
+    return sel
 
 
 # ------------------------------------------------------------------------------------ canonical codes
@@ -240,8 +269,8 @@ def split_cfg(cfg):
 
 class Run:
     """The parsed result of one worker run."""
-    __slots__ = ('seed', 'rc', 'summary', 'remaining', 'levels', 'nlines', 'bad', 'visits', 'unresolved', 'tail',
-                 'wall', 'level_lines')
+    __slots__ = ('seed', 'rc', 'summary', 'remaining', 'levels', 'nlines', 'bad', 'trunc', 'visits', 'unresolved',
+                 'tail', 'wall', 'level_lines')
 
 
 def toks(p):
@@ -267,12 +296,13 @@ def run_job(worker, grid, exit_, extra, seed, tmp, timeout, split_s=0.0, split_n
     if split_nodes:
         cmd += ['--split-after-nodes', str(split_nodes)]
     t0 = time.time()
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                         start_new_session=True)
+    # the worker stays in the harness's process group (it spawns no children), so a group kill of the
+    # harness (cpuslot's time limit, Ctrl-C) also reaches it; the harness's own kill is by pid
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
 
     def kill():
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            p.kill()
         except ProcessLookupError:
             pass
         p.communicate()
@@ -307,7 +337,7 @@ def run_job(worker, grid, exit_, extra, seed, tmp, timeout, split_s=0.0, split_n
             r.unresolved.append(line[11:])
         elif line.startswith('LEVEL\t'):
             r.level_lines.append(line[6:])
-    r.levels, r.nlines, r.bad = [], 0, 0
+    r.levels, r.nlines, r.bad, r.trunc = [], 0, 0, 0
     files = glob.glob(tv + '.*')
     try:
         if len(files) > 1:
@@ -323,6 +353,9 @@ def run_job(worker, grid, exit_, extra, seed, tmp, timeout, split_s=0.0, split_n
                     if not parts or len(parts) != 3 or not parts[1].isdigit() or not code_ok(parts[2], R, C) or \
                             len(toks(parts[0])) != int(parts[1]):      # a node's depth is its path's token count
                         r.bad += 1
+                        if parts and len(parts) == 3 and parts[1].isdigit() and len(toks(parts[0])) == \
+                                worker.path_tok_max < int(parts[1]):
+                            r.trunc += 1                               # a node past the path limit (path_overflow)
                         continue
                     # depth 0 is the root (player on the exit), not a level; the worker traces it only
                     # when given --seed-path '' (the client runs a root without --seed-path)
@@ -350,6 +383,10 @@ def check_run(worker, r, split_expected, grid=None, exit_=None, extra=None):
     if s is None:
         raise Fail(f'no SUMMARY (exit code {r.rc}) for {where}\n{r.tail}')
     fl = s.get('flags')
+    if fl is None and worker.version.get('PROTOCOL') == '3':
+        raise Fail(f'--version says PROTOCOL 3 but SUMMARY has no flags (PROTOCOL3 §2.2 makes them mandatory) ({where})')
+    if fl is not None and not isinstance(fl, dict):
+        raise Fail(f'SUMMARY.flags is not an object: {fl!r} ({where})')
     if fl is not None and grid is not None:
         want = {'grid': grid, 'exit': exit_, 'transit': 1, 'block_on_exit': 0}
         if extra and '--num-holes' in extra:
@@ -532,6 +569,94 @@ def run_config(worker, cfg, root='', split_s=0.02, split_nodes=0, sigint=False, 
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def run_pathmax(worker, ref_worker, cfg, timeout=120.0, name='', out=print, split_nodes=20):
+    """Review build B5 (PROTOCOL3 §2.3-2.4, review T4/T5): a test-only worker with a tiny path limit
+    (-DPATH_TOK_MAX=16) on a config whose tree is deeper than 16 tokens.  Asserts:
+      * --version LIMITS says path_tok_max 16;
+      * the monolithic run ends with status path_overflow, exit code 4, a SUMMARY, and no REMAINING;
+        its traced levels (a prefix of the same search) are all in ref_worker's set, none deeper
+        than 16 tokens;
+      * every run of a node-split tree ends exhausted, split (REMAINING <= 16 tokens, extending the
+        seed) or path_overflow (exit code 4, no REMAINING), and at least one ends path_overflow;
+      * a 17-token seed that replays in ref_worker is bad_seed (exit code 3, no REMAINING), and its
+        16-token prefix replays.
+    Returns a result dict; raises Fail."""
+    grid, exit_, extra = split_cfg(cfg)
+    lim = worker.path_tok_max
+    if lim >= 64:
+        raise Fail(f'the path-limit worker has path_tok_max {lim}: not a -DPATH_TOK_MAX=16 build')
+    tmp = tempfile.mkdtemp(prefix='splitx_pm_')
+    t0 = time.time()
+    try:
+        ref = run_job(ref_worker, grid, exit_, extra, '', tmp, timeout, keep_paths=True)
+        check_run(ref_worker, ref, split_expected=False, grid=grid, exit_=exit_, extra=extra)
+        full = set((d, canon(c)) for d, c, _ in ref.levels)
+        deep = [p_ for d, c, p_ in ref.levels if d > lim]
+        if not deep:
+            raise Fail(f'the reference tree has no level deeper than {lim} tokens: pick a deeper config')
+        seed17 = ','.join(toks(deep[0])[:lim + 1])
+        trunc = [0]   # trace lines of nodes past the limit (depth > lim, path cut at lim tokens): void runs only
+
+        def check_ended(r, where):
+            st = r.summary.get('status') if r.summary else None
+            if st == 'path_overflow':
+                if r.rc != 4:
+                    raise Fail(f'path_overflow with exit code {r.rc}, want 4 ({where})')
+                if r.remaining:
+                    raise Fail(f'path_overflow printed {len(r.remaining)} REMAINING lines ({where})')
+                if r.bad - r.trunc:
+                    raise Fail(f'{r.bad - r.trunc} malformed trace lines ({where})')
+                trunc[0] += r.trunc
+                return st
+            check_run(worker, r, split_expected=True, grid=grid, exit_=exit_, extra=extra)
+            return st
+
+        mono = run_job(worker, grid, exit_, extra, '', tmp, timeout, keep_paths=True)
+        if mono.summary is None:
+            raise Fail(f'no SUMMARY from the monolithic path-limit run (exit code {mono.rc})\n{mono.tail}')
+        if check_ended(mono, 'monolithic') != 'path_overflow':
+            raise Fail(f'monolithic run on a tree deeper than {lim} tokens ended {mono.summary.get("status")!r}, '
+                       'want path_overflow')
+        extra_m = [(d, c) for d, c, _ in mono.levels if (d, canon(c)) not in full]
+        if extra_m or any(d > lim for d, _, _ in mono.levels):
+            raise Fail(f'monolithic path-limit run traced {len(extra_m)} levels the reference lacks, e.g. {extra_m[:2]}, '
+                       f'or a level deeper than {lim}')
+        jobs, runs, st_n = [''], 0, {}
+        while jobs:
+            seed = jobs.pop()
+            r = run_job(worker, grid, exit_, extra, seed, tmp, timeout, split_nodes=split_nodes)
+            runs += 1
+            st = check_ended(r, f'seed {seed!r}')
+            st_n[st] = st_n.get(st, 0) + 1
+            if st == 'split':
+                jobs.extend(r.remaining)
+            if runs > 3000:
+                raise Fail('path-limit split tree exceeded 3000 runs')
+        if not st_n.get('path_overflow') or not st_n.get('split'):
+            raise Fail(f'the split tree needs both split and path_overflow runs: {st_n} (change split_nodes)')
+        b = run_job(worker, grid, exit_, extra, seed17, tmp, timeout)
+        bst = b.summary.get('status') if b.summary else None
+        if bst != 'bad_seed' or b.rc != 3 or b.remaining:
+            raise Fail(f'a {lim + 1}-token seed gave status {bst!r} exit code {b.rc} with {len(b.remaining)} REMAINING; '
+                       'want bad_seed, 3, none')
+        seed16 = ','.join(toks(seed17)[:lim])
+        g = run_job(worker, grid, exit_, extra, seed16, tmp, timeout)
+        gst = check_ended(g, f'seed {seed16!r}') if g.summary else None
+        if gst not in ('exhausted', 'split', 'path_overflow'):
+            raise Fail(f'the {lim}-token seed {seed16!r} did not replay: status {gst!r} exit code {g.rc}')
+        el = time.time() - t0
+        out(f"{name + ': ' if name else ''}{grid} exit {exit_} {' '.join(extra)}, path_tok_max {lim}: monolithic "
+            f"path_overflow (rc 4, {len(mono.levels)} levels, all in the reference's {len(full)}); split tree {runs} runs "
+            f"{st_n}; {lim + 1}-token seed bad_seed (rc 3); {lim}-token prefix {gst}" +
+            (f"; NOTE: the path_overflow runs traced {trunc[0]} nodes deeper than {lim} with paths cut at {lim} tokens "
+             f"(and count them in SUMMARY best; the runs are void, so only the debug trace is affected)"
+             if trunc[0] else '') + f" ({el:.0f}s)")
+        return dict(name=name, grid=grid, exit=exit_, path_tok_max=lim, runs=runs, statuses=st_n, truncated=trunc[0],
+                    elapsed=round(el, 1))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ------------------------------------------------------------------------------------ suites
 C1 = ['--allow-exit-transit', '--num-holes', '3']       # campaign #1 (5x5 at most 3 holes, any blocks)
 Z = ['--allow-exit-transit', '--num-holes', '0']        # campaign #2's flags (6x6 0 holes)
@@ -545,6 +670,12 @@ SEEDS_C1 = {
                      'D1,D1,L2,U1,R1,U2,L1,D1,D1,R1,R1,L2,L1,U1,U1,R1,R1,R1,D1,D1,D1,L1,D1,L1'),
     'job39336': (2, 'R2,U1,U3,U2,L1,D1,L2,L2,U2,U2,R1,D1,R1,D2,D1'),
     'job81420': (0, 'U1,U1,U3,L1,D1,L2,L2,U1,R1,U2,L1,D1,D1,R2,R2,R2,U1,L1,U1,L1,L1,D1,D1,R1,D2,L1,U2,U1,R1,R1'),
+    # review M88 fix (b)'s other two: job 109784 (exit 1, 34 tokens, 131k states, best 128) and job 28083
+    # (exit 6, 34 tokens, 41k states but slow solves, best 122; the only exit-6 seed)
+    'job109784': (1, 'R2,U1,U3,L1,D1,L2,L2,U1,R1,U2,U2,L1,D1,L2,U1,R1,R3,D1,D1,L1,D2,D2,R2,U1,U1,L1,U1,D2,R1,U1,'
+                     'R2,R2,D1,L1'),
+    'job28083': (6, 'U2,L1,D1,D1,R2,R2,U1,U3,U2,L1,D1,L2,L2,D1,R1,D2,L1,U1,U1,R2,R1,R1,U3,L1,D1,L2,U1,R1,U2,L1,'
+                    'D1,L2,L2,U1'),
 }
 # 6x6 0-hole subtrees (campaign #2's flags), found by descending from the exit roots into pending
 # entries of split runs (worker 6c531ee6, 2026-09-24): (exit, seed, split seconds); the timings are the
@@ -592,6 +723,13 @@ def build_suites(worker=None):
         camp.append((f'66-{nm}', ['--grid', '6x6', '--exit', str(e)] + Z, seed, dict(split_s=sp), 'main'))
     # (5) deterministic node-count splits, when the worker has --split-after-nodes (review N18)
     if worker is not None and worker.supports('--split-after-nodes', '5'):
+        # 3x4 and 3x5 <=3 holes, every canonical exit (review §5 T2); their trees take milliseconds, so
+        # only node-count splits can split them
+        for e in (0, 1, 4, 5):
+            camp.append((f'3x4h3e{e}-nodes', ['--grid', '3x4', '--exit', str(e)] + C1, '', dict(split_nodes=300), 'main'))
+        for e in (0, 1, 2, 5, 6, 7):
+            camp.append((f'3x5h3e{e}-nodes', ['--grid', '3x5', '--exit', str(e)] + C1, '', dict(split_nodes=3000),
+                         'main'))
         camp.append(('4x4h3e1-nodes', ['--grid', '4x4', '--exit', '1'] + C1, '', dict(split_nodes=2000), 'main'))
         camp.append(('c1-job39336-nodes', ['--grid', '5x5', '--exit', '2'] + C1, SEEDS_C1['job39336'][1],
                      dict(split_nodes=3000), 'main'))
@@ -606,11 +744,50 @@ def build_suites(worker=None):
                  dict(split_s=0.5, expect_evictions=True), 'evict'))
     camp.append(('evict-c1-job109788', ['--grid', '5x5', '--exit', '1'] + C1, SEEDS_C1['job109788'][1],
                  dict(split_s=0.3, expect_evictions=True), 'evict'))
+    # (7) path limit: a -DPATH_TOK_MAX=16 test build (review B5, T4/T5) must end path_overflow / bad_seed
+    camp.append(('pathmax16-4x4h0e5', ['--grid', '4x4', '--exit', '5'] + Z, '', {}, 'pathmax16'))
     SUITES['campaign'] = camp
     SUITES['all'] = SUITES['quick'] + camp
 
 
+WORKER_SOURCES = ('backsearch.c', 'sokoban_bfs.c', 'sokoban_bfs.h')
+# the three width-dispatch sites in sokoban_bfs.c (64-bit vs 128-bit solver); a narrow-bits test build
+# lowers this threshold so small grids take the wide path (see build_worker)
+WIDTH_TEST = 'g_bits_per_cell * (1 + nb) + nh > 64'
+WIDTH_SITES = 3
+
+
+def src_hash_of(src):
+    """SRC_HASH of a plain (no-knob) build of the worker sources in src: sha256 of backsearch.c +
+    sokoban_bfs.c + sokoban_bfs.h (build_pgo.sh; PROTOCOL3 §2.1)."""
+    h = hashlib.sha256()
+    for x in WORKER_SOURCES:
+        fn = os.path.join(src, x)
+        if not os.path.isfile(fn):
+            raise Fail(f'worker source not found: {fn} (pass --src DIR)')
+        with open(fn, 'rb') as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
+def check_src_matches(worker, src, allow_mismatch=False, out=print):
+    """A variant built from src (eviction, narrow-bits, knob builds) tests src, so src must be the
+    tested worker's source: its plain SRC_HASH must equal the worker's.  A knob-build worker, or a
+    tree that moved on since the candidate was built, fails unless allow_mismatch (then a warning)."""
+    mine, theirs = src_hash_of(src), worker.version.get('SRC_HASH', '')
+    if mine == theirs:
+        return f'--src matches the worker (SRC_HASH {mine[:16]})'
+    msg = (f'the sources in {src} (sha256 {mine[:16]}...) are not the tested worker\'s (SRC_HASH '
+           f'{(theirs or "none")[:16]}...): a variant built from them would test other code; pass --src with '
+           'the worker\'s sources, a prebuilt variant, or --allow-src-mismatch')
+    if not allow_mismatch:
+        raise Fail(msg)
+    out('WARNING: ' + msg)
+    return 'WARNING: --src differs from the worker'
+
+
 EVICT_KNOBS = ['-DSHALLOW_LG2=12', '-DRECENT_LG2=12']
+PATHMAX_KNOBS = ['-DPATH_TOK_MAX=16']      # review build B5
 NN_STUB = r'''
 int   nn_load(const char *p, float s, int r, int c, int ch) { (void)p;(void)s;(void)r;(void)c;(void)ch; return 0; }
 float nn_score(const float *f) { (void)f; return 0.f; }
@@ -623,18 +800,41 @@ void  nn_surrogate_close(void) {}
 '''
 
 
-def build_worker(src, out_dir, knobs, name):
+def build_worker(src, out_dir, knobs, name, narrow_bits=None):
     """Build a TEST-ONLY worker from src with -D knobs (plain -O2, no PGO) into out_dir.  Its SRC_HASH_STR
-    is 'TEST-BUILD-<knobs>' so it can never be mistaken for (or whitelisted as) a volunteer binary."""
+    is 'TEST-BUILD-<knobs>' so it can never be mistaken for (or whitelisted as) a volunteer binary.
+
+    narrow_bits=N: states wider than N bits take the 128-bit ("wide") solver instead of the 64-bit one
+    (production: 64), so the oracle can check the wide path on grids it can enumerate.  Uses the
+    worker's own -DSOK_NARROW_BITS_MAX knob when the source has one; otherwise a patched COPY of
+    sokoban_bfs.c in out_dir with its WIDTH_SITES width tests rewritten (the repo is never touched; a
+    changed site count fails loudly)."""
     out = os.path.join(out_dir, name)
     stub = os.path.join(out_dir, 'nn_stub.c')
     with open(stub, 'w') as f:
         f.write(NN_STUB)
     srcs = [os.path.join(src, x) for x in ('backsearch.c', 'sokoban_bfs.c')]
-    for s in srcs:
-        if not os.path.isfile(s):
-            raise Fail(f'worker source not found: {s} (pass --src)')
-    tag = 'TEST-BUILD-' + '-'.join(k[2:] for k in knobs)
+    for s_ in srcs:
+        if not os.path.isfile(s_):
+            raise Fail(f'worker source not found: {s_} (pass --src)')
+    knobs = list(knobs)
+    tag = 'TEST-BUILD-' + '-'.join([k[2:] for k in knobs] + ([f'NARROW_BITS={int(narrow_bits)}']
+                                                          if narrow_bits is not None else []))
+    if narrow_bits is not None:
+        with open(srcs[1]) as f:
+            text = f.read()
+        if 'SOK_NARROW_BITS_MAX' in text:
+            knobs.append(f'-DSOK_NARROW_BITS_MAX={int(narrow_bits)}')
+        else:
+            n = text.count(WIDTH_TEST)
+            if n != WIDTH_SITES:
+                raise Fail(f'narrow-bits build: expected {WIDTH_SITES} width tests {WIDTH_TEST!r} in {srcs[1]}, '
+                           f'found {n}; the solver dispatch changed: update WIDTH_TEST/WIDTH_SITES')
+            patched = os.path.join(out_dir, 'sokoban_bfs_narrow.c')
+            with open(patched, 'w') as f:
+                f.write(f'/* TEST COPY: width threshold 64 -> {int(narrow_bits)} (test_split_exact.build_worker) */\n' +
+                        text.replace(WIDTH_TEST, WIDTH_TEST[:-2] + '(%d)' % int(narrow_bits)))
+            srcs[1] = patched
     cmd = [os.environ.get('CC', 'cc'), '-O2', '-w'] + knobs + [f'-DSRC_HASH_STR="{tag}"', '-I', src, '-o', out] + \
         srcs + [stub, '-lz', '-lm']
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -644,17 +844,23 @@ def build_worker(src, out_dir, knobs, name):
 
 
 def check_small_tables(ev, main_worker):
-    """The eviction variant must really have smaller dedup tables than the worker under test (its
-    --version KNOBS line, protocol 3; older workers have none and rely on --expect-evictions alone)."""
+    """The eviction variant must really have smaller dedup tables than the worker under test (the
+    --version KNOBS line; a protocol-3 worker must print it on both sides; older workers have none and
+    rely on --expect-evictions alone), and must not carry the tested worker's SRC_HASH."""
     def knobs(w):
         try:
             return json.loads(w.version.get('KNOBS', '{}'))
         except ValueError:
             raise Fail(f'unparsable KNOBS line from {w.path}')
     ke, km = knobs(ev), knobs(main_worker)
+    p3 = main_worker.version.get('PROTOCOL') == '3'
     for k in ('SHALLOW_LG2', 'RECENT_LG2'):
-        if k in ke and k in km and not ke[k] < km[k]:
-            raise Fail(f'eviction worker {ev.path} has {k} {ke[k]}, not below the tested worker\'s {km[k]}')
+        if k in ke and k in km:
+            if not ke[k] < km[k]:
+                raise Fail(f'eviction worker {ev.path} has {k} {ke[k]}, not below the tested worker\'s {km[k]}')
+        elif p3:
+            raise Fail(f'KNOBS {k} missing from the {"eviction" if k not in ke else "tested"} worker\'s --version '
+                       '(protocol 3 prints it): cannot show the eviction build has smaller tables')
     if ev.version.get('SRC_HASH') and ev.version.get('SRC_HASH') == main_worker.version.get('SRC_HASH'):
         raise Fail('the eviction worker carries the tested worker\'s SRC_HASH: a knob build must never look like a '
                    'release build')
@@ -678,8 +884,12 @@ def main():
     ap.add_argument('--quick', action='store_true', help='= --suite quick')
     ap.add_argument('--only', action='append', default=[], help='with --suite: only configs whose name contains this')
     ap.add_argument('--list', action='store_true', help='with --suite: list the configs and exit')
-    ap.add_argument('--src', default=os.path.dirname(HERE), help='worker sources (for the eviction build)')
+    ap.add_argument('--src', default=os.path.dirname(HERE),
+                    help='worker sources for the test-only builds (must be the tested worker\'s: SRC_HASH is checked)')
+    ap.add_argument('--allow-src-mismatch', action='store_true',
+                    help='build the variants from --src even if it is not the tested worker\'s source (warning)')
     ap.add_argument('--evict-worker', help='a prebuilt small-table worker (else built from --src)')
+    ap.add_argument('--pathmax-worker', help='a prebuilt -DPATH_TOK_MAX=16 worker (else built from --src)')
     ap.add_argument('--json', action='store_true', help='print one RESULT json line per config')
     argv = sys.argv[1:]
     cfg = []
@@ -689,6 +899,7 @@ def main():
     a = ap.parse_args(argv)
     if a.quick:
         a.suite = 'quick'
+    install_signal_handlers()
     try:
         worker = Worker(a.worker)
         print(f'worker {worker.path}: src {worker.version.get("SRC_HASH", "?")[:16]} protocol '
@@ -706,7 +917,7 @@ def main():
             print('OK')
             return 0
         build_suites(worker)
-        todo = [c for c in SUITES[a.suite] if not a.only or any(o in c[0] for o in a.only)]
+        todo = select_only(SUITES[a.suite], a.only)
         if a.list:
             for c in todo:
                 print(c[0], ' '.join(c[1]), f'root {len(toks(c[2]))} tokens', c[3], c[4])
@@ -714,24 +925,35 @@ def main():
         variants = {'main': worker}
         build_dir = None
         failed = []
+        prebuilt = {'evict': a.evict_worker, 'pathmax16': a.pathmax_worker}
+        knobs_of = {'evict': EVICT_KNOBS, 'pathmax16': PATHMAX_KNOBS}
         try:
             for name, ccfg, root, mode, variant in todo:
-                if variant not in variants:
-                    if a.evict_worker:
-                        variants['evict'] = Worker(a.evict_worker)
-                    else:
-                        build_dir = build_dir or tempfile.mkdtemp(prefix='splitx_build_')
-                        t0 = time.time()
-                        variants['evict'] = Worker(build_worker(a.src, build_dir, EVICT_KNOBS, 'bs_test_evict'))
-                        print(f'built the test-only eviction worker ({" ".join(EVICT_KNOBS)}) in {time.time() - t0:.0f}s',
-                              flush=True)
-                    check_small_tables(variants['evict'], worker)
-                m = dict(split_s=0.02, split_nodes=0, sigint=False, expect_evictions=False)
-                m.update(mode)
                 try:
-                    res = run_config(variants[variant], ccfg, root=root, timeout=a.timeout, max_runs=a.max_runs,
-                                     visits=a.visits or a.strict, strict=a.strict, max_levels=a.max_levels,
-                                     name=name, allow_unknown=a.allow_unknown, **m)
+                    if variant not in variants:
+                        if prebuilt.get(variant):
+                            variants[variant] = Worker(prebuilt[variant])
+                        else:
+                            print(check_src_matches(worker, a.src, a.allow_src_mismatch), flush=True)
+                            build_dir = build_dir or tempfile.mkdtemp(prefix='splitx_build_')
+                            t0 = time.time()
+                            variants[variant] = Worker(build_worker(a.src, build_dir, knobs_of[variant],
+                                                                    'bs_test_' + variant))
+                            print(f'built the test-only {variant} worker ({" ".join(knobs_of[variant])}) in '
+                                  f'{time.time() - t0:.0f}s', flush=True)
+                        if variant == 'evict':
+                            check_small_tables(variants['evict'], worker)
+                        elif variants[variant].version.get('SRC_HASH') == worker.version.get('SRC_HASH'):
+                            raise Fail(f'the {variant} worker carries the tested worker\'s SRC_HASH')
+                    if variant == 'pathmax16':
+                        res = run_pathmax(variants[variant], worker, ccfg, timeout=a.timeout, name=name,
+                                          out=lambda x: print(x, flush=True))
+                    else:
+                        m = dict(split_s=0.02, split_nodes=0, sigint=False, expect_evictions=False)
+                        m.update(mode)
+                        res = run_config(variants[variant], ccfg, root=root, timeout=a.timeout, max_runs=a.max_runs,
+                                         visits=a.visits or a.strict, strict=a.strict, max_levels=a.max_levels,
+                                         name=name, allow_unknown=a.allow_unknown, **m)
                     if a.json:
                         print('RESULT\t' + json.dumps(res))
                 except Fail as e:
