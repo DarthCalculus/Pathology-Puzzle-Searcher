@@ -60,8 +60,8 @@ void sokoban_set_grid(int rows, int cols);
  *   SOK_PENDING_CAP  -2  the pending queue reached HP64_SIZE (every state width)
  *   SOK_PROBE_LIMIT  -3  a hash probe chain exceeded HT_PROBE_LIMIT (or the
  *                        optional heap cap, sokoban_set_heap_cap, was hit)
- *   SOK_TABLE_FULL   -5  the big hash table reached its 85% insert limit
- *                        (the solve is not retried: the rerun is identical)
+ *   SOK_TABLE_FULL   -5  the hash table, grown to its last tier (HTP_SIZE
+ *                        slots), reached its 85% insert limit
  *   SOK_NO_FIT       -6  the state cannot be represented (nb > MAX_BLOCKS or
  *                        nh > 30, or g_bits_per_cell*(1+nb)+nh beyond a test
  *                        build's -DSOK_STATE_BITS_MAX); nothing was searched
@@ -114,9 +114,12 @@ typedef struct {
     /* Frontier-width profile for the deepest BFS_TAIL_W cost levels of the
      * forward solve: tail_width[i] = #states settling at cost
      * (max_cost_seen - (BFS_TAIL_W-1-i)).  Only the *cutoff* solvers populate
-     * this; the uncapped solvers leave it untouched. */
+     * this, and only while sokoban_set_tail_profile is on (the default); the
+     * uncapped solvers leave it untouched. */
     int32_t tail_width[BFS_TAIL_W];
 } BfsProfile;
+void sokoban_set_tail_profile(int on);   /* 0: the cutoff solvers leave tail_width untouched (saves a per-pop update) */
+void sokoban_table_stats(long long *push_grows, long long *ms_grows, int n);   /* growths into table tier t = 1..n-1 so far */
 
 int  sokoban_solve(const Puzzle *pz, uint8_t *used_dirs, BfsProfile *prof);
 
@@ -194,12 +197,12 @@ void sokoban_set_decision_only(int on);
  * that does not fit at all): then out[] is
  * meaningless and the caller must fall back to per-start solves. */
 /* Parent-table reuse (see REFERENCE TABLE in sokoban_bfs.c).  After a cutoff
- * solve returned -1 exhaustively on the small table, sokoban_export_settled()
- * copies its settled (key, cost) pairs (returns n, or -1 if unavailable / too
- * many).  sokoban_set_reference() installs such a table for the next cutoff
- * solves of children whose forward puzzle is identical and whose cutoff is the
- * parent's + k; sokoban_clear_reference() removes it.  A solve made with a
- * reference installed is not exportable (its table is incomplete). */
+ * solve returned -1 exhaustively, sokoban_export_settled() copies its settled
+ * (key, cost) pairs (returns n, or -1 if unavailable or max or more entries;
+ * a solve made with a reference installed folds the reference's entries in,
+ * see there).  sokoban_set_reference() installs such a table for the next
+ * cutoff solves of children whose forward puzzle is identical and whose cutoff
+ * is the parent's + k; sokoban_clear_reference() removes it. */
 int  sokoban_export_settled(uint64_t *keys, int32_t *costs, int max);
 void sokoban_set_reference(const uint64_t *keys, const int32_t *costs, int n, int k);
 void sokoban_clear_reference(void);

@@ -256,7 +256,9 @@ jobs.tsv, so resuming still works.  Waste is at most SEC per split.
 
 Cross-job dedup loss is small (dedup off entirely costs ~1.4x states), and dedup
 table size barely matters (2x larger tables changed a 74M-state run by 1.5%).
-Keep concurrent workers to what RAM allows (~250 MB each).
+Keep concurrent workers to what RAM allows: plan on 0.5 GB each (measured
+2026-09-25: about 0.2 GB for a typical job, 0.25-0.4 GB for the heaviest 6x6
+0-hole jobs, 4 MB for a trivial one).
 
 **5x5 under real rules (2026-09-14 estimates, dedup-free lower bounds):** exit 0
 45 h, exit 1 124 h, exit 2 33 h, exit 6 ~8000 h, exit 7 216 h, exit 12 105 h of

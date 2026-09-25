@@ -1,23 +1,31 @@
 #!/bin/bash
 # Profile-guided build of backsearch_worker.
 #
-# The forward solver is ~90% of runtime and is branch-heavy; a PGO build is
-# measurably faster (~10-20% on the solver replay benchmark) than plain -O3.
-# This script:
+# The forward solver is most of the runtime and is branch-heavy; a PGO build
+# is measurably faster than plain -O3.  This script:
 #   1. builds an instrumented worker,
-#   2. runs it briefly on two representative searches to collect a profile: a
-#      5x5 run (the 64-bit solver instance) and a 6x6 0-hole subtree whose
-#      checks are about one third wider than 64 bits (the 16-block-byte
-#      instance), so neither instance is compiled as cold code,
-#   3. rebuilds with that profile.
+#   2. runs it on two campaign-shaped jobs (the campaign's own flags, protocol
+#      mode, a fixed amount of work: a few seconds each) to collect a profile:
+#      a 5x5 <=3-hole layer-4 root with exit transit (block-on-exit states, the
+#      64-bit solver instance) and a 6x6 0-hole subtree whose checks are about
+#      a third wider than 64 bits (10+ blocks: the 16-block-byte instance), so
+#      no campaign hot path is compiled as cold code,
+#   3. checks that both runs completed and that the profile is not empty, and
+#      (clang) that both solver instances ran: code the training never runs is
+#      optimised for size, which measured 27% SLOWER than plain -O3 on heavy
+#      6x6 jobs when a 6x6 training run never reached the wide instance,
+#   4. rebuilds with that profile.
+# The binary is portable (no -march/-mcpu=native: a binary copied to another
+# CPU must not die with SIGILL).  NATIVE=1 opts in to the host's ISA.
 #
 # Usage:
 #   ./build_pgo.sh                 # -> ./backsearch_worker
 #   ./build_pgo.sh -o mybinary     # custom output path
 #   ./build_pgo.sh --no-torch      # force the no-NN stub even if libtorch is present
 #   ./build_pgo.sh --train "--grid 6x6 --exit 0 --time 6"   # custom first training run
-#   ./build_pgo.sh --train2 ""     # skip the second (6x6 wide-state) training run
+#   ./build_pgo.sh --train2 ""     # skip the second (6x6) training run
 #   CC=gcc-13 ./build_pgo.sh   # pick the compiler (clang and GCC PGO are both handled)
+#   NATIVE=1 ./build_pgo.sh    # also -mcpu=native (arm64) / -march=native (x86): this machine only
 #   KNOBS="-DHP64_SIZE=(1<<9) -DPATH_TOK_MAX=16" ./build_pgo.sh -o /tmp/knob_worker
 #                              # a "knob build": compile-time table-size overrides (tests)
 #   ./build_pgo.sh --print-hash      # print the SRC_HASH this build would carry, then exit
@@ -41,8 +49,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT=./backsearch_worker
-TRAIN_ARGS="--grid 5x5 --exit 0 --time 4"
-TRAIN2_ARGS="--grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --exit 14 --seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R1 --time 4"
+# Training runs: campaign flags (always --allow-exit-transit), protocol mode
+# (--status-every), a fixed number of expansions (--split-after-nodes).
+TRAIN_ARGS="--grid 5x5 --two-tables --allow-exit-transit --num-holes 3 --exit 7 --seed-path D2,R1,U1,U1 --time 0 --split-after-nodes 500000 --status-every 1000"
+TRAIN2_ARGS="--grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --exit 14 --seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R1 --time 0 --status-every 1000"
 USE_TORCH=auto
 PRINT_HASH=0
 while [ $# -gt 0 ]; do
@@ -119,7 +129,15 @@ EOF
   NN_OBJ="$TMP/nn_stub.o"
 fi
 
-CFLAGS="-O3 $KNOBS -DGIT_SHA_STR=\"$SHA\" -DSRC_HASH_STR=\"$SRC_HASH\""
+ARCHFLAGS=""
+if [ "${NATIVE:-0}" = 1 ]; then
+  case "$(uname -m)" in arm64|aarch64) ARCHFLAGS="-mcpu=native" ;; *) ARCHFLAGS="-march=native" ;; esac
+  if ! echo 'int main(void){return 0;}' | ${CC:-cc} -x c - $ARCHFLAGS -o "$TMP/archtest" 2>/dev/null; then
+    echo "NATIVE=1: the compiler does not accept $ARCHFLAGS" >&2; exit 1
+  fi
+  echo "NATIVE=1: $ARCHFLAGS (this binary may not run on other CPUs)"
+fi
+CFLAGS="-O3 $ARCHFLAGS $KNOBS -DGIT_SHA_STR=\"$SHA\" -DSRC_HASH_STR=\"$SRC_HASH\""
 LIBS="-lz -lm"
 
 # --- compiler family: clang (macOS, or clang on Linux) vs GCC ------------------
@@ -144,25 +162,65 @@ else
 fi
 
 # --- 1. instrumented build ---------------------------------------------------
-echo "[1/3] instrumented build"
+echo "[1/4] instrumented build"
 $CC $CFLAGS $GEN -c backsearch.c  -o "$TMP/bs.o"
 $CC $CFLAGS $GEN -c sokoban_bfs.c -o "$TMP/sb.o"
 $CXX_LINK $GEN "$TMP/bs.o" "$TMP/sb.o" $NN_OBJ -o "$TMP/worker.gen" $LIBS $NN_LINK
 
 # --- 2. training runs --------------------------------------------------------
-echo "[2/3] training run: $TRAIN_ARGS"
+# Each must exit 0 and end with a SUMMARY of a completed run (status split or
+# exhausted); anything else fails the build instead of producing a build
+# trained on nothing.
+train() {   # train N ARGS
+  local n=$1; shift
+  echo "      training run $n: $*"
+  local rc=0
+  LLVM_PROFILE_FILE="$TMP/w$n.profraw" "$TMP/worker.gen" "$@" > "$TMP/train$n.out" 2> "$TMP/train$n.err" || rc=$?
+  if [ $rc -ne 0 ] || ! grep -Eq '^SUMMARY.*"status":"(split|exhausted)"' "$TMP/train$n.out"; then
+    echo "training run $n failed (exit $rc): $*" >&2
+    tail -5 "$TMP/train$n.err" >&2; grep '^SUMMARY' "$TMP/train$n.out" >&2 || true
+    exit 1
+  fi
+}
+echo "[2/4] training runs"
 # shellcheck disable=SC2086
-LLVM_PROFILE_FILE="$TMP/w1.profraw" "$TMP/worker.gen" $TRAIN_ARGS >/dev/null 2>&1 || true
-if [ -n "$TRAIN2_ARGS" ]; then
-  echo "      training run: $TRAIN2_ARGS"
-  # shellcheck disable=SC2086
-  LLVM_PROFILE_FILE="$TMP/w2.profraw" "$TMP/worker.gen" $TRAIN2_ARGS >/dev/null 2>&1 || true
-fi
-# clang merges the raw profiles; gcc accumulates both runs in $TMP/*.gcda and reads them directly
-if [ "$FAMILY" = clang ]; then $PROFDATA merge -output="$TMP/w.profdata" "$TMP"/w*.profraw; fi
+train 1 $TRAIN_ARGS
+# shellcheck disable=SC2086
+if [ -n "$TRAIN2_ARGS" ]; then train 2 $TRAIN2_ARGS; fi
 
-# --- 3. optimised build (same object paths as stage 1, see above) -------------
-echo "[3/3] optimised build -> $OUT"
+# --- 3. the profile must not be empty ------------------------------------------
+echo "[3/4] checking the profile"
+if [ "$FAMILY" = clang ]; then
+  # clang merges the raw profiles
+  $PROFDATA merge -output="$TMP/w.profdata" "$TMP"/w*.profraw
+  MAXC=$( { $PROFDATA show "$TMP/w.profdata" 2>/dev/null || true; } | sed -n 's/^Maximum function count: *\([0-9]*\).*/\1/p' | head -1 || true)
+  if [ -z "$MAXC" ] || [ "$MAXC" -lt 100000 ]; then
+    echo "the training profile is empty or nearly so (maximum function count '${MAXC:-?}'): refusing to build" >&2; exit 1
+  fi
+  echo "      maximum function count $MAXC"
+  # Code the training never ran is compiled for size: the solver instances the
+  # training runs are meant to cover must have run (the second run is the one
+  # that reaches the 16-block-byte instance; skip it with --train2 "").
+  fcount() { { $PROFDATA show --function="$1" --counts "$TMP/w.profdata" 2>/dev/null || true; } | sed -n 's/^ *Function count: *\([0-9]*\).*/\1/p' | head -1 || true; }
+  NEED="solve_push_cutoff_w1 solve_multi_w1"
+  if [ -n "$TRAIN2_ARGS" ]; then NEED="$NEED solve_push_cutoff_w2"; fi
+  for f in $NEED; do
+    c=$(fcount "$f")
+    if [ -z "$c" ]; then echo "      (profile check: no count found for $f; skipped)"; continue; fi
+    if [ "$c" -eq 0 ]; then
+      echo "the training runs never reached $f: its code would be compiled as cold (choose a training run that does)" >&2; exit 1
+    fi
+    echo "      $f: $c calls"
+  done
+else
+  # gcc accumulates both runs in $TMP/*.gcda and reads them directly
+  if ! ls "$TMP"/*.gcda >/dev/null 2>&1 || [ -z "$(find "$TMP" -name '*.gcda' -size +0c)" ]; then
+    echo "the training runs left no profile data (.gcda): refusing to build" >&2; exit 1
+  fi
+fi
+
+# --- 4. optimised build (same object paths as stage 1, see above) -------------
+echo "[4/4] optimised build -> $OUT"
 $CC $CFLAGS $USE -c backsearch.c  -o "$TMP/bs.o"
 $CC $CFLAGS $USE -c sokoban_bfs.c -o "$TMP/sb.o"
 $CXX_LINK "$TMP/bs.o" "$TMP/sb.o" $NN_OBJ -o "$OUT" $LIBS $NN_LINK
