@@ -206,14 +206,25 @@ python3 volunteer.py --name "Your name" [--workers N] [--server URL] [--port 876
    walk-history flags, so a subtree job expands some twins the full run skipped
    and skips some it expanded; both dominate the same levels. Passed
    2026-09-23 (5 runs, 0 levels lost, 106,436 distinct levels on the 5x5 case).
-2. **Chaos** (client+server, local, `v2/test_chaos.sh WORKER`): real node
-   server on a temp `jobs.db`, real worker, two real clients; one client is
-   SIGKILLed (workers orphaned, leases expire in 5 s) and one is stopped with
-   SIGINT (hands back REMAINING) and both restart; runs until the audit is
-   clean. Asserts: at least one job split, audit clean, union of the workers'
-   canonical valid-level traces == monolithic run (levels at or below the root
-   layer), best equal. Passed 2026-09-23 on 5x5 exit 7 ≤3 blocks (46 layer-2
-   roots → 72 jobs, 473,034 levels, best 58, 62 s wall).
+2. **Chaos** (client+server, local, `v2/test_chaos.sh WORKER [--config 4x4h3|6x6h0b1]`, driver
+   `v2/test_chaos.py`): the real node server on a temp data dir (both `jobs.db` and `records.db`:
+   `JOBS_DATA_DIR`, `RECORDS_DATA_DIR`; no backups), the real worker, two real clients with one worker
+   each. The campaign is an allowlisted protocol-3 plan with every canonical exit, seeded by `v2_seed.js`
+   from the worker's own `--list-layer` output; splits are deterministic (`split_after_nodes`), lease
+   10 s, heartbeat 5 s, 1-s windows, `dup_fraction` 0.1. Scenario, each step waiting for its condition:
+   client A is SIGKILLed while its worker runs and it holds leases, and restarted; client B gets SIGINT
+   in the middle of a window (it must hand the window back, exit 0 and hold no lease), and restarted;
+   the server is stopped with SIGTERM while work remains (exit 0), left down 3 s (both clients must
+   notice) and restarted; both clients must then exit by themselves with code 0 when the campaign is
+   complete. Asserts: campaign complete; a FRESH audit of every exit clean and exact (no mismatch,
+   quarantine or pending dup); at least one split and one compared dup; no failure report, no rejected
+   report, empty outboxes; every exit's best equals the monolithic run's; the union of the valid levels
+   traced by the runs behind ACCEPTED done/split nodes (tied through the client's development run log,
+   `VOLUNTEER_RUN_LOG`) equals the monolithic run's canonical set at depth >= K per exit, nothing lost
+   or extra; no process of the test survives it and the owner's databases are untouched. `--e2e` runs
+   one client without disruptions to completion (exit 0). Needs two CPU slots (a server, two clients
+   and their workers). Passed 2026-09-25 on 4x4 <=3 holes (61 layer-2 roots, 6,208 nodes, 84 s) and 6x6
+   0 holes <=1 block (250 layer-3 roots, 8,818 nodes, 90 s).
 3. **Gates** (server, `server/test/v2_gates.test.js`, `node --test`): 12
    tests covering register/queue, lease caps, unknown hash, bad remaining,
    foreign level, duplicates and fingerprint mismatch, sweeper, audit, HTTP

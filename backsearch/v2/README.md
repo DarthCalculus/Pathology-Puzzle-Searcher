@@ -89,9 +89,10 @@ is published only when every exit's audit is clean.
 
 ```
 python3 v2/test_split_exact.py ./backsearch_worker_nt --split 0.15 -- --grid 5x5 --exit 12 --num-blocks 3 --allow-exit-transit
-bash v2/test_chaos.sh ./backsearch_worker_nt          # needs node and the server checkout
+bash v2/test_chaos.sh ./backsearch_worker_nt          # needs node and the server checkout; --config 6x6h0b1, --e2e
 bash v2/test_client.sh                                 # fake server + fake worker (test 'ui' needs node)
 node --test ../PathologyRecords/server/test/v2_gates.test.js
 ```
 
-Every test runs one worker at a time and finishes in about a minute.
+Every test but the chaos test runs one worker at a time and finishes in about a minute. The chaos
+test runs a server, two clients and their workers at once (two CPUs) for one to two minutes.

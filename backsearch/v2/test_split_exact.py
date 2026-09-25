@@ -198,7 +198,7 @@ class Worker:
 def client_argv(worker, grid, exit_, seed, split_after, extra):
     """The client's worker argv (volunteer.py Volunteer.worker_argv), rebuilt here and cross-checked
     against the real function by check_client_argv().  The one deliberate difference: the split time is
-    printed with %g, not %.1f, so tests can split after 0.02 s (the client never splits below 1 s)."""
+    printed with %g, not the client's %.3f (compared as a number), so tests can split after 0.0002 s."""
     argv = [worker, '--grid', grid, '--two-tables', '--exit', str(exit_)]
     if seed != '':
         argv += ['--seed-path', seed]            # the client runs an exit root "" without --seed-path
@@ -235,6 +235,16 @@ def check_client_argv():
 
         def worker_argv_base(self):
             return ['W']
+
+        def split_after_nodes(self):             # client 3.1.0: a campaign's split_after_nodes (none here)
+            return None
+
+    def norm(argv):                              # the split time compared as a number (%g here, %.3f there)
+        out = list(argv)
+        for i, x in enumerate(out[:-1]):
+            if x == '--split-after':
+                out[i + 1] = float(out[i + 1])
+        return out
     fn = getattr(getattr(volunteer, 'Volunteer', None), 'worker_argv', None)
     if fn is None:
         return 'volunteer.Volunteer.worker_argv not found; argv not cross-checked'
@@ -244,7 +254,7 @@ def check_client_argv():
         except Exception as e:
             return f'volunteer.worker_argv raised {type(e).__name__}: {e}; argv not cross-checked'
         mine = client_argv('W', '4x4', 0, seed, 1.5, flags)
-        if theirs != mine:
+        if norm(theirs) != norm(mine):
             raise Fail(f'the harness argv no longer matches the client:\n  client  {theirs}\n  harness {mine}\n'
                        'update client_argv() in test_split_exact.py')
     return 'argv matches volunteer.worker_argv'

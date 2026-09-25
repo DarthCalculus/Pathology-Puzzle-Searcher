@@ -889,6 +889,10 @@ test_w() {
   sleep 1
   kill -INT "$CLIENT_PID"
   wait_log w1.log "stopping:" 5 || bad "no stop logged"
+  # let the worker take the SIGINT first (the fake worker notices it within 0.1 s and then takes 3 s to
+  # answer): frozen before it noticed, its 3 s would only start after its own wake, 1 s after the
+  # client's, and the test would measure the fake worker's timing instead of the client's grace
+  sleep 0.5
   kill -STOP "$CLIENT_PID" "$wp2"; sleep 7
   kill -CONT "$CLIENT_PID"; sleep 1; kill -CONT "$wp2"
   wait_rc "$CLIENT_PID" 20; rc=$RC; CLIENT_PID=""

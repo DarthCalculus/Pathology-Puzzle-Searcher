@@ -11,12 +11,12 @@ SUMMARY, and its level when it has a best, as the worker prints them). `--status
 one dashboard poller of /api/v2/status every S seconds (hunt.html polls every 3 s). Measures
 server request latency and throughput; prints rows written per second.
 
-  python3 test_load.py --server http://127.0.0.1:3199 --clients 40 --workers 32 --seconds 60 --hash <64 hex>
+  python3 test_load.py --server http://127.0.0.1:19430 --clients 40 --workers 32 --seconds 60 --hash <64 hex>
 """
 import argparse, json, random, statistics, sys, threading, time, urllib.request
 
 ap = argparse.ArgumentParser()
-ap.add_argument('--server', default='http://127.0.0.1:3199'); ap.add_argument('--clients', type=int, default=40)
+ap.add_argument('--server', default='http://127.0.0.1:19430'); ap.add_argument('--clients', type=int, default=40)
 ap.add_argument('--workers', type=int, default=32); ap.add_argument('--seconds', type=float, default=60)
 ap.add_argument('--interval', type=float, default=10); ap.add_argument('--job-s', type=float, default=2.0,
     help='mean simulated job duration (2 s = the worst case the rules allow after absorption)')
@@ -29,12 +29,21 @@ FLAGS = {"grid": "5x5", "transit": 1, "block_on_exit": 0, "bulk_walk": 1, "max_h
 LEVELS = {12: '00000/00000/00300/00000/40000', 0: '30000/00000/00500/00000/00004'}   # a valid level for the exits that have one here
 
 def post(path, body, timeout=30):
+    """(HTTP code, JSON body, seconds). Code 0 = no HTTP answer (refused, reset, timeout) or a body
+    that is not JSON: review M92, every such failure is counted, none kills a client thread."""
     req = urllib.request.Request(a.server + path, data=json.dumps({**VER, **body}).encode(), headers={'Content-Type': 'application/json'})
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r: out = json.loads(r.read().decode()); code = r.status
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode(); code = r.status
+        try: out = json.loads(raw)
+        except ValueError: return 0, {'error': 'non-JSON body: ' + raw[:100]}, time.time() - t0
     except urllib.error.HTTPError as e:
-        out = json.loads(e.read().decode() or '{}'); code = e.code
+        try: out = json.loads(e.read().decode() or '{}')
+        except ValueError: out = {'error': 'non-JSON error body'}
+        code = e.code
+    except Exception as e:          # URLError, timeout, reset, ...
+        return 0, {'error': '%s: %s' % (type(e).__name__, e)}, time.time() - t0
     return code, out, time.time() - t0
 
 def get(path, timeout=30):
@@ -43,9 +52,11 @@ def get(path, timeout=30):
         with urllib.request.urlopen(a.server + path, timeout=timeout) as r: r.read(); code = r.status
     except urllib.error.HTTPError as e:
         code = e.code
+    except Exception:
+        code = 0
     return code, time.time() - t0
 
-lat = {'lease': [], 'reports': [], 'heartbeat': [], 'status': []}; errors = []; rows = [0]; lock = threading.Lock()
+lat = {'lease': [], 'reports': [], 'heartbeat': [], 'status': [], 'campaigns': []}; errors = []; rows = [0]; accepted = [0]; lock = threading.Lock()
 stop = time.time() + a.seconds
 
 def node(seed, parent, status, exit_):
@@ -75,6 +86,12 @@ def tree_report(job):
     return {"job_id": job['id'], "src_hash": a.hash, "nodes": nodes}
 
 def client(idx):
+    try:
+        client_loop(idx)
+    except Exception as e:          # M92: a dying client thread is an error, never silent
+        with lock: errors.append(('client thread', idx, '%s: %s' % (type(e).__name__, e)))
+
+def client_loop(idx):
     code, reg, _ = post('/api/v2/register', {"name": f"load{idx}", "workers": a.workers})
     if code != 200: errors.append(('register', code, str(reg)[:200])); return
     token = reg['token']; held = []; last_hb = 0
@@ -98,9 +115,13 @@ def client(idx):
             with lock:
                 lat['reports'].append(d)
                 if c == 200:
-                    rows[0] += sum(len(r['nodes']) for r in reports)
-                    bad = [x for x in o.get('results', []) if not x.get('ok')]
-                    if bad: errors.append(('report results', len(bad), str(bad[0])[:200]))
+                    res = o.get('results') if isinstance(o.get('results'), list) else []
+                    if len(res) != len(reports): errors.append(('report results', len(res), 'expected %d results' % len(reports)))
+                    for r, x in zip(reports, res):
+                        if isinstance(x, dict) and x.get('ok') and not x.get('error'):
+                            rows[0] += len(r['nodes']); accepted[0] += 1       # M92: only what the server accepted
+                        else:
+                            errors.append(('report result', r['job_id'], str(x)[:200]))
                 else: errors.append(('reports', c, str(o)[:200]))
         want = min(200, max(0, int(a.workers * 300 / a.job_s) - len(held)))
         if want:
@@ -111,11 +132,18 @@ def client(idx):
         time.sleep(max(0, a.interval - (time.time() - t)))
 
 def poller():
+    """hunt.html-style dashboard: /api/v2/status every status_poll s, the campaigns card every 10 polls."""
+    i = 0
     while time.time() < stop:
         t = time.time()
         c, d = get('/api/v2/status')
         with lock: lat['status'].append(d)
         if c != 200: errors.append(('status', c, ''))
+        if i % 10 == 0:
+            c, d = get('/api/v2/campaigns')
+            with lock: lat['campaigns'].append(d)
+            if c != 200: errors.append(('campaigns', c, ''))
+        i += 1
         time.sleep(max(0, a.status_poll - (time.time() - t)))
 
 threads = [threading.Thread(target=client, args=(i,), daemon=True) for i in range(a.clients)]
@@ -128,6 +156,7 @@ def pct(xs, p): return sorted(xs)[min(len(xs) - 1, int(p * len(xs)))] if xs else
 print(f"clients {a.clients} × workers {a.workers}, {el:.0f} s, mean job {a.job_s}s")
 for k, xs in lat.items():
     if xs: print(f"  {k:9s} n={len(xs):5d} rate={len(xs)/el:6.2f}/s  median={statistics.median(xs)*1000:6.1f} ms  p95={pct(xs,0.95)*1000:7.1f} ms  max={max(xs)*1000:7.1f} ms")
-print(f"  rows written: {rows[0]} ({rows[0]/el:.0f}/s);  errors: {len(errors)}")
+print(f"  reports accepted: {accepted[0]}; rows written: {rows[0]} ({rows[0]/el:.0f}/s);  errors: {len(errors)}")
+if not accepted[0]: errors.append(('no report was accepted', 0, ''))
 for e in errors[:5]: print('   ', e)
 sys.exit(1 if errors else 0)
