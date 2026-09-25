@@ -175,18 +175,25 @@ static int g_only_task   = -1;   /* -1 = run all tasks merged (default) */
 static int g_list_tasks  = 0;
 
 /* --estimate N [--estimate-depth K]: Knuth tree-size estimation instead of a
- * DFS.  The depth-K layer is enumerated exactly (with dedup), then each layer
- * node gets ceil(N / layer) random root-to-leaf probes that use expand() /
- * try_successor() verbatim (every prune except dedup), multiplying the accepted
- * out-degree along the way.  E[product] is the subtree size, so the estimate is
- * unbiased for the dedup-free DFS tree; the real DFS is ~0.7x of that. */
+ * DFS.  The depth-K root layer of the job tree is enumerated exactly (with dedup
+ * and bulk walk-back, see run_estimate), then each root gets ceil(N / roots)
+ * random root-to-leaf probes that use expand() / try_successor() verbatim (every
+ * prune except dedup), multiplying the accepted out-degree along the way.
+ * E[product] is the subtree size, so the estimate is unbiased for the dedup-free
+ * job tree; the real DFS is ~0.7x of that. */
 static int    g_estimate_probes = 0;
-static const char *g_estimate_dump = NULL;   /* --estimate-dump FILE: per-layer-node estimates as TSV (chunk planning) */
+static const char *g_estimate_dump = NULL;   /* --estimate-dump FILE: per-root estimates as TSV (chunk planning, v2_seed est_s) */
 static int    g_estimate_layer  = 6;
-static int    g_list_layer      = 0;      /* --list-layer K: print the dedup'd depth-K layer as --seed-path strings and exit */
+static int    g_list_layer      = 0;      /* --list-layer K: print the job tree's depth-K root layer as --seed-path strings and exit */
 static int    g_probe_mode      = 0;      /* 1: try_successor appends to g_probe_buf instead of q_push */
-static int8_t g_probe_tagD[64], g_probe_tagV[64];
 static int    g_probe_n         = 0;
+/* One expansion emits at most (component size - 1) bulk walk-back children plus
+ * 4 directions x 3 single steps, i.e. fewer than MAX_NCELLS + 16 children; the
+ * buffer holds that many and overflowing it is a fatal internal error, never a
+ * silent drop (review N19). */
+#ifndef PROBE_BUF_MAX
+#define PROBE_BUF_MAX (MAX_NCELLS + 16)
+#endif
 static int8_t g_emit_D = -1, g_emit_V = -1; /* set by expand() before each try_successor() */
 static int    g_emit_walk_committed = 0;
 /* Bulk walk-back generation (--no-bulk-walk to disable).  For a state whose
@@ -750,7 +757,7 @@ static int exit_block_stuck(const BState *s, uint8_t adjflags) {
     return 2;
 }
 
-static BState g_probe_buf[64];   /* --estimate: children of the node being probed */
+static BState g_probe_buf[PROBE_BUF_MAX];   /* --estimate / --list-layer: children of the node being expanded */
 
 /* --fixedholes with an explicit --num-holes larger than the whitelist grants a
  * "wildcard" budget: that many holes may be placed OUTSIDE the whitelist
@@ -2293,9 +2300,12 @@ static int apply_seed_step(BState *s, int D, int variant) {
 
 /* Build the seed-path seed (bare depth-0 root + replayed --seed-path steps)
  * into *out.  Returns 1 on success; on an invalid step prints a diagnostic and
- * returns 0.  Shared by run_exit_search and run_rollout so both honor
- * --seed-path identically. */
-static int build_seed_path_seed(BState *out) {
+ * returns 0.  Shared by run_exit_search, run_rollout and the root listing
+ * (run_estimate, which also replays every root it prints through
+ * replay_steps() to check that the job rebuilds exactly that node). */
+static int replay_steps(const SeedStep *steps, int nsteps, BState *out, int verbose);
+static int build_seed_path_seed(BState *out) { return replay_steps(g_seed_path, g_seed_path_n, out, 1); }
+static int replay_steps(const SeedStep *steps, int nsteps, BState *out, int verbose) {
     BState seed = {
         .player_pos      = (int8_t)g_exit_pos,
         .nblocks         = 0,
@@ -2310,9 +2320,9 @@ static int build_seed_path_seed(BState *out) {
      * generated one -- walk history cleared, bulk_walk set -- or its expansion
      * would differ from the tree the DFS builds. */
     int run = 0;
-    for (int i = 0; i < g_seed_path_n; i++) {
-        int D = g_seed_path[i].direction;
-        int V = g_seed_path[i].variant;
+    for (int i = 0; i < nsteps; i++) {
+        int D = steps[i].direction;
+        int V = steps[i].variant;
         int user_digit = (V == 4) ? 3 : V;   /* invert the parse-time remap for messages */
         int C = g_adj[seed.player_pos][D ^ 2];
         int committed_walk = V == 1 && C >= 0 && (seed.committed_empty >> C & 1) && g_bulk_walk_active
@@ -2323,8 +2333,9 @@ static int build_seed_path_seed(BState *out) {
          * after every single-step edge below. */
         if (!committed_walk && run) { seed.wh = 0; seed.bulk_walk = 1; run = 0; seed.adjflags |= exit_adj_bits(&seed); }
         if (!apply_seed_step(&seed, D, V)) {
-            fprintf(stderr, "error: --seed-path step %d (%c%d) is invalid at depth %d (player=%d)\n",
-                    i, "URDL"[D], user_digit, seed.depth, seed.player_pos);
+            if (verbose)
+                fprintf(stderr, "error: --seed-path step %d (%c%d) is invalid at depth %d (player=%d)\n",
+                        i, "URDL"[D], user_digit, seed.depth, seed.player_pos);
             return 0;
         }
         if (committed_walk) run = 1; else seed.adjflags |= exit_adj_bits(&seed);
@@ -2551,11 +2562,8 @@ static void try_successor_x(const BState *s, int have_x, int given_x, int dedup_
         }
     }
     if (g_probe_mode) {
-        if (g_probe_n < 64) {
-            g_probe_tagD[g_probe_n] = g_emit_D;
-            g_probe_tagV[g_probe_n] = g_emit_V;
-            g_probe_buf[g_probe_n++] = ns;
-        }
+        if (g_probe_n >= PROBE_BUF_MAX) fatal_error("internal error: a node has more than PROBE_BUF_MAX children in the root listing / estimator");
+        bs_copy(&g_probe_buf[g_probe_n++], &ns);
         return;
     }
     q_push(&ns);
@@ -4324,17 +4332,114 @@ static void run_rollout(double remaining_s, int *out_exhausted) {
 static const BState *g_task_seeds = NULL;
 static int           g_task_seed_count = 0;
 
-/* -------------------------------------------------------------------------
- * --estimate: Knuth random-probe tree-size estimation (see globals above).
- * ------------------------------------------------------------------------- */
-typedef struct { BState st; char path[PATH_TEXT_CAP]; uint8_t key[64]; } LayerNode;   /* key: DFS-order sort key (per level, 63 - generation rank) */
-static int layer_cmp(const void *a, const void *b) { return memcmp(((const LayerNode *)a)->key, ((const LayerNode *)b)->key, 64); }
+/* The search definition a job actually runs: bulk walk-back generation is on
+ * exactly when run_exit_search turns it on (it needs the plain DFS and no exact
+ * solve lengths).  The root listing and SUMMARY's flags use the same value. */
+static int bulk_walk_effective(void) {
+    return g_bulk_walk && g_beam_width == 0 && g_rollout_steps == 0 && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
+}
+static void json_str(FILE *f, const char *t);   /* defined with print_summary */
+static void print_flags_json(FILE *f);
 
-static void path_append(char *path, size_t cap, int D, int V) {
-    size_t n = strlen(path);
-    /* --seed-path digits are user-facing: 1 walk, 2 push (existing or new block), 3 un-consume. */
-    int digit = (V == 4) ? 3 : (V == 3) ? 2 : V;
-    snprintf(path + n, cap - n, "%s%c%d", n ? "," : "", "URDL"[D], digit);
+/* -------------------------------------------------------------------------
+ * The root layer: --list-layer K, --estimate N [--estimate-depth K],
+ * --estimate-dump FILE (PROTOCOL3 §2.4; review C2 = M1 + N11, N19).
+ *
+ * The layer is cut from the JOB TREE: the tree run_exit_search builds with these
+ * flags, through the same expand() / bulk_generate() / try_successor(), with bulk
+ * walk-back on exactly when a job has it on, every prune, and dedup.  Nodes are
+ * expanded one tree edge (generation) at a time; a bulk walk-back child is ONE
+ * edge although its depth jumps by its walk length.  A child whose depth is >= K
+ * is a ROOT and is not expanded; every node of depth < K is expanded.  So a root
+ * is exactly a node of depth >= K whose tree parent has depth < K (bulk children
+ * can land deeper than K), and every tree node of depth >= K lies in the subtree
+ * of a root.  Replaying a root's path (--seed-path) rebuilds that very node --
+ * bulk_walk, walk history, walk segment, adjflags -- and the listing checks this
+ * for every root it prints (layer_replay_ok), so the jobs of the K-layer cover
+ * the whole tree at depth >= K for every K.  (Until 2026-09-24 the listing ran
+ * with bulk walk-back off: a root ending in a walk onto a committed cell replayed
+ * as a bulk child, and its parent's farther bulk siblings belonged to no job.
+ * K <= 4 was unaffected: no committed walk exists within 4 steps.)
+ *
+ * The nodes above the layer (depth < K) belong to no job: their deepest valid
+ * level is LAYERINFO shallow_best (verified like a job's LEVEL line), and an
+ * inconclusive check among them -- a candidate no job would ever report -- makes
+ * the listing fail (status error, exit 5), as does a full dedup table.  Dedup
+ * only drops a node whose state was reached at a depth <= its own by a node that
+ * is expanded here or is a root: the rule the DFS itself relies on.
+ *
+ * Output per exit: the LAYERINFO header, then one LAYER line per root in DFS
+ * visiting order (LAYER / dump lines can be cut into --from/--until ranges).
+ * --estimate prints the same header and roots, then runs Knuth probes below each
+ * root (every prune except dedup; each tree edge counts as one node, so the
+ * estimates describe the job tree) and appends the header plus one row per root
+ * to the --estimate-dump file.
+ * ------------------------------------------------------------------------- */
+typedef struct { BState *st; uint8_t *key; size_t n, cap; int kw; } LayerVec;   /* key[g]: 255 - rank among the children of its generation-g ancestor */
+static void lv_push(LayerVec *v, const BState *s, const uint8_t *pkey, int gen, int rank) {
+    if (v->n == v->cap) {
+        v->cap = v->cap ? v->cap * 2 : 1024;
+        v->st  = xrealloc(v->st, v->cap * sizeof *v->st, "layer nodes");
+        v->key = xrealloc(v->key, v->cap * (size_t)v->kw, "layer keys");
+    }
+    bs_copy(&v->st[v->n], s);
+    uint8_t *k = v->key + v->n * (size_t)v->kw;
+    if (pkey) memcpy(k, pkey, (size_t)v->kw); else memset(k, 0, (size_t)v->kw);
+    if (gen >= 0 && gen < v->kw) k[gen] = (uint8_t)(255 - rank);   /* later-generated = pushed later = visited earlier */
+    v->n++;
+}
+static void lv_free(LayerVec *v) { free(v->st); free(v->key); v->st = NULL; v->key = NULL; v->n = v->cap = 0; }
+static const uint8_t *g_lv_keys; static int g_lv_kw;
+static int lv_idx_cmp(const void *a, const void *b) {
+    size_t i = *(const size_t *)a, j = *(const size_t *)b;
+    return memcmp(g_lv_keys + i * (size_t)g_lv_kw, g_lv_keys + j * (size_t)g_lv_kw, (size_t)g_lv_kw);
+}
+static int has_block_on_exit(const BState *s) {
+    for (int i = 0; i < s->nblocks; i++) if (s->block_pos[i] == g_exit_pos) return 1;
+    return 0;
+}
+/* 1 if a job seeded with n's path starts from exactly n: replay the path the way
+ * run_exit_search does (build_seed_path_seed) and compare every field that shapes
+ * the subtree; the adjflags compared are the ones the job's root check gives it
+ * (try_successor_x ORs in the state's own moments).  Else 0 and the reason. */
+static int layer_replay_ok(const BState *n, char *why, size_t cap) {
+    static SeedStep steps[PATH_TOK_MAX];
+    static BState r;
+    for (int i = 0; i < n->plen; i++) { steps[i].direction = (int8_t)(n->path[i] & 3); steps[i].variant = (int8_t)(n->path[i] >> 2); }
+    if (!replay_steps(steps, n->plen, &r, 0)) { snprintf(why, cap, "its path does not replay"); return 0; }
+    uint8_t radj = (g_exit_block_prune && !g_allow_block_on_exit) ? (uint8_t)(r.adjflags | exit_adj_bits(&r)) : 0;
+    const char *f = NULL;
+    if (r.plen != n->plen || memcmp(r.path, n->path, n->plen)) f = "path";
+    else if (r.player_pos != n->player_pos) f = "player";
+    else if (r.committed_empty != n->committed_empty) f = "committed cells";
+    else if (r.depth != n->depth) f = "depth";
+    else if (r.nblocks != n->nblocks || memcmp(r.block_pos, n->block_pos, (size_t)n->nblocks) || memcmp(r.block_mask, n->block_mask, (size_t)n->nblocks)) f = "blocks";
+    else if (r.nholes != n->nholes || memcmp(r.hole_pos, n->hole_pos, (size_t)n->nholes)) f = "holes";
+    else if (r.bulk_walk != n->bulk_walk) f = "bulk_walk";
+    else if (r.wh != n->wh) f = "walk history";
+    else if (r.seg_anchor1 != n->seg_anchor1 || r.seg_len != n->seg_len) f = "walk segment";
+    else if (radj != n->adjflags) f = "adjflags";
+    if (!f) return 1;
+    snprintf(why, cap, "the replayed state differs in %s (bulk_walk %d/%d, wh %d/%d, seg %d:%d/%d:%d, adjflags %d/%d)", f,
+             r.bulk_walk, n->bulk_walk, r.wh, n->wh, r.seg_anchor1, r.seg_len, n->seg_anchor1, n->seg_len, radj, n->adjflags);
+    return 0;
+}
+/* LAYERINFO<TAB>{json}: what the listing is (PROTOCOL3 §2.4).  k = the absolute
+ * layer depth; roots = this exit's root count; shallow_best = the deepest valid
+ * level among the nodes above the layer (null: none); above = nodes expanded
+ * above the layer; root_depth = [shallowest, deepest] root; seed = the
+ * --seed-path the listing started from ("" = the exit root). */
+static void print_layerinfo(FILE *f, int K, size_t nroots, int sb_depth, const BState *sb, long long above, int dmin, int dmax) {
+    fprintf(f, "LAYERINFO\t{\"k\":%d,\"grid\":\"%dx%d\",\"flags\":", K, g_grid_rows, g_grid_cols);
+    print_flags_json(f);
+    fprintf(f, ",\"src_hash\":\"%s\",\"protocol\":3,\"seed\":\"", SRC_HASH_STR);
+    json_str(f, g_have_seed_path ? g_seed_text : "");
+    fprintf(f, "\",\"roots\":{\"%d\":%zu},\"shallow_best\":{\"%d\":", g_exit_pos, nroots, g_exit_pos);
+    if (sb_depth > 0) {
+        char code[128]; level_code_text(sb, g_exit_pos, '1', code, sizeof code);
+        fprintf(f, "{\"depth\":%d,\"code\":\"", sb_depth); json_str(f, code); fprintf(f, "\"}");
+    } else fprintf(f, "null");
+    fprintf(f, "},\"above\":{\"%d\":%lld},\"root_depth\":{\"%d\":[%d,%d]}}\n", g_exit_pos, above, g_exit_pos, dmin, dmax);
 }
 
 static void run_estimate(void) {
@@ -4349,95 +4454,163 @@ static void run_estimate(void) {
         memset(g_visited, 0, HASH_CAP * sizeof *g_visited);
     }
     g_visited_count = 0; g_states_checked = 0; g_pruned_short = 0; g_pruned_dedup = 0;
-    g_solver_calls = 0; g_skipped_dedup = 0;
+    g_solver_calls = 0; g_skipped_dedup = 0; g_pruned_cap = 0; g_pruned_axis = 0; g_dedup_full = 0;
+    g_pruned_walkseg = 0; g_pruned_exitstuck = 0; g_pruned_exitadj = 0; g_accepted_valid = 0;
+    g_unknown = g_unknown_pq = g_unknown_probe = g_unknown_big = 0;
+    g_max_pops = g_max_pending = 0;
+    cands_reset();
+    g_path_overflow = 0;
+    /* The job tree's semantics, set BEFORE the seed is replayed (the replay folds
+     * committed-walk runs into bulk edges by g_bulk_walk_active).  Parent tables
+     * stay off: they only speed checks up, a job's root check has none either. */
+    g_bulk_walk_active = bulk_walk_effective();
+    g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0;
+    g_ptab_active = 0;
+    g_emit_D = -1; g_emit_V = -1;   /* the root gets no edge token */
     int saved_best = g_best_depth, saved_overall = g_overall_best_depth;
     g_best_depth = INT_MAX; g_overall_best_depth = INT_MAX;   /* silence new-best streaming */
 
-    /* Roots, exactly as run_exit_search would seed them. */
-    size_t lcap = 4096, ln = 0;
-    LayerNode *layer = xrealloc(NULL, lcap * sizeof *layer, "layer nodes");
+    /* The root, exactly as run_exit_search seeds it. */
+    static BState root;
     if (g_have_seed_path) {
-        BState seed;
-        if (g_seed_parse_error || !build_seed_path_seed(&seed)) { g_seed_error = 1; free(layer); return; }
-        layer[ln].st = seed; memset(layer[ln].key, 0, 64);
-        path_text(seed.path, seed.plen, layer[ln].path, sizeof layer[ln].path);   /* prefix = the seed path itself */
-        ln++;
-    } else if (g_task_seeds && g_task_seed_count > 0) {
-        for (int i = 0; i < g_task_seed_count; i++) {
-            if (ln == lcap) { lcap *= 2; layer = xrealloc(layer, lcap * sizeof *layer, "layer nodes"); }
-            layer[ln].st = g_task_seeds[i]; memset(layer[ln].key, 0, 64); snprintf(layer[ln].path, sizeof layer[ln].path, "task%d.%d", g_only_task, i); ln++;
-        }
+        if (g_seed_parse_error || !build_seed_path_seed(&root)) { g_seed_error = 1; g_best_depth = saved_best; g_overall_best_depth = saved_overall; return; }
     } else {
         BState init = { .player_pos = (int8_t)g_exit_pos, .committed_empty = 1ULL << g_exit_pos, .depth = 0,
                         .seg_anchor1 = (int8_t)(g_exit_pos + 1), .seg_len = 0 };
-        layer[ln].st = init; layer[ln].path[0] = 0; memset(layer[ln].key, 0, 64); ln++;
+        bs_copy(&root, &init);
     }
-    int root_depth = layer[0].st.depth;
-    int K = root_depth + g_estimate_layer;
-
-    /* 1. Exact enumeration of the depth-K layer (dedup ON, probe intercept ON). */
+    const int root_depth = root.depth, K = root_depth + g_estimate_layer;
+    const int kw = K - root_depth > 0 ? K - root_depth : 1;   /* generations: each adds >= 1 depth, so fewer than K - root_depth are expanded */
+    LayerVec cur = { .kw = kw }, nxt = { .kw = kw }, roots = { .kw = kw };
+    static BState sb_state; int sb_depth = 0;   /* deepest valid level above the layer */
+    long long n_above = 0, n_above_unknown = 0; char unk_path[160] = "";
+    #define ABOVE_NODE(s_) do { const BState *a_ = (s_); n_above++;                                               \
+        if (!has_block_on_exit(a_)) {                                                                            \
+            if (a_->unk_run) { if (!n_above_unknown++) path_text(a_->path, a_->plen < 40 ? a_->plen : 40, unk_path, sizeof unk_path); } \
+            else if (a_->depth > sb_depth) { sb_depth = a_->depth; bs_copy(&sb_state, a_); } } } while (0)
     g_probe_mode = 1;
-    long long layer_nodes_seen = 0;   /* accepted nodes strictly above the layer */
-    LayerNode *next = xrealloc(NULL, lcap * sizeof *next, "layer nodes"); size_t ncap = lcap, nn = 0;
-    for (int d = root_depth; d < K; d++) {
-        nn = 0;
-        for (size_t i = 0; i < ln; i++) {
+    int have_root = 1;
+    if (g_have_seed_path) {
+        g_probe_n = 0;
+        try_successor(&root);   /* the job checks its seed first (run_exit_search) */
+        if (g_probe_n == 1) bs_copy(&root, &g_probe_buf[0]); else have_root = 0;   /* pruned: its job finds nothing */
+    } else {
+        uint64_t k = canonical_state_key(&root);
+        if (g_two_tables) dedup_two_tables(k, 0); else dedup_check_and_insert(k, 0);
+    }
+    if (have_root) {
+        if (root.depth >= K) lv_push(&roots, &root, NULL, -1, 0);
+        else { if (g_have_seed_path) ABOVE_NODE(&root); lv_push(&cur, &root, NULL, -1, 0); }
+    }
+
+    /* 1. The layer: expand every node above it, generation by generation. */
+    for (int gen = 0; cur.n > 0; gen++) {
+        nxt.n = 0;
+        for (size_t i = 0; i < cur.n; i++) {
             g_probe_n = 0;
-            expand(&layer[i].st);
+            expand(&cur.st[i]);
+            const uint8_t *pk = cur.key + i * (size_t)kw;
             for (int c = 0; c < g_probe_n; c++) {
-                if (nn == ncap) { ncap *= 2; next = xrealloc(next, ncap * sizeof *next, "layer nodes"); }
-                next[nn].st = g_probe_buf[c];
-                path_text(next[nn].st.path, next[nn].st.plen, next[nn].path, sizeof next[nn].path);
-                memcpy(next[nn].key, layer[i].key, 64);
-                if (d - root_depth < 64) next[nn].key[d - root_depth] = (uint8_t)(63 - c);   /* later-generated = visited earlier */
-                nn++;
+                const BState *ch = &g_probe_buf[c];
+                if (ch->depth >= K) lv_push(&roots, ch, pk, gen, c);
+                else { ABOVE_NODE(ch); lv_push(&nxt, ch, pk, gen, c); }
             }
         }
-        layer_nodes_seen += (long long)ln;
-        LayerNode *t = layer; layer = next; next = t; size_t tc = lcap; lcap = ncap; ncap = tc; ln = nn;
-        if (ln == 0) break;
+        LayerVec t = cur; cur = nxt; nxt = t;
     }
-    if (g_path_overflow) {   /* a layer node's path was truncated: its LAYER line would name another node */
+    #undef ABOVE_NODE
+    lv_free(&cur); lv_free(&nxt);
+    long long n_expanded = n_above + (have_root && root.depth < K && !g_have_seed_path);   /* nodes expanded above the layer */
+    if (g_path_overflow) {   /* a root's path was truncated: its LAYER line would name another node */
         fprintf(stderr, "error: a depth-%d layer node needs more than PATH_TOK_MAX=%d path tokens\n", K, PATH_TOK_MAX);
         exit(4);
     }
+    if (g_dedup_full) fatal_error("the dedup table filled up during the root listing (nodes would be lost): use --two-tables or a larger HASH_LG2");
+    if (n_above_unknown) {
+        char m[400];
+        snprintf(m, sizeof m, "%lld shortcut check(s) above the root layer were inconclusive (capacity limit; first at path %s): "
+                 "candidates no job would report, so the listing cannot be exact; list a shallower layer", n_above_unknown, unk_path);
+        fatal_error(m);
+    }
+    if (sb_depth > 0) {   /* the header's shallow best is verified like a job's LEVEL line */
+        Puzzle pz; build_partial_puzzle(&sb_state, &pz);
+        sokoban_clear_reference();
+        int v = sokoban_solve_cutoff(&pz, NULL, NULL, sb_depth - 2);
+        if (v != -1) {
+            char m[200]; snprintf(m, sizeof m, "the deepest level above the root layer (depth %d) failed its verify solve (%d)", sb_depth, v);
+            fatal_error(m);
+        }
+    }
+    /* Every root must replay to itself: the job built from its LAYER line starts from exactly this node. */
+    int dmin = INT_MAX, dmax = 0; size_t n_deeper = 0;
+    for (size_t i = 0; i < roots.n; i++) {
+        const BState *r = &roots.st[i];
+        char why[240];
+        if (!layer_replay_ok(r, why, sizeof why)) {
+            char pb[200], m[520]; path_text(r->path, r->plen < 60 ? r->plen : 60, pb, sizeof pb);
+            snprintf(m, sizeof m, "root %s (depth %d) would not be rebuilt by its job: %s", pb, r->depth, why);
+            fatal_error(m);
+        }
+        if (r->depth < dmin) dmin = r->depth;
+        if (r->depth > dmax) dmax = r->depth;
+        if (r->depth > K) n_deeper++;
+    }
+    if (!roots.n) dmin = dmax = 0;
     long long layer_checked = g_states_checked, layer_calls = g_solver_calls;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double t_layer = elapsed_s(t0, t1);
+    const size_t ln = roots.n;
     printf("[estimate] exit %d: depth-%d layer = %zu nodes (%lld accepted above it, %lld states checked, %.2f s)\n",
-           g_exit_pos, K, ln, layer_nodes_seen, layer_checked, t_layer);
+           g_exit_pos, K, ln, n_expanded, layer_checked, t_layer);
+    printf("[estimate] exit %d: roots at depth %d..%d (%zu deeper than %d: bulk walk-back children), bulk walk-back %s, "
+           "deepest valid level above the layer %d\n", g_exit_pos, dmin, dmax, n_deeper, K, g_bulk_walk_active ? "on" : "off", sb_depth);
+    size_t *ord = xmalloc((ln ? ln : 1) * sizeof *ord, "layer order");
+    for (size_t i = 0; i < ln; i++) ord[i] = i;
+    g_lv_keys = roots.key; g_lv_kw = kw;
+    qsort(ord, ln, sizeof *ord, lv_idx_cmp);   /* DFS visiting order (keys are distinct tree positions) */
+    print_layerinfo(stdout, K, ln, sb_depth, &sb_state, n_expanded, dmin, dmax);
+    {   /* one job per line: seed path, depth, blocks, holes */
+        static char pb[PATH_TEXT_CAP];
+        for (size_t j = 0; j < ln; j++) {
+            const BState *r = &roots.st[ord[j]];
+            path_text(r->path, r->plen, pb, sizeof pb);
+            printf("LAYER\t%d\t%s\t%d\t%d\t%d\n", g_exit_pos, pb, r->depth, r->nblocks, r->nholes);
+        }
+    }
     fflush(stdout);
-    if (ln == 0) { g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall; free(layer); free(next); return; }
-    qsort(layer, ln, sizeof *layer, layer_cmp);   /* DFS visiting order, so LAYER / dump lines can be cut into --from/--until ranges */
-    if (g_list_layer) {
-        /* One job per line: seed path, depth, blocks, holes.  Together with the
-         * ancestors (all depth < K, none can be a record) these subtrees cover
-         * the whole DFS tree of this exit; duplicates were removed by dedup. */
-        for (size_t i = 0; i < ln; i++)
-            printf("LAYER\t%d\t%s\t%d\t%d\t%d\n", g_exit_pos, layer[i].path, layer[i].st.depth,
-                   layer[i].st.nblocks, layer[i].st.nholes);
-        fflush(stdout);
-        g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall; free(layer); free(next); return;
+    if (g_list_layer || ln == 0) {
+        if (!g_list_layer && g_estimate_dump) {   /* an empty layer still gets its header in the dump */
+            FILE *df = fopen(g_estimate_dump, "a");
+            if (!df) fatal_error("cannot open the --estimate-dump file");
+            print_layerinfo(df, K, 0, sb_depth, &sb_state, n_expanded, dmin, dmax);
+            fclose(df);
+        }
+        free(ord); lv_free(&roots);
+        g_probe_mode = 0; g_best_depth = saved_best; g_overall_best_depth = saved_overall;
+        return;
     }
 
-    /* 2. Probes: no dedup below the layer. */
+    /* 2. Probes below each root: no dedup below the layer.  Arrays are indexed
+     * in DFS order (j), like the LAYER lines. */
     int saved_thr = g_dupe_threshold; g_dupe_threshold = -1;
     int m = (int)((g_estimate_probes + (long)ln - 1) / (long)ln); if (m < 1) m = 1;
-    double *node_est = xcalloc(ln, sizeof(double), "estimate");      /* est accepted nodes in subtree (excl. layer node) */
+    double *node_est = xcalloc(ln, sizeof(double), "estimate");      /* est accepted nodes in subtree (excl. the root) */
     double *node_est2 = xcalloc(ln, sizeof(double), "estimate");
     double *chk_est = xcalloc(ln, sizeof(double), "estimate");       /* est states checked in subtree */
     double *time_est = xcalloc(ln, sizeof(double), "estimate"), *time_est2 = xcalloc(ln, sizeof(double), "estimate"); /* est expand() seconds in subtree */
     static double depth_est[4096]; memset(depth_est, 0, sizeof depth_est);
     int max_probe_depth = 0; long probes = 0;
     long long chk0 = g_states_checked; clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (size_t i = 0; i < ln; i++) {
+    static BState pcur;
+    for (size_t j = 0; j < ln; j++) {
         for (int r = 0; r < m; r++) {
-            BState cur = layer[i].st; double w = 1.0, nodes = 0, checked = 0, tw = 0;
+            bs_copy(&pcur, &roots.st[ord[j]]);
+            double w = 1.0, nodes = 0, checked = 0, tw = 0;
             for (;;) {
                 long long c0 = g_states_checked;
                 g_probe_n = 0;
                 struct timespec e0, e1; clock_gettime(CLOCK_MONOTONIC, &e0);
-                expand(&cur);
+                expand(&pcur);
                 clock_gettime(CLOCK_MONOTONIC, &e1);
                 tw += w * elapsed_s(e0, e1);
                 checked += w * (double)(g_states_checked - c0);
@@ -4445,11 +4618,13 @@ static void run_estimate(void) {
                 if (c == 0) break;
                 w *= c;
                 nodes += w;
-                int d = cur.depth + 1; if (d < 4096) depth_est[d] += w;
+                const BState *nx = &g_probe_buf[rand() % c];
+                int d = nx->depth;   /* a bulk child lands at depth + its walk length */
+                if (d < 4096) depth_est[d] += w;
                 if (d > max_probe_depth) max_probe_depth = d;
-                cur = g_probe_buf[rand() % c];
+                bs_copy(&pcur, nx);
             }
-            node_est[i] += nodes / m; node_est2[i] += nodes * nodes / m; chk_est[i] += checked / m; time_est[i] += tw / m; time_est2[i] += tw * tw / m;
+            node_est[j] += nodes / m; node_est2[j] += nodes * nodes / m; chk_est[j] += checked / m; time_est[j] += tw / m; time_est2[j] += tw * tw / m;
             probes++;
         }
     }
@@ -4459,11 +4634,11 @@ static void run_estimate(void) {
     double us_per_checked = probe_checked ? t_probe * 1e6 / (double)probe_checked : 0;
 
     double tot_nodes = 0, tot_var = 0, tot_chk = 0, tot_time = 0, tot_tvar = 0;
-    for (size_t i = 0; i < ln; i++) {
-        tot_nodes += node_est[i]; tot_chk += chk_est[i]; tot_time += time_est[i];
-        double var = node_est2[i] - node_est[i] * node_est[i]; if (var < 0) var = 0;
+    for (size_t j = 0; j < ln; j++) {
+        tot_nodes += node_est[j]; tot_chk += chk_est[j]; tot_time += time_est[j];
+        double var = node_est2[j] - node_est[j] * node_est[j]; if (var < 0) var = 0;
         tot_var += var / m;
-        double tvar = time_est2[i] - time_est[i] * time_est[i]; if (tvar < 0) tvar = 0;
+        double tvar = time_est2[j] - time_est[j] * time_est[j]; if (tvar < 0) tvar = 0;
         tot_tvar += tvar / m;
     }
     double se = sqrt(tot_var), tse = sqrt(tot_tvar);
@@ -4474,38 +4649,43 @@ static void run_estimate(void) {
            tot_nodes, se, tot_nodes ? 100 * se / tot_nodes : 0, tot_chk);
     printf("[estimate] est. DFS time (dedup-free, time-weighted probes): %.3g s = %.2f h = %.2f d  (SE %.0f%%);  x0.7 with dedup ~ %.2f h\n",
            est_time, est_time / 3600, est_time / 86400, tot_time ? 100 * tse / tot_time : 0, 0.7 * est_time / 3600);
-    (void)us_per_checked;
     printf("[estimate] deepest probe: depth %d\n", max_probe_depth);
     printf("[estimate] est. nodes per depth band:\n");
     for (int d = 0; d <= max_probe_depth; d += 10) {
         double sum = 0; for (int k = d; k < d + 10 && k < 4096; k++) sum += depth_est[k] / m;
         if (sum > 0) printf("   %3d-%-3d %.3g\n", d, d + 9, sum);
     }
-    if (g_estimate_dump) {   /* every layer node: seed path, depth, blocks, holes, est nodes, est seconds, SE of seconds */
+    static char pb[PATH_TEXT_CAP];
+    if (g_estimate_dump) {   /* the header, then every root: seed path, depth, blocks, holes, est nodes, est seconds, SE of seconds */
         FILE *df = fopen(g_estimate_dump, "a");
-        if (df) {
-            for (size_t i = 0; i < ln; i++) {
-                double tvar = time_est2[i] - time_est[i] * time_est[i]; if (tvar < 0) tvar = 0;
-                fprintf(df, "%d\t%s\t%d\t%d\t%d\t%.6g\t%.6g\t%.6g\n", g_exit_pos, layer[i].path, layer[i].st.depth,
-                        layer[i].st.nblocks, layer[i].st.nholes, node_est[i], time_est[i], sqrt(tvar / m));
-            }
-            fclose(df);
+        if (!df) fatal_error("cannot open the --estimate-dump file");
+        print_layerinfo(df, K, ln, sb_depth, &sb_state, n_expanded, dmin, dmax);
+        for (size_t j = 0; j < ln; j++) {
+            const BState *r = &roots.st[ord[j]];
+            double tvar = time_est2[j] - time_est[j] * time_est[j]; if (tvar < 0) tvar = 0;
+            path_text(r->path, r->plen, pb, sizeof pb);
+            fprintf(df, "%d\t%s\t%d\t%d\t%d\t%.6g\t%.6g\t%.6g\n", g_exit_pos, pb, r->depth,
+                    r->nblocks, r->nholes, node_est[j], time_est[j], sqrt(tvar / m));
         }
+        if (fclose(df) != 0) fatal_error("writing the --estimate-dump file failed");
     }
-    /* Heaviest layer nodes (job-splitting hints). */
+    /* Heaviest roots (job-splitting hints). */
     int show = ln < 12 ? (int)ln : 12;
-    int *idx = xcalloc(ln, sizeof(int), "estimate"); for (size_t i = 0; i < ln; i++) idx[i] = (int)i;
+    int *idx = xcalloc(ln, sizeof(int), "estimate"); for (size_t j = 0; j < ln; j++) idx[j] = (int)j;
     for (int a = 0; a < show; a++) {
         int best = a;
         for (size_t b = a + 1; b < ln; b++) if (node_est[idx[b]] > node_est[idx[best]]) best = (int)b;
         int t = idx[a]; idx[a] = idx[best]; idx[best] = t;
     }
     printf("[estimate] heaviest layer nodes (est nodes, share, seed path):\n");
-    for (int a = 0; a < show; a++)
-        printf("   %.3g  %5.1f%%  %s\n", node_est[idx[a]], tot_nodes ? 100 * node_est[idx[a]] / tot_nodes : 0, layer[idx[a]].path);
+    for (int a = 0; a < show; a++) {
+        const BState *r = &roots.st[ord[idx[a]]];
+        path_text(r->path, r->plen, pb, sizeof pb);
+        printf("   %.3g  %5.1f%%  %s\n", node_est[idx[a]], tot_nodes ? 100 * node_est[idx[a]] / tot_nodes : 0, pb);
+    }
     fflush(stdout);
 
-    free(idx); free(node_est); free(node_est2); free(chk_est); free(time_est); free(time_est2); free(layer); free(next);
+    free(idx); free(node_est); free(node_est2); free(chk_est); free(time_est); free(time_est2); free(ord); lv_free(&roots);
     g_dupe_threshold = saved_thr; g_probe_mode = 0;
     g_best_depth = saved_best; g_overall_best_depth = saved_overall;
 }
@@ -4678,10 +4858,9 @@ static double run_exit_search(double remaining_s, int *out_exhausted, int *out_d
     cands_reset();
 
     /* Bulk walk-back generation only fits the plain DFS (children at depth+k
-     * break beam levels and layer listings) and needs no exact solve lengths
-     * (harvest / trace record them). */
-    g_bulk_walk_active = g_bulk_walk && g_beam_width == 0 && g_rollout_steps == 0
-                         && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
+     * break beam levels) and needs no exact solve lengths (harvest / trace
+     * record them).  The root listing (run_estimate) uses the same value. */
+    g_bulk_walk_active = bulk_walk_effective();
     g_bulk_calls = g_bulk_starts = g_bulk_fallbacks = 0;
     g_ptab_active = g_beam_width == 0 && g_rollout_steps == 0 && !g_no_ptab;
     g_ptab_saved = g_ptab_used = g_ptab_inherited = g_ptab_delta_refs = 0;
@@ -5162,23 +5341,27 @@ static void print_usage(const char *prog) {
         "                          committed cells with one multi-start solve (default on; exact\n"
         "                          either way; ~10%% faster on deep 5x5 classes).  --bulk-walk = on.\n"
         "  --estimate N          do not search: estimate the size of the DFS tree instead.\n"
-        "                          Enumerates the depth-K layer exactly (K = --estimate-depth,\n"
-        "                          default 6), then runs ~N random root-to-leaf probes (Knuth\n"
+        "                          Lists the depth-K root layer exactly like --list-layer K\n"
+        "                          (K = --estimate-depth, default 6; LAYERINFO + LAYER lines),\n"
+        "                          then runs ~N random root-to-leaf probes below the roots (Knuth\n"
         "                          estimator; every prune except dedup) and prints estimated\n"
         "                          nodes, states checked, wall time, depth profile and the\n"
-        "                          heaviest layer nodes as --seed-path strings for splitting.\n"
-        "                          Honours --exit/--task-id/--seed-path and every search cap.\n"
+        "                          heaviest roots as --seed-path strings for splitting.\n"
+        "                          Honours --exit/--seed-path and every search cap.\n"
         "  --estimate-depth K    layer depth for --estimate (default 6).\n"
         "  --from PATH           skip everything the DFS visits before the node with this path\n"
         "                          (a CURSOR line, or a layer path); PATH's own subtree is searched.\n"
         "  --until PATH          stop at that node: it and everything after it belong to another run.\n"
         "                          Ctrl-C / --time print a CURSOR line to resume from with --from.\n"
-        "  --estimate-dump FILE  append one TSV line per layer node (exit, seed path, depth, blocks,\n"
-        "                          holes, est. accepted nodes, est. seconds, SE) for chunk planning.\n"
-        "  --list-layer K        print the dedup'd depth-K layer, one LAYER line per node\n"
-        "                          (exit, --seed-path string, depth, blocks, holes), then exit.\n"
-        "                          Feed the paths to independent --seed-path --time 0 jobs to\n"
-        "                          split an exhaustive search across processes / sessions.\n"
+        "  --estimate-dump FILE  append the LAYERINFO header and one TSV line per root (exit, seed\n"
+        "                          path, depth, blocks, holes, est. accepted nodes, est. seconds, SE).\n"
+        "  --list-layer K        print the root layer of the job tree and exit: a LAYERINFO header\n"
+        "                          (k, grid, flags, src_hash, roots, shallow_best = the deepest valid\n"
+        "                          level above the layer), then one LAYER line per root (exit,\n"
+        "                          --seed-path string, depth, blocks, holes).  A root is a node of\n"
+        "                          depth >= K whose parent is shallower (a bulk walk-back child can\n"
+        "                          land deeper than K), so the roots' --seed-path --time 0 jobs plus\n"
+        "                          shallow_best cover the whole exhaustive search for every K.\n"
         "  --seed-path PATH      search only the subtree of the node with this path (a REMAINING or\n"
         "                          LAYER path, at most %d tokens).  A path that does not replay ends\n"
         "                          with status bad_seed (exit 3).\n"
@@ -5226,9 +5409,9 @@ static void print_version(void) {
     printf("LIMITS\t{\"path_tok_max\":%d,\"max_ncells\":%d,\"max_blocks\":%d,\"state_bits\":%d}\n",
            PATH_TOK_MAX, MAX_NCELLS, MAX_BLOCKS, sokoban_state_bits_max());
     printf("KNOBS\t{\"HASH_LG2\":%d,\"SHALLOW_LG2\":%d,\"RECENT_LG2\":%d,\"PATH_TOK_MAX\":%d,\"HTP_EXPORT_MAX\":%d,\"UNRESOLVED_MAX\":%d,"
-           "\"UNKNOWN_CHAIN_MAX\":%d,\"UNKNOWN_DEFER_S\":%d,%s,\"defs\":\"%s\"}\n",
+           "\"UNKNOWN_CHAIN_MAX\":%d,\"UNKNOWN_DEFER_S\":%d,\"PROBE_BUF_MAX\":%d,%s,\"defs\":\"%s\"}\n",
            (int)HASH_LG2, (int)SHALLOW_LG2, (int)RECENT_LG2, (int)PATH_TOK_MAX, (int)HTP_EXPORT_MAX, (int)UNRESOLVED_MAX,
-           (int)UNKNOWN_CHAIN_MAX, (int)UNKNOWN_DEFER_S, sokoban_knobs_json(),
+           (int)UNKNOWN_CHAIN_MAX, (int)UNKNOWN_DEFER_S, (int)PROBE_BUF_MAX, sokoban_knobs_json(),
            ""
 #ifdef REF_CHECK
            "REF_CHECK "
@@ -5258,8 +5441,12 @@ static double cpu_seconds(void) {
 }
 static int g_last_unresolved_printed = 0;
 /* SUMMARY: the last protocol line of an exit's run (v2/PROTOCOL3.md §2.2). */
+/* The effective search definition (SUMMARY and LAYERINFO "flags"). */
+static void print_flags_json(FILE *f) {
+    fprintf(f, "{\"grid\":\"%dx%d\",\"exit\":%d,\"transit\":%d,\"block_on_exit\":%d,\"max_holes\":%d,\"max_blocks\":%d,\"min_walls\":%d,\"bulk_walk\":%d}",
+            g_grid_rows, g_grid_cols, g_exit_pos, g_allow_exit_transit, g_allow_block_on_exit, g_max_holes, g_max_blocks, g_min_walls, bulk_walk_effective());
+}
 static void print_summary(const char *st, double elapsed, int verify, const char *err) {
-    int bulk_eff = g_bulk_walk && g_beam_width == 0 && g_rollout_steps == 0 && !HARVEST_ACTIVE && !g_trace_csv && !g_bf_dump;
     long long accepted = g_states_checked - g_pruned_short - g_pruned_dedup - g_pruned_axis - g_unknown;   /* pruned_cap is part of pruned_short */
     printf("SUMMARY\t{\"status\":\"%s\",\"seed\":\"", st);
     json_str(stdout, g_seed_text);
@@ -5267,12 +5454,12 @@ static void print_summary(const char *st, double elapsed, int verify, const char
            "\"verify\":%d,\"evict_shallow\":%lld,\"evict_recent\":%lld,\"elapsed\":%.3f,\"solver_calls\":%lld,\"src_hash\":\"%s\","
            "\"protocol\":3,\"cpu_s\":%.3f,\"unknown\":%lld,\"unknown_pq\":%lld,\"unknown_probe\":%lld,\"unknown_big\":%lld,"
            "\"unresolved\":%d,\"unresolved_dropped_max\":%d,\"max_pops\":%lld,\"max_pending\":%lld,"
-           "\"flags\":{\"grid\":\"%dx%d\",\"exit\":%d,\"transit\":%d,\"block_on_exit\":%d,\"max_holes\":%d,\"max_blocks\":%d,\"min_walls\":%d,\"bulk_walk\":%d}",
+           "\"flags\":",
            g_exit_pos, g_states_checked, accepted, g_accepted_valid, g_best_depth,
            verify, g_two_tables ? g_evictions_shallow : 0LL, g_two_tables ? g_evictions_recent : 0LL, elapsed, g_solver_calls, SRC_HASH_STR,
            cpu_seconds(), g_unknown, g_unknown_pq, g_unknown_probe, g_unknown_big,
-           g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending,
-           g_grid_rows, g_grid_cols, g_exit_pos, g_allow_exit_transit, g_allow_block_on_exit, g_max_holes, g_max_blocks, g_min_walls, bulk_eff);
+           g_last_unresolved_printed, g_cand_dropped_max, g_max_pops, g_max_pending);
+    print_flags_json(stdout);
     if (err) { printf(",\"%s\":\"", strcmp(st, "error") ? "detail" : "error"); json_str(stdout, err); printf("\""); }
     printf("}\n");
     fflush(stdout);
@@ -5730,6 +5917,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--list-layer") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --list-layer requires K\n"); return 1; }
             g_estimate_layer = atoi(argv[i]); g_list_layer = 1; g_estimate_probes = 1;
+            if (g_estimate_layer < 0) { fprintf(stderr, "error: --list-layer K needs K >= 0\n"); return 2; }
         } else if (strcmp(argv[i], "--from") == 0 || strcmp(argv[i], "--until") == 0) {
             int is_from = strcmp(argv[i], "--from") == 0;
             if (++i >= argc) { fprintf(stderr, "%s needs a path\n", argv[i - 1]); return 2; }
@@ -5744,6 +5932,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--estimate-depth") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --estimate-depth requires K\n"); return 1; }
             g_estimate_layer = atoi(argv[i]);
+            if (g_estimate_layer < 0) { fprintf(stderr, "error: --estimate-depth K needs K >= 0\n"); return 2; }
         } else if (strcmp(argv[i], "--max-depth") == 0) {
             if (++i >= argc) { fprintf(stderr, "error: --max-depth requires N\n"); return 1; }
             int n = atoi(argv[i]);
@@ -6178,6 +6367,10 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    if (g_estimate_probes > 0 && g_only_task >= 0) {   /* task seeds carry no tree paths: their layer could not be replayed */
+        fprintf(stderr, "error: --estimate / --list-layer cannot be combined with --task-id\n");
+        return 2;
+    }
     /* If --task-id is set, find the (exit, local_task) for that global ID. */
     int task_target_exit = -1;
     TaskGroup task_target = {0};

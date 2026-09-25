@@ -1,34 +1,41 @@
 #!/usr/bin/env python3
 """Root-cover exactness gate (review M87 fix 4 / C2; PROTOCOL3 §2.4 "Root listing").
 
-A campaign is seeded with the depth-K layer printed by `--list-layer K`; every root becomes a job
-that starts with fresh dedup tables.  The union of the roots' subtrees must therefore contain every
-valid level of the monolithic run at depth >= K (levels shallower than the layer are above every root),
-and nothing the monolithic run does not find.  For each K this test:
+A campaign is seeded with the root layer printed by `--list-layer K`; every root becomes a job that
+starts with fresh dedup tables.  The listing cuts the JOB TREE (bulk walk-back on, as the jobs run): a
+root is a node of depth >= K whose tree parent is shallower, so a bulk walk-back child can be a root
+deeper than K, and every tree node of depth >= K lies below some root.  The union of the roots' subtrees
+must therefore contain every valid level of the monolithic run at depth >= K, and nothing the
+monolithic run does not find; the levels above the layer belong to no job, and the header's
+shallow_best must be their best.  For each K this test:
 
   1. lists the layer with the campaign flags (the client's argv minus --seed-path / --split-after) and
      checks it as v2_seed will (server/lib/v2seed.js): a protocol-3 worker MUST print the LAYERINFO
      header, with this k and grid, its own SRC_HASH, this exit's root count, and flags that describe the
      search with bulk_walk 1 (the job tree's semantics); every LAYER line has exactly 6 fields (LAYER,
-     exit, path, depth, blocks, holes) and comes after the header, every root has depth == tokens == K
-     and respects the hole / block caps, no root repeats; an optional shallow_best must match the
-     monolithic run's best above the layer;
-  2. runs every root to exhaustion in the client's argv (one process at a time, BS_TRACE_VALID);
+     exit, path, depth, blocks, holes) and comes after the header, every root has depth == tokens >= K
+     (a root deeper than K must end in a run of walk tokens reaching back above the layer: a bulk
+     child) and respects the hole / block caps, no root repeats; shallow_best must equal the
+     monolithic run's best above the layer (depth < K);
+  2. runs every root to exhaustion in the client's argv (--jobs N at a time, BS_TRACE_VALID);
   3. compares the union with the monolithic run: LOST levels at depth >= K and EXTRA levels (a root
-     found a level the monolithic run pruned) both fail, and so does a best depth that differs.
+     found a level the monolithic run pruned) both fail, and so does a best depth that differs
+     (max of the union's best and shallow_best).
 A worker may refuse a layer (PROTOCOL3's fallback: "refuse K >= 5"): a refusal (a non-zero exit code)
 is accepted for K >= 5 and fails for K <= 4.  Exit code 0 with no LAYER lines is not a refusal but an
 empty listing: every level at depth >= K is then lost.  An --only filter that selects nothing fails.
 
-  python3 test_roots_exact.py WORKER [--layers 2 4 6] [--timeout 120] -- --grid 4x4 --exit 0 \\
+  python3 test_roots_exact.py WORKER [--layers 2 4 6] [--timeout 120] [--jobs N] -- --grid 4x4 --exit 0 \\
           --allow-exit-transit --num-holes 3
   python3 test_roots_exact.py WORKER --suite quick|campaign [--only NAME]
   python3 test_roots_exact.py WORKER --quick        (= --suite quick)
 
 The lead's measurement this gate encodes: 5x5 exit 7 <=3 blocks with transit, layer 8, lost 9,566
-valid levels at depth >= 8 when roots were listed with bulk walk-back off but run with it on.  The
+valid levels at depth >= 8 when roots were listed with bulk walk-back off but run with it on (the
+job-tree listing adds 107 roots at depth 9-10 there, the bulk children the old listing lost).  The
 'campaign' suite runs configs of that shape small enough for about 2 minutes each, including 0-hole
-configs (campaign #2's flags).  Exit status 0 = all passed, 1 = a failure.
+6x6 configs (campaign #2's flags); 'deep' is the lead's layer-8 case (about 20k roots: use --jobs 2).
+Exit status 0 = all passed, 1 = a failure.
 """
 import argparse, json, os, re, shutil, subprocess, sys, tempfile, time
 
@@ -53,6 +60,11 @@ SUITES = {
         ('5x5e7b3', ['--grid', '5x5', '--exit', '7', '--allow-exit-transit', '--num-blocks', '3'], [4, 6]),
         ('6x6h0e14b2', ['--grid', '6x6', '--exit', '14', '--allow-exit-transit', '--num-holes', '0', '--num-blocks', '2'],
          [4, 6]),
+        ('6x6h0e14d13', ['--grid', '6x6', '--exit', '14', '--allow-exit-transit', '--num-holes', '0', '--max-depth', '13'],
+         [4, 6]),
+    ],
+    'deep': [
+        ('5x5e7b3', ['--grid', '5x5', '--exit', '7', '--allow-exit-transit', '--num-blocks', '3'], [8]),
     ],
 }
 SUITES['all'] = SUITES['quick'] + SUITES['campaign']
@@ -158,8 +170,15 @@ def check_layer(worker, roots, info, grid, exit_, k, flags, errors=()):
     for e, path, depth, blocks, holes in roots:
         if e != exit_:
             raise Fail(f'LAYER line for exit {e}, asked for exit {exit_}')
-        if depth != k or len(path.split(',')) != k:
-            raise Fail(f'root {path!r} has depth {depth} and {len(path.split(","))} tokens; the layer is {k}')
+        t = path.split(',')
+        if depth < k or len(t) != depth or (info is None and depth != k):
+            raise Fail(f'root {path!r} has depth {depth} and {len(t)} tokens; the layer is {k} (roots have '
+                       f'depth == tokens >= K{", == K for a pre-protocol-3 lister" if info is None else ""})')
+        if depth > k and not all(x.endswith('1') for x in t[k - 1:]):
+            # a root deeper than K is a bulk walk-back child of a node above the layer (depth < K): its
+            # last (depth - parent depth) tokens are one walk chain, which covers tokens k-1 .. depth-1
+            raise Fail(f'root {path!r} is deeper than the layer {k} but its tokens from {k} on are not one walk '
+                       f'chain: its parent would be at depth >= {k}, i.e. a root or below one')
         if max_h is not None and holes > max_h:
             raise Fail(f'root {path!r} has {holes} holes > --num-holes {max_h}')
         if max_b is not None and blocks > max_b:
@@ -199,27 +218,73 @@ def check_layer(worker, roots, info, grid, exit_, k, flags, errors=()):
 
 
 def check_shallow_best(info, full, k, exit_):
-    """LAYERINFO.shallow_best (optional): the exit's best level above the root layer, which no job
-    reports.  It must lie between the monolithic run's best above the layer and its best at depth <= k,
-    and a code given with it must be a monolithic level at that depth."""
-    sb = ((info or {}).get('shallow_best') or {}).get(str(exit_))
+    """LAYERINFO.shallow_best: the exit's best level above the root layer (the nodes of depth < K, which
+    no job reports).  Returns (note, depth).  A header without the key is a pre-job-tree lister (note
+    only); with it, the exit's value must be null exactly when the monolithic run has no level above the
+    layer, else its depth must be the monolithic run's best above the layer (every tree node of depth < K
+    is expanded by the listing, and a state is valid at one depth only), and a code given with it must be
+    a monolithic level at that depth."""
+    lo = max((d for d, _ in full if d < k), default=0)
+    if info is None or 'shallow_best' not in info:
+        return (None, 0)
+    sbm = info.get('shallow_best')
+    if not isinstance(sbm, dict) or str(exit_) not in sbm:
+        raise Fail(f'LAYERINFO shallow_best {sbm!r} does not give exit {exit_}')
+    sb, code = sbm[str(exit_)], None
     if sb is None:
-        return None
-    code = None
+        if lo:
+            raise Fail(f'LAYERINFO shallow_best is null, the monolithic run\'s best above layer {k} is {lo}')
+        return ('shallow_best null ok', 0)
     if isinstance(sb, dict):
         code, sb = sb.get('code'), sb.get('depth')
-    if not isinstance(sb, int) or sb < 0:
+    if not isinstance(sb, int) or isinstance(sb, bool) or sb < 1:
         raise Fail(f'LAYERINFO shallow_best {sb!r} is not a depth')
-    lo = max((d for d, _ in full if d < k), default=0)
-    hi = max((d for d, _ in full if d <= k), default=0)
-    if not lo <= sb <= hi:
-        raise Fail(f'LAYERINFO shallow_best {sb}, the monolithic run\'s best above layer {k} is {lo} ({hi} at depth <= {k})')
-    if code is not None and sb > 0 and (sb, canon(code)) not in full:
+    if sb != lo:
+        raise Fail(f'LAYERINFO shallow_best {sb}, the monolithic run\'s best above layer {k} is {lo}')
+    if code is not None and (sb, canon(code)) not in full:
         raise Fail(f'LAYERINFO shallow_best code {code!r} is not a monolithic level at depth {sb}')
-    return f'shallow_best {sb} ok'
+    return (f'shallow_best {sb} ok', sb)
 
 
-def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_000_000):
+def run_roots(worker, grid, exit_, flags, roots, tmp, timeout, max_levels, jobs):
+    """Run every root to exhaustion, `jobs` worker processes at a time (each thread in its own directory,
+    so trace files never collide).  Yields (root path, Run) as runs finish; run_job kills a worker that
+    exceeds the timeout, and a failure cancels the runs not started yet."""
+    if jobs <= 1:
+        for _, path, _, _, _ in roots:
+            yield path, TS.run_job(worker, grid, exit_, flags, path, tmp, timeout, max_levels=max_levels, keep_paths=True)
+        return
+    import concurrent.futures as cf
+    import threading
+    local = threading.local()
+
+    def one(path):
+        if not hasattr(local, 'dir'):
+            local.dir = tempfile.mkdtemp(prefix='t', dir=tmp)
+        return path, TS.run_job(worker, grid, exit_, flags, path, local.dir, timeout, max_levels=max_levels,
+                                keep_paths=True)
+    with cf.ThreadPoolExecutor(max_workers=jobs) as ex:
+        it = iter(roots)
+        pending = set()
+        try:
+            for _ in range(2 * jobs):                    # a bounded window: results are consumed as they come
+                r = next(it, None)
+                if r is None:
+                    break
+                pending.add(ex.submit(one, r[1]))
+            while pending:
+                done, pending = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
+                for f in done:
+                    yield f.result()
+                    r = next(it, None)
+                    if r is not None:
+                        pending.add(ex.submit(one, r[1]))
+        finally:
+            for f in pending:
+                f.cancel()
+
+
+def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_000_000, jobs=1):
     grid, exit_, flags = TS.split_cfg(cfg)
     tmp = tempfile.mkdtemp(prefix='rootsx_')
     fails = []
@@ -232,6 +297,7 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
         full = {}
         for d, code, path in ref.levels:
             full.setdefault((d, canon(code)), path)
+        ref.levels = None                                # bounded memory: keep one entry per canonical level
         fbest = ref.summary['best']
         out(f'{name + ": " if name else ""}{grid} exit {exit_} {" ".join(flags)}: monolithic {len(full)} canonical '
             f'valid levels, best {fbest}, {ref.summary.get("states")} states ({time.time() - t0:.1f}s)')
@@ -245,25 +311,28 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
                 out(f'  layer {k}: FAIL refused for K <= 4 ({refused})')
                 fails.append(f'{name}-K{k}')
                 continue
-            problem = None
+            problem, sb_depth = None, 0
             try:
                 notes = check_layer(worker, roots, info, grid, exit_, k, flags, errors)
-                sb = check_shallow_best(info, full, k, exit_)
+                sb, sb_depth = check_shallow_best(info, full, k, exit_)
                 if sb:
                     notes.append(sb)
+                deeper = sum(1 for r in roots if r[2] > k)
+                if deeper:
+                    notes.append(f'{deeper} roots deeper than {k} (bulk walk-back children)')
             except Fail as e:
                 # a listing v2_seed would refuse fails the layer; the roots are still run (when they are
                 # at depth K) so a cover loss is reported as well
                 problem, notes = str(e), []
                 out(f'  layer {k}: FAIL {e}')
-                if any(r[2] != k or len(r[1].split(',')) != k or r[0] != exit_ for r in roots):
+                if any(r[2] < k or len(r[1].split(',')) != r[2] or r[0] != exit_ for r in roots):
                     fails.append(f'{name}-K{k}')
                     continue
             if not roots:
                 notes.append('EMPTY listing (exit code 0, no LAYER lines)')
-            union, extras, statuses, states, unknown = {}, [], {}, 0, ref.summary.get('unknown', 0)
-            for _, path, _, _, _ in roots:
-                r = TS.run_job(worker, grid, exit_, flags, path, tmp, timeout, max_levels=max_levels, keep_paths=True)
+            union, extras, statuses, states, unknown = set(), [], {}, 0, ref.summary.get('unknown', 0)
+            extra_n = 0
+            for path, r in run_roots(worker, grid, exit_, flags, roots, tmp, timeout, max_levels, jobs):
                 TS.check_run(worker, r, split_expected=False, grid=grid, exit_=exit_, extra=flags)
                 st = r.summary['status']
                 statuses[st] = statuses.get(st, 0) + 1
@@ -271,16 +340,21 @@ def run_config(worker, cfg, layers, timeout, name='', out=print, max_levels=3_00
                 unknown += r.summary.get('unknown', 0)
                 for d, code, p in r.levels:
                     key = (d, canon(code))
-                    if key not in full and key not in union and len(extras) < 5:
-                        extras.append((key, path, p))
-                    union.setdefault(key, p)
+                    if key in union:
+                        continue
+                    union.add(key)
+                    if key not in full:
+                        extra_n += 1
+                        if len(extras) < 5:
+                            extras.append((key, path, p))
             lost = sorted((key for key in full if key[0] >= k and key not in union), reverse=True)
             above = sum(1 for key in full if key[0] < k and key not in union)
-            extra_n = sum(1 for key in union if key not in full)
             ubest = max((d for d, _ in union), default=0)
-            ok = not lost and not extra_n and (ubest == fbest or fbest < k) and not unknown and problem is None
+            best = max(ubest, sb_depth)                  # the exit's best: the jobs' and the header's shallow_best
+            ok = not lost and not extra_n and (best == fbest or (fbest < k and sb_depth == 0 and info is None)) \
+                and not unknown and problem is None
             out(f'  layer {k}: {len(roots)} roots{" (" + "; ".join(notes) + ")" if notes else ""}, statuses {statuses}, {states} states, union '
-                f'{len(union)}; lost at depth >= {k}: {len(lost)}, extra {extra_n}, best {ubest} vs {fbest} '
+                f'{len(union)}; lost at depth >= {k}: {len(lost)}, extra {extra_n}, best {best} vs {fbest} '
                 f'({above} levels above the layer){f"; {unknown} capacity results (sets not comparable)" if unknown else ""} '
                 f'({time.time() - t1:.0f}s){"" if ok else "  FAIL"}{" (listing: see above)" if problem else ""}')
             for d, c in lost[:3]:
@@ -302,6 +376,7 @@ def main():
     ap.add_argument('--suite', choices=sorted(SUITES))
     ap.add_argument('--quick', action='store_true')
     ap.add_argument('--only', action='append', default=[])
+    ap.add_argument('--jobs', type=int, default=1, help='root jobs run in parallel (run under cpuslot -n N)')
     argv = sys.argv[1:]
     cfg = []
     if '--' in argv:
@@ -326,7 +401,7 @@ def main():
         for name, c, layers in todo:
             try:
                 fails += run_config(worker, c, layers, a.timeout, name=name,
-                                    out=lambda s: print(s, flush=True))
+                                    out=lambda s: print(s, flush=True), jobs=max(1, a.jobs))
             except Fail as e:
                 print(f'FAIL {name}: {e}', flush=True)
                 fails.append(name)
