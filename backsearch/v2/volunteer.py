@@ -638,6 +638,10 @@ class Volunteer:
         self.outbox = os.path.abspath(args.outbox)
         self.allow_dirty = os.environ.get("VOLUNTEER_ALLOW_DIRTY") == "1"
         self.env = worker_env(os.environ, self.allow_dirty)
+        # development only (test_chaos, review M91): one JSON line per finished worker run (pid, job, seed,
+        # outcome, SUMMARY counts), so a test can tie each worker's BS_TRACE_VALID file (<prefix>.<pid>) to
+        # the node the server accepted from it and leave out runs whose work was never reported
+        self.run_log = os.environ.get("VOLUNTEER_RUN_LOG") if self.allow_dirty else None
         self.lock_fd = None
         self.exit_code = 0
         self.fatal_msg = None
@@ -2208,8 +2212,24 @@ class Volunteer:
             watchdog = slot.watchdog_fired
             stopped = slot.stop_sent_at > 0 and not watchdog   # we sent SIGINT (Stop)
             tail = " | ".join(list(slot.stderr_tail)[-3:])
-        return self._judge(slot, job, seed, probe_run, rc, killed, watchdog, stopped, tail, run_hash, hash_mismatch,
-                           summary, summary_bad, bad, self_remaining, dup_remaining, remaining, unresolved, level)
+        res = self._judge(slot, job, seed, probe_run, rc, killed, watchdog, stopped, tail, run_hash, hash_mismatch,
+                          summary, summary_bad, bad, self_remaining, dup_remaining, remaining, unresolved, level)
+        if self.run_log:
+            self._log_run(proc.pid, rc, job, seed, probe_run, res)
+        return res
+
+    def _log_run(self, pid, rc, job, seed, probe_run, res):
+        """VOLUNTEER_RUN_LOG (development only): append this run's outcome. Never raises."""
+        sm = res.summary or {}
+        rec = {"t": round(time.time(), 3), "pid": pid, "rc": rc, "job": job.get("id"), "exit": job.get("exit"),
+               "seed": seed, "probe": bool(probe_run), "kind": res.kind, "reason": res.reason,
+               "status": sm.get("status"), "states": sm.get("states"), "valid": sm.get("valid"), "best": sm.get("best"),
+               "remaining": len(res.remaining or [])}
+        try:
+            with open(self.run_log, "a") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+        except (OSError, TypeError, ValueError):
+            pass
 
     def _judge(self, slot, job, seed, probe_run, rc, killed, watchdog, stopped, tail, run_hash, hash_mismatch,
                summary, summary_bad, bad, self_remaining, dup_remaining, remaining, unresolved, level):
