@@ -14,7 +14,7 @@
     --level-block: rgb(0, 0, 0); --level-block-border: rgb(183, 119, 57); --level-end: rgb(229, 229, 229);
     --level-grid: rgb(14, 168, 117); --level-grid-used: rgb(4, 110, 80); --level-grid-text: rgb(0, 0, 0);
     --level-hole: rgb(65, 65, 65); --level-hole-border: rgb(106, 106, 106); --level-player: rgb(244, 114, 182);
-    --level-wall: rgb(38, 38, 38); --level-unknown: rgb(120, 120, 120);
+    --level-wall: rgb(38, 38, 38);
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
@@ -71,7 +71,8 @@
   .tile.wall { background: var(--level-wall); }
   .tile.exit { background: var(--level-end); }
   .tile.hole { background: var(--level-hole); border-style: solid; border-color: var(--level-hole-border); }
-  .tile.unknown { background: var(--level-unknown); }
+  /* the exit cell while a block (or the player) sits on it: a thin white ring drawn over the block */
+  .tile.covered::after { content: ''; position: absolute; inset: 0; box-shadow: inset 0 0 0 1px #fff; z-index: 3; pointer-events: none; }
   .tile .block { position: absolute; inset: 0; background: var(--level-block); border-color: var(--level-block-border); }
   .tile .player { position: absolute; inset: 0; background: var(--level-player); color: var(--level-grid-text); display: flex; align-items: center; justify-content: center; z-index: 2; }
   .placeholder { width: 96px; height: 96px; background: var(--bg); border-radius: 4px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; text-align: center; padding: 6px; }
@@ -120,7 +121,7 @@
 <section>
   <h2><span class="n">2</span>What is happening</h2>
   <div class="workers" id="workersBox"></div>
-  <p class="hint" style="margin:8px 0 0">Each worker owns one <b>job</b> (a subtree named by its seed path) for a <b>window</b>. Inside the window it keeps a local stack of sub-trees; at the end it briefly probes what is left, deepest first (absorbing), and reports the whole tree once. Grey cells in the board are not decided yet.</p>
+  <p class="hint" style="margin:8px 0 0">Each worker owns one <b>job</b> (a subtree named by its seed path) for a <b>window</b>. Inside the window it keeps a local stack of sub-trees; at the end it briefly probes what is left, deepest first (absorbing), and reports the whole tree once. Cells not decided yet are drawn as walls, and a white ring marks the exit while a block sits on it.</p>
 </section>
 
 <section>
@@ -142,7 +143,7 @@
   <h2><span class="n">5</span>Campaign</h2>
   <div class="tablewrap"><table id="campTable"><thead id="campHead"></thead><tbody id="campBody"></tbody></table></div>
   <div class="tiles" style="margin-top:10px" id="campTotals"></div>
-  <p class="hint" style="margin:8px 0 0">"Roots covered" counts the top-level jobs whose whole subtree is finished. An exit is <b>exact</b> when it is covered and every unresolved candidate (a state whose shortcut check hit a capacity limit) deeper than its best has been checked. The total amount of work is unknown until it is done, so no percentage of the search is shown anywhere.</p>
+  <p class="hint" style="margin:8px 0 0">"Roots covered" counts the top-level jobs whose whole subtree is finished. An exit is <b>exact</b> when it is covered and every unresolved candidate (a state whose shortcut check hit a capacity limit) deeper than its best has been checked. The total amount of work is only known once it is done; the site's dashboard shows a forecast of it.</p>
 </section>
 
 <section>
@@ -205,10 +206,11 @@ function fmtN(n) { return n == null ? '–' : Number(n).toLocaleString(); }
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 /* ==== END PURE ==== */
 
-/* Tile renderer copied from PathologyRecords/server/public/collective.js, with two additions:
-   '?' cells (uncommitted in the search cursor) render grey as "unknown", and rows may differ in length. */
+/* Tile renderer copied from PathologyRecords/server/public/collective.js, with additions: '?' cells (not decided
+   yet in the node being expanded) are drawn as walls, rows may differ in length, and `exit` (the job's exit cell,
+   row-major) gets a thin white ring while a block or the player covers it (owner 2026-09-28, as on the site's wall). */
 const CHAR_TO_MASK = { '2': 15, '6': 8, '7': 1, '8': 2, '9': 4, 'A': 9, 'B': 3, 'C': 6, 'D': 12, 'E': 7, 'F': 14, 'G': 13, 'H': 11, 'I': 10, 'J': 5 };
-function renderLevel(rows, moves, scale) {
+function renderLevel(rows, moves, scale, exit) {
   const nr = rows.length, nc = Math.max(...rows.map(r => r.length));
   const div = document.createElement('div'); div.className = 'lvlgrid';
   div.style.gridTemplateColumns = `repeat(${nc}, ${scale}px)`;
@@ -216,10 +218,10 @@ function renderLevel(rows, moves, scale) {
   for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) {
     const ch = rows[r][c] || '?', t = document.createElement('div'); t.className = 'tile';
     t.style.width = t.style.height = scale + 'px';
-    if (ch === '1') t.classList.add('wall');
+    if (ch === '1' || ch === '?') t.classList.add('wall');
     else if (ch === '5') { t.classList.add('hole'); t.style.borderWidth = bw + 'px'; }
     else if (ch === '3') { t.classList.add('exit'); if (moves != null) { t.textContent = moves; t.style.fontSize = Math.round(scale / 2) + 'px'; } }
-    else if (ch === '?') { t.classList.add('unknown'); t.title = 'unknown (not yet committed)'; }
+    if (Number.isInteger(exit) && r * nc + c === exit && ch !== '3' && ch !== '?') { t.classList.add('exit'); t.classList.add('covered'); }
     if (CHAR_TO_MASK[ch] !== undefined) {
       const b = document.createElement('div'); b.className = 'block'; const mask = CHAR_TO_MASK[ch];
       b.style.borderStyle = 'solid';
@@ -267,7 +269,8 @@ document.addEventListener('click', ev => {
 /* A board (caption, depth, optional attribution, the level, its code with a copy button), redrawn only on change. */
 function updateBoard(el, caption, b, opts = {}) {
   const rows = b ? levelRows(b.code) : null;
-  const key = JSON.stringify([caption, b ? b.depth : null, b ? b.exit : null, rows, opts.who || '', opts.empty || '', opts.code !== false]);
+  const exit = opts.exit != null ? opts.exit : b ? b.exit : null;
+  const key = JSON.stringify([caption, b ? b.depth : null, exit, rows, opts.who || '', opts.empty || '', opts.code !== false]);
   if (el._key === key) return;
   if (el._key !== undefined && (hovered(el) || selectionIn(el))) return;
   el._key = key;
@@ -278,7 +281,7 @@ function updateBoard(el, caption, b, opts = {}) {
   if (rows) {
     const nc = Math.max(...rows.map(r => r.length));
     const scale = Math.max(10, Math.min(opts.scale || SCALE, Math.floor((opts.maxPx || 200) / nc)));
-    el.appendChild(renderLevel(rows, null, scale));
+    el.appendChild(renderLevel(rows, null, scale, Number.isInteger(exit) ? exit : null));
     if (opts.who) { const w = document.createElement('div'); w.className = 'who'; w.textContent = opts.who; el.appendChild(w); }
     if (opts.code !== false) {
       const txt = rows.join('/');
@@ -473,7 +476,7 @@ function render(st) {
       const phase = s.frozen || s.state === 'paused' ? 'paused' : s.state === 'finishing' ? 'handing back' : s.phase === 'absorb' ? 'absorbing' : s.phase === 'window' ? 'searching' : 'waiting for a job';
       const retiring = s.retiring ? ' · retires after this job' : '';
       renderWorkerFacts(d.children[0], s, phase, retiring, st);
-      updateBoard(d.children[1], 'current node', s.cur, { code: false, empty: 'no board yet', maxPx: 150 });
+      updateBoard(d.children[1], 'current node', s.cur, { code: false, empty: 'no board yet', maxPx: 150, exit: s.exit });
     }
   }
 

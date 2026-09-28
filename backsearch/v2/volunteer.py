@@ -51,7 +51,7 @@ try:
 except ImportError:          # native Windows: no advisory locks (WSL has them)
     fcntl = None
 
-CLIENT_VERSION = "3.2.0"
+CLIENT_VERSION = "3.2.1"
 PROTOCOL = 3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -3115,9 +3115,9 @@ class Volunteer:
                 if s.job is None:
                     continue
                 cur = s.cur or {}
-                # `exit` lets the dashboard mark the exit cell on the wall (outlined when a block sits on it)
+                # `job`: the server takes the board's exit from its job (the dashboard rings a covered exit)
                 b = {"depth": cur.get("depth", 0), "cur": (cur.get("code") or "")[:BOARD_CAP],
-                     "best": (s.best or {}).get("depth", 0), "exit": s.job.get("exit")}
+                     "best": (s.best or {}).get("depth", 0), "job": s.job["id"]}
                 out.append(b)
         return out[:self.workers]
 

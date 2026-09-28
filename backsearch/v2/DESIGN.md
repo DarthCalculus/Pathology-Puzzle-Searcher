@@ -4,7 +4,7 @@
 three components (worker, client, server). Change it here first, then the code.
 
 - It describes the `campaign2` branches: worker sources with SRC_HASH `c3ee5d2b…` (project45 9430640, the
-  release candidate), client 3.2.0 (`v2/volunteer.py`; 3.2.0: closing the panel no longer stops the client, boards carry `exit`), server PathologyRecords `campaign2` (3ec0a4f).
+  release candidate), client 3.2.1 (`v2/volunteer.py`; 3.2: big jobs, closing the panel no longer stops the client, boards name their `job`), server PathologyRecords `campaign2` (3ec0a4f).
 - `PROTOCOL3.md` is the change record: the protocol-3 contract as written on 2026-09-24 from the review
   (`REVIEW-2026-09-24.md`, issue ids M*/N*/C*/H*, one detail file per issue in `review_issues/`). Everything
   in it is folded in here; §10 lists where the implementation differs from what it says.
@@ -522,8 +522,12 @@ Per exit, from the job tree (computed off the request path, §3.7):
   idle; with a full queue it sends a `big_only` probe every 60 s. A big run gets 900 s of watchdog silence
   after its split time and 600 s to answer SIGINT. `unknown_chain` never starts a slot's failure backoff.
 - **Dashboard.** `totals.big_waiting` and per exit `big` (waiting or running); the Take part panel explains it.
+- **Wall boards** (3.2.1): each board's `exit` is set by the server from its job: the board's `job` (3.2.1), else
+  the i-th id of the heartbeat's `running` list, which every client builds in the same slot order as its boards
+  (skipped when the two lengths differ). The dashboard and the panel draw undecided cells as walls and ring the
+  exit cell while a block covers it.
 
-## 4. Client (`v2/volunteer.py` 3.2.0, Python 3.9+, stdlib only)
+## 4. Client (`v2/volunteer.py` 3.2.1, Python 3.9+, stdlib only)
 
 ```
 python3 v2/volunteer.py --name "Your name" [--workers N] [--exit E] [--server URL] [--port 8765]
@@ -858,7 +862,7 @@ Panel sections (top to bottom):
    print their remaining work…").
 2. **What is happening**: per worker: job seed, exit, window time left, local stack size, nodes done this
    window, phase (search / absorbing / reporting), "retires after this job" when the count was lowered, and the
-   current board (grey = undecided cells).
+   current board (undecided cells drawn as walls; a white ring on the job's exit while a block covers it).
 3. **Levels**: four boards with Pathology codes and copy buttons: the best on this machine in the last second,
    in the last hour and this session (fed by STATUS samples and LEVEL lines, so short runs count too), and the
    best known globally for the selected exit, or the longest over all exits with "Any exit" (from `exits`; the
@@ -959,6 +963,6 @@ Known gaps (not done; none affects exactness):
   the first protocol-3 release (406e5500).
 - 2026-09-25: the protocol-3 stages (worker W1-W4, client C1-C2, server S1-S3, tests T1-T2) folded into this
   file; release candidate c3ee5d2b.
-- 2026-09-28: big jobs (§3.9, client 3.2.0, `build_pgo.sh --big`); fingerprint re-checks silent (§3.6);
+- 2026-09-28: big jobs (§3.9, client 3.2.0/3.2.1, `build_pgo.sh --big`); fingerprint re-checks silent (§3.6);
   closing the panel no longer stops the client; the dashboard forecast is censoring-aware (a Kaplan-Meier mean of
   subtree cost per depth for every unfinished job); the wall shows only board images.

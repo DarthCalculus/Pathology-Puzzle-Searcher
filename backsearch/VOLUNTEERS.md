@@ -60,8 +60,8 @@ worker is doing, the longest levels found on your machine (last second, last
 hour, this session) and the longest known for the campaign (with a copy button
 for its level code), your statistics, and the campaign table: roots covered per
 exit, whether an exit is already *exact*, and the unresolved candidates still to
-check when the server reports them. There is no percentage of the whole search,
-because the total amount of work is unknown until it is done.
+check when the server reports them. The total amount of work is only known once
+it is done; the site's dashboard shows a forecast of how much is left.
 
 Closing the page does **not** stop the client: it keeps working until you press
 Stop or Ctrl-C in its terminal, and you can reopen the page at any time. Start it
