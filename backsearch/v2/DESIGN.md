@@ -502,7 +502,10 @@ Per exit, from the job tree (computed off the request path, §3.7):
   campaign lists it in `big_hashes` (register and heartbeat `campaign`).
 - **Becoming big.** A failure `unknown_chain` of an ordinary job under an ordinary build: the job becomes big
   (`jobs.big = 1`), reopens, and counts no failure toward quarantine (the caps are the same for every client of
-  a build). Under a big build it is quarantined at once (then only the offline resolver can decide it). Split
+  a build). Under a big build it is quarantined at once (then only the offline resolver can decide it). An
+  ordinary build's `unknown_chain` on a job that is already big (it had it queued from before) is recorded and
+  never counted. The heartbeat hands a big job back (`reclaimed`) only to a client that leased as a big build in
+  the last day (`clients.big_at`); any other client holding one is told to drop it. Split
   children of a big job are ordinary again; a re-check of a result reported under a big build is big.
 - **Leasing.** Ordinary leases, re-checks, the tail and work stealing never touch big jobs. A request with
   `big: true` and a `big_hash` in `big_hashes` (else 400) gets big jobs first, originals before re-checks,
