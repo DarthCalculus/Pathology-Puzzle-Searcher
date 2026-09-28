@@ -65,7 +65,7 @@ SPORT="${TEST_SERVER_PORT:-19131}"
 UPORT="${TEST_UI_PORT:-19166}"
 UPORT2=$((UPORT + 1))
 SERVER="http://127.0.0.1:$SPORT"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/volunteer_test.XXXXXX")"
+TMPBASE="${TMPDIR:-/tmp}"; TMP="$(mktemp -d "${TMPBASE%/}/volunteer_test.XXXXXX")"   # no '//': the client's paths are normalised (pgrep patterns)
 export HOME="$TMP/home"; mkdir -p "$HOME"
 export VOLUNTEER_ALLOW_DIRTY=1
 export FAKE_MIN_S=1 FAKE_MAX_S=4 FAKE_SEED="${FAKE_SEED:-1}"
@@ -1198,7 +1198,48 @@ EOF
   stop_server; done_test
 }
 
-ALL="a b c d e f g h i j k l m n o p q r s t u v w x y z pw ui"
+test_bg() {
+  say "test bg: big jobs (3.2.0): running windows hand back their work, then the big job runs alone on the big worker"
+  local H="fa4e$(printf '0%.0s' $(seq 1 60))" BH="b16$(printf '0%.0s' $(seq 1 61))"
+  start_server 12 60 20 --hashes "$H,$BH" --big-hashes "$BH" || return
+  cp "$HERE/fake_worker.py" "$TMP/fake_worker_big.py"
+  FAKE_MIN_S=40 FAKE_MAX_S=50 start_client bg.log --workers 2 --no-ui --prefer-big --big-worker "$TMP/fake_worker_big.py" || return
+  grep -q "big worker .*hash $BH" "$TMP/bg.log" && ok "the big worker is pinned with its own hash" || bad "big worker not pinned: $(grep -i big "$TMP/bg.log" | head -2)"
+  wait_true 20 eval '[ "$(grep -c "window 20 s" "$TMP/bg.log")" -ge 2 ]' && ok "two ordinary windows run" || bad "two ordinary windows did not start"
+  sleep 3
+  admin '{"op":"big","n":1}'
+  wait_log bg.log "BIG job" 90 && ok "the big job started (a lease or the big-only probe found it)" || bad "the big job never started"
+  grep -Eq "big job: [0-9]+ queued ordinary job\(s\) handed back, [12] running window" "$TMP/bg.log" \
+    && ok "the running ordinary windows were asked to hand back" || bad "no hand-back: $(grep 'big job:' "$TMP/bg.log" | head -2)"
+  local bid; bid=$(sed -n 's/.*: BIG job \([0-9]*\) exit.*/\1/p' "$TMP/bg.log" | head -1)
+  wait_log bg.log "worker [0-9]+: job $bid (done|split) in [0-9]+ s" 60 && ok "the big job $bid ended on the big worker" || bad "the big job did not end"
+  resumed() { "$PY" - "$TMP/bg.log" "$bid" <<'PY'
+import re, sys
+lines = open(sys.argv[1], errors="replace").read().splitlines()
+end = next((k for k, l in enumerate(lines) if re.search(r"worker \d+: job %s (done|split) in" % sys.argv[2], l)), None)
+sys.exit(0 if end is not None and sum(1 for l in lines[end:] if re.search(r"worker \d+: job \d+ exit", l)) >= 2 else 1)
+PY
+  }
+  wait_true 40 resumed && ok "ordinary work resumed on both workers after the big job" || bad "ordinary work did not resume after the big job"
+  # between the big job's start and its end no ordinary window starts, and both hand-backs were reported before it began
+  "$PY" - "$TMP/bg.log" <<'PY' && ok "the big job ran alone, after both windows handed back" || bad "the big job overlapped ordinary work (see bg.log)"
+import re, sys
+lines = open(sys.argv[1], errors="replace").read().splitlines()
+i = next(k for k, l in enumerate(lines) if "BIG job" in l)
+j = next((k for k in range(i, len(lines)) if re.search(r"worker \d+: job \d+ (done|split) in", lines[k])), len(lines))
+start_lines = [l for l in lines[i + 1:j] if re.search(r"worker \d+: job \d+ exit", l)]
+before = [l for l in lines[:i] if re.search(r"worker \d+: job \d+ split in", l)]
+sys.exit(0 if not start_lines and len(before) >= 2 else 1)
+PY
+  wait_true 30 eval '[ "$(stat big_grants)" -ge 1 ]' && ok "the server granted $(stat big_grants) big job(s)" || bad "no big grant counted"
+  [ "$(aq "a['failure_reasons']")" = "{}" ] && ok "no failure was reported" || bad "failures: $(aq "a['failure_reasons']")"
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 30; CLIENT_PID=""
+  [ "$RC" = 0 ] && ok "client exited 0 on Ctrl-C" || bad "client exit code $RC"
+  no_bang bg.log
+  stop_server; done_test 120
+}
+
+ALL="a b c d e f g h i j k l m n o p q r s t u v w x y z pw ui bg"
 which="${*:-all}"
 [ "$which" = all ] && which="$ALL"
 start=$(date +%s)

@@ -63,9 +63,10 @@ exit, whether an exit is already *exact*, and the unresolved candidates still to
 check when the server reports them. There is no percentage of the whole search,
 because the total amount of work is unknown until it is done.
 
-**Closing the page stops the client** like Stop. Start it with
-`--no-stop-on-close` to keep it running without the page, or with `--no-ui` on a
-machine without a browser (`--no-browser` serves the page without opening it).
+Closing the page does **not** stop the client: it keeps working until you press
+Stop or Ctrl-C in its terminal, and you can reopen the page at any time. Start it
+with `--no-ui` on a machine without a browser (`--no-browser` serves the page
+without opening it).
 
 ## 3. While it runs
 
@@ -75,6 +76,20 @@ machine without a browser (`--no-browser` serves the page without opening it).
 * **Exit**: choose which exit position to work on, or leave "Any exit". It
   applies to the next lease; if that exit has no open jobs, the client takes
   jobs of other exits and says so.
+* **Big jobs** (client 3.2.0): a few jobs need more solver memory than an
+  ordinary worker allows. The first time one runs out, the server turns it into
+  a *big job*, which only a machine with the big worker gets. If you have 8 GB
+  or more to spare, build the big worker once (same sources, larger memory caps):
+
+      cd backsearch && ./build_pgo.sh --big --no-torch     # -> backsearch_worker_big
+
+  then start the client with `--prefer-big` (or pick "Big jobs" in the panel's
+  "Work on" menu). While the campaign has big jobs, the client runs one at a
+  time (one per 10 workers) on the big worker, with the other workers waiting,
+  because one big job can use up to about 5 GB. When a big job arrives, the running
+  ordinary jobs hand back their unexplored part within seconds, so nothing is
+  lost. With no big job left, the client runs ordinary jobs on all workers and
+  checks for big jobs again after 10 minutes.
 * **Pause** freezes the workers instantly (their memory stays allocated) and,
   while the client stays online, keeps their jobs reserved (up to 12 hours after
   each lease; the panel shows the campaign's figure). **Resume** continues where

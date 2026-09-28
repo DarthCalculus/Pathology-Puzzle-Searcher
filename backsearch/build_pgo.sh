@@ -29,6 +29,9 @@
 #   KNOBS="-DHP64_SIZE=(1<<9) -DPATH_TOK_MAX=16" ./build_pgo.sh -o /tmp/knob_worker
 #                              # a "knob build": compile-time table-size overrides (tests)
 #   ./build_pgo.sh --print-hash      # print the SRC_HASH this build would carry, then exit
+#   ./build_pgo.sh --big             # the BIG worker (-> ./backsearch_worker_big): the same sources with the
+#                              # solver's memory caps raised 16x (pending entries) and 8x (table), for the
+#                              # campaign's big jobs; about 10 ordinary workers' memory at worst (~5 GB)
 #
 # SRC_HASH (the v2 protocol's build identity, v2/PROTOCOL3.md §2.1) is the sha256
 # of backsearch.c + sokoban_bfs.c + sokoban_bfs.h, PLUS the sorted list of KNOBS
@@ -55,20 +58,29 @@ TRAIN_ARGS="--grid 5x5 --two-tables --allow-exit-transit --num-holes 3 --exit 7 
 TRAIN2_ARGS="--grid 6x6 --two-tables --allow-exit-transit --num-holes 0 --exit 14 --seed-path R2,D2,L2,L2,L2,L2,U2,U2,R1,U2,R2,R1 --time 0 --status-every 1000"
 USE_TORCH=auto
 PRINT_HASH=0
+BIG=0
+OUT_SET=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    -o) OUT="$2"; shift 2 ;;
+    -o) OUT="$2"; OUT_SET=1; shift 2 ;;
     --no-torch) USE_TORCH=no; shift ;;
     --torch) USE_TORCH=yes; shift ;;
     --train) TRAIN_ARGS="$2"; shift 2 ;;
     --train2) TRAIN2_ARGS="$2"; shift 2 ;;
     --print-hash) PRINT_HASH=1; shift ;;
+    --big) BIG=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 # --- knob overrides (KNOBS="-DNAME=VALUE ...") ---------------------------------
 KNOBS=${KNOBS:-}
+if [ "$BIG" = 1 ]; then
+  # the big-job build (v2/DESIGN.md, big jobs): exactly these two knobs, so every volunteer's big build has one hash
+  [ -n "$KNOBS" ] && { echo "--big sets KNOBS itself; do not combine it with KNOBS=..." >&2; exit 2; }
+  KNOBS="-DHP64_SIZE=(1<<24) -DHTP_SIZE=(1<<27)"
+  [ "$OUT_SET" = 1 ] || OUT=./backsearch_worker_big
+fi
 for k in $KNOBS; do
   case "$k" in
     -D[A-Za-z_]*) ;;

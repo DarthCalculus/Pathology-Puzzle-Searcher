@@ -29,8 +29,8 @@ python3 v2/volunteer.py --name "Your name" --workers 4
   worker, the node it is expanding and its job, the longest levels found on this
   machine (last second, last hour, this session) and the longest known for the
   campaign, your statistics and the campaign table (roots covered, exact or not,
-  unresolved candidates when the server reports them). Closing the page stops the
-  client like **Stop** (add `--no-stop-on-close` to keep it running without the page).
+  unresolved candidates when the server reports them). Closing the page does not
+  stop the client; reopen http://127.0.0.1:8765/ at any time.
 * **Pause** freezes the workers instantly (memory stays allocated). While the
   client stays online the jobs stay reserved (up to 12 hours after each lease; the
   page shows the campaign's figure). **Resume** continues where they were.
@@ -45,6 +45,15 @@ python3 v2/volunteer.py --name "Your name" --workers 4
   per exit; the page shows the same and says you can close it) and exits 0. Add
   `--keep-going` to wait for the next campaign and join it instead. With no
   campaign running, the client says so and exits 0.
+* **Big jobs** (3.2.0): a job the ordinary worker cannot finish within its solver
+  memory caps (`unknown_chain`) becomes a big job at its first such run, and only
+  big workers get it. To help with them (8 GB or more to spare): build
+  `./build_pgo.sh --big --no-torch` once (-> `backsearch_worker_big`, the same
+  sources with the caps raised 16x / 8x, up to about 5 GB per big job) and add
+  `--prefer-big` (or pick "Big jobs" in the page). The client then runs one big
+  job per 10 workers, alone; the running ordinary jobs hand back their
+  unexplored part when one arrives, and with none left it runs ordinary jobs and
+  looks again after 10 minutes. `--big-worker PATH` names another binary.
 * The client holds at most two jobs per worker (the one running and the next), so
   no job waits on your machine that someone else could run. Each window takes the
   length the server sets when it starts (shorter near the end of a campaign).

@@ -102,6 +102,7 @@ class Store:
             "extra": extra.split() if isinstance(extra, str) else list(extra),
             "exits": [int(x) for x in str(spec.get("exits", o.exits)).split(",")],
             "hashes": [h for h in str(spec.get("hashes", o.hashes)).split(",") if h],
+            "big_hashes": [h for h in str(spec.get("big_hashes", o.big_hashes)).split(",") if h],
             "max_clients": o.max_clients, "workers_max": 32, "status": "open",
             "job_target_s": o.split_after_s, "split_after_s": float(spec.get("split_after_s", o.split_after_s)),
             "lease_s": float(spec.get("lease_s", o.lease_s)), "paused_max_s": o.paused_max_s,
@@ -140,7 +141,7 @@ class Store:
         keys = ("id", "title", "grid", "extra", "exits", "hashes", "max_clients", "workers_max", "job_target_s",
                 "split_after_s", "ramp_split_after_s", "lease_s", "paused_max_s", "batch_interval_s", "lease_ahead_s",
                 "absorb_total_s", "absorb_probe_s", "lease_cap", "heartbeat_s", "status", "min_client_version",
-                "min_protocol", "release", "min_window_s", "split_after_nodes")
+                "min_protocol", "release", "min_window_s", "split_after_nodes", "big_hashes")
         return {k: c[k] for k in keys if c.get(k) is not None}
 
     def state_of(self, c):
@@ -354,19 +355,37 @@ class Store:
         if pref is not None and (not isinstance(pref, int) or pref not in camp["exits"]):
             return 400, {"error": "exit is not part of the campaign"}
         n = max(0, min(camp["lease_cap"], int(body.get("n", 1))))
+        # big jobs (like jobs.js): only a big build asks; one per 10 workers held, and nothing else while it holds one
+        big_req = body.get("big") is True
+        if big_req and str(body.get("big_hash") or "").lower() not in camp.get("big_hashes", []):
+            return 400, {"error": "big_hash is not a big build accepted by the campaign"}
+        held_big = sum(1 for j in self.jobs.values() if j["status"] == "leased" and j["client_token"] == c["token"] and j.get("big"))
         held = sum(1 for j in self.jobs.values() if j["status"] == "leased" and j["client_token"] == c["token"])
         n = min(n, 3 * max(1, c["workers"]) + LEASE_HELD_EXTRA - held)
         self.stats["lease_requests"] += 1
         granted = []
         reclaimed = []
         fallback = False
+        if big_req and n > 0 and camp["status"] == "open":
+            slots = max(1, c["workers"] // 10) + 1     # one queued ahead
+            for j in sorted(self.jobs.values(), key=lambda j: j["id"]):
+                if held_big >= slots or len(granted) >= n:
+                    break
+                if j["campaign_id"] == camp["id"] and j["status"] == "open" and j.get("big"):
+                    self._lease(j, c, camp, t)
+                    granted.append({"id": j["id"], "exit": j["exit"], "seed": j["seed"], "depth": j["depth"], "big": True,
+                                    "split_after_s": camp["split_after_s"]})
+                    held_big += 1
+            if held_big or body.get("big_only") is True:
+                n = 0
+            self.stats["big_grants"] = self.stats.get("big_grants", 0) + len(granted)
         if n > 0 and camp["status"] == "open":
             # like jobs.js: what the client listed as running or holding at its last heartbeat is never
             # granted to it a second time; an open one (its lease lapsed) goes back as `reclaimed`
             mine = set(c["running"]) | set(c.get("holding") or ())
             open_by_exit = {}
             for j in self.jobs.values():
-                if j["campaign_id"] != camp["id"] or j["status"] != "open":
+                if j["campaign_id"] != camp["id"] or j["status"] != "open" or j.get("big"):
                     continue
                 if t - j["fail_at"].get(c["token"], -1e18) < self.opts.fail_regrant_s:
                     continue                  # failed here recently: neither granted nor reclaimed (jobs.js SQL)
@@ -409,7 +428,8 @@ class Store:
         self.update_complete(camp)
         self.log("lease %s n=%d exit=%s -> %s (split_after_s %g%s)" % (c["name"], n, pref, [g["id"] for g in granted], sa,
                                                                         ", fallback" if fallback else ""))
-        res = {"ok": True, "jobs": granted, "reclaimed": reclaimed, "split_after_s": sa, "campaign_state": self.state_of(camp)}
+        res = {"ok": True, "jobs": granted, "reclaimed": reclaimed, "split_after_s": sa, "campaign_state": self.state_of(camp),
+               "big_open": sum(1 for j in self.jobs.values() if j["campaign_id"] == camp["id"] and j["status"] == "open" and j.get("big"))}
         if self.opts.lease_absorb_total_s is not None:
             # like jobs.js windowFor (M109): the lease's own absorption budget, 0 in the endgame
             res["absorb_total_s"] = self.opts.lease_absorb_total_s
@@ -430,7 +450,7 @@ class Store:
         cand = []
         held_by = {}
         for j in self.jobs.values():
-            if j["campaign_id"] != camp["id"] or j["status"] != "leased" or j["client_token"] == c["token"]:
+            if j["campaign_id"] != camp["id"] or j["status"] != "leased" or j["client_token"] == c["token"] or j.get("big"):
                 continue
             holder = self.clients.get(j["client_token"])
             if holder is None or j["id"] in holder["running"] or t - (j["leased_at"] or t) < self.opts.steal_protect_s \
@@ -737,6 +757,16 @@ class Store:
             for k, v in (body.get("params") or {}).items():
                 camp[k] = v
             return 200, {"ok": True, "campaign": self.public(camp)}
+        if op == "big":                # tests: make N open jobs big jobs (the server's first unknown_chain, jobs.js)
+            camp = self.current()
+            ids = []
+            for j in sorted(self.jobs.values(), key=lambda j: j["id"]):
+                if len(ids) >= int(body.get("n", 1)):
+                    break
+                if j["campaign_id"] == camp["id"] and j["status"] == "open" and not j.get("big"):
+                    j["big"] = True
+                    ids.append(j["id"])
+            return 200, {"ok": True, "big": ids}
         if op == "forget_clients":
             self.clients.clear()
             return 200, {"ok": True}
@@ -933,6 +963,7 @@ def main():
     ap.add_argument("--extra", default="--allow-exit-transit --num-holes 3")
     ap.add_argument("--exits", default="0,1,2")
     ap.add_argument("--hashes", default="fa4e" + "0" * 60)
+    ap.add_argument("--big-hashes", default="", help="hashes that are big builds (they must also be in --hashes)")
     ap.add_argument("--max-clients", type=int, default=40)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--preregister", action="append", help="NAME:TOKEN client that exists at startup")

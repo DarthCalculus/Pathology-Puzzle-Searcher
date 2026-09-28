@@ -51,7 +51,7 @@ try:
 except ImportError:          # native Windows: no advisory locks (WSL has them)
     fcntl = None
 
-CLIENT_VERSION = "3.1.0"
+CLIENT_VERSION = "3.2.0"
 PROTOCOL = 3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +90,16 @@ LOG_QUEUE_MAX = 5000
 MIN_WINDOW_S_DEFAULT = 1.0   # floor of a window and of a run's split time; a campaign may set min_window_s (tests, N18)
 HOLD_PER_WORKER = 2          # M108: jobs running + queued here <= 2 x workers
 LEASE_EARLY_GAP_S = 2.0      # an idle worker with nothing queued may lease this soon after the last request
+# Big jobs (3.2.0): jobs the ordinary worker cannot finish within its solver memory caps (unknown_chain). They run
+# on the BIG worker (build_pgo.sh --big: the same sources, caps raised 16x / 8x, up to ~5 GB), one per
+# BIG_WORKER_EQUIV workers, with nothing else running meanwhile (the big job has the machine's memory).
+BIG_WORKER_EQUIV = 10
+BIG_SWITCH_S = 600.0         # after the last big job ends, ordinary work runs at least this long before big jobs
+                             # may interrupt it again (each switch hands back the running ordinary windows)
+BIG_WATCHDOG_S = 900.0       # a big run may stay silent this long after its split time (one check can take minutes)
+BIG_GRACE_S = 600.0          # and take this long to answer SIGINT
+BIG_HP64_MIN = 1 << 24       # a big build's pending-entry cap (KNOBS HP64_SIZE) is at least this
+BIG_PROBE_S = 60.0           # with a full queue, ask for big jobs only (no ordinary ones) this often
 DEPTH_HIST_N = 16            # window durations kept per job depth (expected work of a job, M108)
 KEEP_SPLIT_S_PER_OPEN = 1.0  # M18: the pass's last kept probe split stays a split only if it saved at least this
                              # many seconds per child it hands to the pool unprobed (else it goes back open)
@@ -576,6 +586,7 @@ class Slot:
         self.run_started_at = 0.0
         self.saw_output = False       # first line (SRC_HASH) read: the worker is past startup
         self.stop_pending = False     # Stop requested before the worker printed anything
+        self.yield_requested = False  # a big job waits for this slot's memory: end the window after this run
         self.stderr_tail = collections.deque(maxlen=12)
 
     def win_last_second(self, now):
@@ -596,6 +607,7 @@ class Slot:
             "retiring": bool(self.retire and j is not None),
             "pid": self.proc.pid if self.proc and self.proc.poll() is None else None,
             "job_id": j["id"] if j else None,
+            "big": bool(j and j.get("big")),
             "exit": j["exit"] if j else None,
             "seed": j["seed"] if j else None,
             "elapsed": round(now - self.started_at, 1) if self.job and self.started_at else 0,
@@ -650,7 +662,6 @@ class Volunteer:
         self.sigint_count = 0
         self.ui_started = False
         self.ui_last_poll = 0.0
-        self.ui_close_at = 0.0
         self.ui_secret = secrets.token_hex(16)
         self.session_start = time.time()
         self.completed_campaign_id = None
@@ -660,7 +671,15 @@ class Volunteer:
         self.pre_registered = False      # wait_for_campaign already registered
         self.reregistered = False
         self.outbox_meta = {}            # path -> {"jobs": [...], "created_at": t, "campaign_id": id}
-        self.exit_pref = args.exit       # None = any exit
+        self.exit_pref = None if getattr(args, "prefer_big", False) else args.exit   # None = any exit
+        self.big_on = bool(getattr(args, "prefer_big", False))   # prefer big jobs (the panel's "Big jobs")
+        self.big_base = None             # argv prefix of the pinned big worker, when there is one
+        self.big_src = None
+        self.big_hash = None
+        self.big_last_end = 0.0          # when the last big job of this client ended (BIG_SWITCH_S)
+        self.big_open = None             # big jobs waiting on the server at the last lease response
+        self.big_refused_logged = None
+        self.big_probe_at = 0.0
         self.workers_changed_at = 0.0
         self.workers_prev = self.workers
         self.pause_requested_at = 0.0
@@ -683,6 +702,7 @@ class Volunteer:
             self.queue = collections.deque()      # leased, not yet started jobs
             self.pending = []                     # reports waiting for the next batch
             self.send_event = threading.Event()
+            self.send_now = False                 # deliver the pending reports without waiting for batch_interval_s
             self.sender_may_exit = False
             self.last_send_at = 0.0
             self.last_lease_at = 0.0
@@ -834,6 +854,83 @@ class Volunteer:
             sys.exit(2)
         self.worker_src = src
         self.worker_base = [sys.executable, dst] if dst.endswith(".py") else [dst]
+
+    def pin_big_worker(self):
+        """The big worker (build_pgo.sh --big), pinned like the ordinary one when it exists. Required with
+        --prefer-big; otherwise optional (the panel offers big jobs only when it is there)."""
+        w = self.args.big_worker
+        cands = [w, os.path.join(BACKSEARCH_DIR, w)] if not os.path.isabs(w) else [w]
+        src = next((os.path.abspath(c) for c in cands if os.path.isfile(c)), None)
+        if src is None:
+            if self.big_on:
+                emit("--prefer-big needs the big worker, and %s was not found. Build it in %s with:\n"
+                     "    ./build_pgo.sh --big --no-torch\n(the same sources as your worker, with the solver's memory caps "
+                     "raised; one big job can use about 5 GB)." % (w, BACKSEARCH_DIR))
+                sys.exit(2)
+            return
+        dst = os.path.join(self.outbox, ".bin", os.path.basename(src))
+        if os.path.abspath(dst) == os.path.abspath(os.path.join(self.outbox, ".bin", os.path.basename(self.worker_src or ""))):
+            emit("The big worker and the ordinary worker have the same file name (%s); build the big one with "
+                 "./build_pgo.sh --big (-> backsearch_worker_big)." % os.path.basename(src))
+            sys.exit(2)
+        try:
+            tmp = "%s.tmp%d" % (dst, os.getpid())
+            shutil.copyfile(src, tmp)
+            os.chmod(tmp, 0o700)
+            os.replace(tmp, dst)
+        except OSError as e:
+            emit("Cannot copy the big worker to %s: %s" % (os.path.dirname(dst), e))
+            sys.exit(2)
+        try:
+            out = subprocess.run(([sys.executable, dst] if dst.endswith(".py") else [dst]) + ["--version"],
+                                 capture_output=True, text=True, timeout=30, cwd=BACKSEARCH_DIR, env=self.env)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            emit("Cannot run the big worker %s: %s" % (src, e))
+            sys.exit(2)
+        info = {}
+        for line in out.stdout.splitlines():
+            parts = line.rstrip("\r").split("\t", 1)
+            if len(parts) == 2:
+                info[parts[0]] = parts[1].strip()
+        h = info.get("SRC_HASH", "").lower()
+        try:
+            knobs = json.loads(info.get("KNOBS", "{}"))
+        except ValueError:
+            knobs = {}
+        hp = knobs.get("HP64_SIZE") if isinstance(knobs, dict) else None
+        try:
+            proto = int(info.get("PROTOCOL", "0"))
+        except ValueError:
+            proto = 0
+        why = None
+        if not HEX_RE.match(h):
+            why = "it prints no source hash"
+        elif proto < PROTOCOL:
+            why = "it speaks protocol %d" % proto
+        elif not (isinstance(hp, int) and hp >= BIG_HP64_MIN):
+            why = "it is not a big build (pending cap %s); build it with ./build_pgo.sh --big" % hp
+        if why:
+            emit("The big worker %s cannot be used: %s." % (src, why))
+            if self.big_on:
+                sys.exit(2)
+            return
+        self.big_src = src
+        self.big_base = [sys.executable, dst] if dst.endswith(".py") else [dst]
+        self.big_hash = h
+        self.log("big worker %s (pinned copy of %s) hash %s, pending cap %d" % (dst, src, h, hp))
+
+    def big_hashes(self):
+        return [str(x).lower() for x in (self.campaign.get("big_hashes") or [])]
+
+    def big_ready(self):
+        """The big worker is pinned and the campaign accepts it as a big build."""
+        return self.big_base is not None and self.big_hash in self.big_hashes()
+
+    def big_slots(self):
+        return max(1, self.workers // BIG_WORKER_EQUIV)
+
+    def hash_for(self, job):
+        return self.big_hash if job and job.get("big") and self.big_hash else self.src_hash
 
     def read_version(self):
         argv = self.worker_base + ["--version"]
@@ -1360,7 +1457,8 @@ class Volunteer:
             extra = list(self.extra)
             grid = str(self.param("grid", "5x5"))
             nodes = self.split_after_nodes()
-        argv = list(self.worker_base) + ["--grid", grid, "--two-tables", "--exit", str(job["exit"])]
+        base = self.big_base if job.get("big") and self.big_base else self.worker_base
+        argv = list(base) + ["--grid", grid, "--two-tables", "--exit", str(job["exit"])]
         if seed != "":
             argv += ["--seed-path", seed]         # M41: the exit root "" runs without --seed-path
         # never 0 (= never split): sub-second windows (N18) keep three decimals
@@ -1499,6 +1597,11 @@ class Volunteer:
             active = [s for s in self.slots if not s.retire and s.thread is not None and s.thread.is_alive()]
             if not active:
                 return 0, False
+            n_big = self.big_count()
+            if n_big:
+                # a big job is here: only big ones (never ordinary work) until they are done, with one queued
+                # ahead so the next starts as soon as one ends (most big jobs take seconds)
+                return max(0, self.big_slots() + 1 - n_big), False
             # only the workers that stay count: a retiring worker's job is not followed by another, and
             # counting it would leave the kept workers idle until the retiring windows end
             running = sum(1 for s in active if s.job is not None)
@@ -1532,6 +1635,38 @@ class Volunteer:
         cap = int(self.fparam("lease_cap", LEASE_CAP))
         return max(0, min(n, room, cap)), idle > 0 and not queued
 
+    def big_count(self):
+        """Big jobs queued or running here (caller holds the lock)."""
+        return sum(1 for j in self.queue if j.get("big")) + sum(1 for s in self.slots if s.job is not None and s.job.get("big"))
+
+    def want_big_lease(self, now):
+        """Ask for big jobs at this lease request? (caller holds the lock) Only a ready big worker; and while
+        ordinary work runs, not within BIG_SWITCH_S of the last big job (each switch hands that work back)."""
+        if not (self.big_on and self.big_ready()):
+            return False
+        if self.big_count():
+            return True
+        ordinary = any(s.job is not None for s in self.slots)
+        return not ordinary or now - self.big_last_end >= BIG_SWITCH_S
+
+    def _begin_big(self):
+        """A big job arrived (caller holds the lock): queued ordinary jobs go back to the server (released by
+        omission at the next heartbeat) and every running ordinary window ends after its current run, which
+        SIGINT makes hand back its unexplored part within seconds; the big job starts once they are all in."""
+        dropped = [j for j in self.queue if not j.get("big")]
+        if dropped:
+            self.queue = collections.deque(j for j in self.queue if j.get("big"))
+        yielding = 0
+        for s in self.slots:
+            if s.job is not None and not s.job.get("big") and not s.yield_requested:
+                s.yield_requested = True
+                self._send_stop(s)
+                yielding += 1
+        if dropped or yielding:
+            self.heartbeat_now = True
+            self.log("big job: %d queued ordinary job(s) handed back, %d running window(s) hand back their unexplored "
+                     "part; the big job starts when they are in" % (len(dropped), yielding))
+
     def leaser_loop(self):
         while True:
             with self.cond:
@@ -1548,8 +1683,16 @@ class Volunteer:
         if self.paused or time.time() < self.no_jobs_until:
             return
         want, early = self.lease_want()
+        probe = False
         if want <= 0:
-            return
+            # the queue is full: a big-job preference still asks now and then, for big jobs only
+            now = time.time()
+            with self.lock:
+                probe = (self.big_on and self.big_ready() and not self.big_count() and self.want_big_lease(now)
+                         and now - self.big_probe_at >= BIG_PROBE_S)
+            if not probe:
+                return
+            want = 1
         since = time.time() - self.last_lease_at
         interval = self.fparam("batch_interval_s", 10)
         # one request per batch_interval_s; sooner (LEASE_EARLY_GAP_S) only for an idle worker with
@@ -1557,9 +1700,24 @@ class Volunteer:
         if since < interval and not (early and since >= min(interval, LEASE_EARLY_GAP_S)):
             return
         self.last_lease_at = time.time()
+        if probe:
+            self.big_probe_at = self.last_lease_at
         body = {"token": self.token, "n": want}
         with self.lock:
             pref = self.exit_pref
+            ask_big = self.want_big_lease(time.time())
+            if self.big_on and not self.big_ready() and self.big_refused_logged != self.big_hash:
+                self.big_refused_logged = self.big_hash
+                self.log("big jobs: %s; running ordinary jobs" % ("no big worker" if self.big_base is None else
+                         "the campaign does not accept the big worker %s as a big build" % (self.big_hash or "?")[:16]))
+        if probe and not ask_big:
+            return                    # the preference changed meanwhile: a full queue asks for nothing
+        if ask_big:
+            body["big"] = True
+            body["big_hash"] = self.big_hash
+            if probe:
+                body["big_only"] = True
+            pref = None
         if pref is not None:
             body["exit"] = pref
         try:
@@ -1576,6 +1734,11 @@ class Volunteer:
             elif kind == "reregister":
                 self.end_campaign("reregister", "the server does not know this client's token any more (%s); "
                                   "registering again" % e)
+            elif e.status == 400 and ask_big and "big_hash" in str(e.error or ""):
+                self.log("the server refused the big worker (%s); big jobs are off until the panel turns them on again" % e.error)
+                with self.lock:
+                    self.big_on = False
+                self.last_lease_at = 0.0
             elif e.status == 400 and pref is not None and "exit" in str(e.error or ""):
                 with self.lock:
                     if self.exit_pref == pref:
@@ -1593,6 +1756,8 @@ class Volunteer:
         if not isinstance(res, dict):
             return
         self.on_campaign_state(res)
+        if isinstance(res.get("big_open"), int):
+            self.big_open = res.get("big_open")
         if self.draining or self.stopping:
             jobs = res.get("jobs") or []
             if jobs:
@@ -1627,7 +1792,8 @@ class Volunteer:
                          "split_after_fixed": sa_job if sa_job else None,
                          "split_after_s": resp_sa, "absorb_total_s": resp_abs,
                          "absorb_fixed": nonneg_float(j.get("absorb_total_s")), "window_mode": mode,
-                         "dup": bool(j.get("dup")), "stolen": bool(j.get("stolen")), "leased_at": time.time(), "seq": seq})
+                         "dup": bool(j.get("dup")), "stolen": bool(j.get("stolen")), "leased_at": time.time(), "seq": seq,
+                         "big": bool(j.get("big")) and self.big_base is not None})
         for j in bad_seed:
             self.log("!!! job %d has a seed this client cannot run (%d chars); reporting it as a failure"
                      % (j["id"], len(j["seed"])))
@@ -1659,10 +1825,20 @@ class Volunteer:
                                  % (pref, "" if fallback else " (taken from other clients' queues)"))
                     self.exit_fallback = True
             if fresh:
-                self.grant_depths.extend(g["depth"] for g in fresh)
+                self.grant_depths.extend(g["depth"] for g in fresh if not g.get("big"))
                 self.queue.extend(fresh)
+                if any(g.get("big") for g in fresh):
+                    self.log("big job(s) %s leased (%s waiting on the server)"
+                             % (", ".join(str(g["id"]) for g in fresh if g.get("big")), self.big_open))
+                    self._begin_big()
                 self.cond.notify_all()
-            elif not good:
+            elif not good and ask_big and (self.big_open or 0) > 0:
+                # big jobs are waiting but the server still counts our last one (its report is on its way)
+                self.no_jobs_until = time.time() + LEASE_EARLY_GAP_S
+            elif not good and ask_big and self.big_count():
+                # asking for the next big job while one is here: none waiting, nothing to say
+                self.no_jobs_until = time.time() + max(5.0, self.fparam("batch_interval_s", 10))
+            elif not good and not probe:
                 wait = max(5.0, self.fparam("batch_interval_s", 10))
                 self.no_jobs_until = time.time() + wait
                 if time.time() - self.last_no_jobs_log > 60:
@@ -1679,11 +1855,25 @@ class Volunteer:
                 if self.stopping or slot.retire or self.paused or self.draining:
                     return None
                 if self.queue:
-                    job = min(self.queue, key=queue_key)     # M108: the server's lease order, not FIFO
-                    self.queue.remove(job)
-                    slot.job = job
-                    slot.drop_requested = False
-                    return job
+                    # big jobs: one starts once no ordinary job runs here (up to big_slots at once); ordinary
+                    # jobs wait while a big job is queued or running (the big job has the memory)
+                    others = [s.job for s in self.slots if s is not slot and s.job is not None]
+                    bigs = [j for j in self.queue if j.get("big")]
+                    if bigs:
+                        if not any(not j.get("big") for j in others) and sum(1 for j in others if j.get("big")) < self.big_slots():
+                            job = min(bigs, key=queue_key)
+                            self.queue.remove(job)
+                            slot.job = job
+                            slot.drop_requested = False
+                            slot.yield_requested = False
+                            return job
+                    elif not any(j.get("big") for j in others):
+                        job = min(self.queue, key=queue_key)     # M108: the server's lease order, not FIFO
+                        self.queue.remove(job)
+                        slot.job = job
+                        slot.drop_requested = False
+                        slot.yield_requested = False
+                        return job
                 self.cond.wait(0.5)
 
     def slot_loop(self, slot):
@@ -1702,6 +1892,12 @@ class Volunteer:
                 if job is None:
                     continue
                 outcome = self.run_window(slot, job)
+                if job.get("big"):
+                    with self.cond:
+                        self.big_last_end = time.time()
+                        self.send_now = True      # its report or failure at once (the server holds the next big job until then)
+                        self.cond.notify_all()
+                    self.send_event.set()
                 wait = 0.0
                 with self.lock:
                     if outcome != "fail" or slot.killed_by_client:
@@ -1744,7 +1940,8 @@ class Volunteer:
     def run_window(self, slot, job):
         """Work job J and its local subtree for one window, absorb trivial children, then queue
         ONE tree report. Returns 'ok' (a report was queued), 'fail' (J's run was void and a
-        failure was reported), 'none' (nothing for J; the job is left untouched) or 'abandoned'."""
+        failure was reported), 'capacity' (J's run hit the solver's memory caps: unknown_chain, reported; the
+        server makes it a big job), 'none' (nothing for J; the job is left untouched) or 'abandoned'."""
         start = time.time()
         window_s, absorb_total, mode = self.window_for(job)     # M108: chosen now, not at lease time
         min_w = self.min_window_s()
@@ -1764,17 +1961,18 @@ class Volunteer:
             slot.nodes_done = 0
             slot.phase = "window"
             slot.killed_by_client = False
-        self.log("worker %d: job %d exit %d window %s s%s seed %s"
-                 % (slot.idx, job["id"], job["exit"], fmt_s(window_s),
+        self.log("worker %d: %sjob %d exit %d window %s s%s seed %s"
+                 % (slot.idx, "BIG " if job.get("big") else "", job["id"], job["exit"], fmt_s(window_s),
                     " (%s)" % mode if mode not in (None, "full") else "",
                     job["seed"] or "(exit root)"))
         first = True
         while stack and not self.stopping:
             now = time.time()
-            if now >= deadline and not first:
+            if (now >= deadline or slot.yield_requested) and not first:
                 break
             seed = stack.pop()
-            res = self.run_worker(slot, job, seed, max(min_w, deadline - now))
+            # a big job waits for this slot: even the window's first run only expands its root and hands back the rest
+            res = self.run_worker(slot, job, seed, min_w if slot.yield_requested else max(min_w, deadline - now))
             node = index[seed]
             if res.kind != "ok":
                 if slot.killed_by_client or slot.drop_requested:
@@ -1785,6 +1983,10 @@ class Volunteer:
                     with self.lock:
                         slot.job = None
                         slot.phase = None
+                    if res.kind == "void" and res.reason == "unknown_chain":
+                        # the solver's memory caps, not this machine: the server makes it a big job (3.2.0),
+                        # so this is no reason to back off
+                        return "capacity"
                     return "fail" if res.kind == "void" else "none"   # J produced nothing: job untouched
                 node["status"] = "open"    # a child's run is void: the child stays open in the tree
                 first = False
@@ -1849,7 +2051,7 @@ class Volunteer:
         todo = absorb_order([n["seed"] for n in nodes if n["status"] == "open"])
         absorbed = probe_splits = 0
         demoted = None
-        if todo and not self.stopping and absorb_total > 0:
+        if todo and not self.stopping and absorb_total > 0 and not slot.yield_requested:
             probe = max(min(0.5, min_w), self.fparam("absorb_probe_s", 10))
             absorb_end = time.time() + absorb_total
             last = None               # the last kept probe split: {"seed", "saved" (s of work kept under it)}
@@ -1860,7 +2062,7 @@ class Volunteer:
                 slot.stack = todo
             while todo:
                 left = absorb_end - time.time()
-                if self.stopping or left < min(0.5, min_w) or slot.drop_requested:
+                if self.stopping or left < min(0.5, min_w) or slot.drop_requested or slot.yield_requested:
                     cut = True
                     break
                 seed = todo.pop(0)
@@ -1948,7 +2150,7 @@ class Volunteer:
                 self.stats["folded_back"] += 1
             self.log("worker %d: job %d tree folded back from %d to %d nodes to fit one report"
                      % (slot.idx, job["id"], len(nodes), len(fitted)))
-        report = {"job_id": job["id"], "src_hash": run_hash or self.src_hash,
+        report = {"job_id": job["id"], "src_hash": run_hash or self.hash_for(job),
                   "client_version": CLIENT_VERSION, "protocol": PROTOCOL,
                   "nodes": [clean_node(n) for n in fitted]}
         counts = collections.Counter(n["status"] for n in fitted)
@@ -1974,7 +2176,10 @@ class Volunteer:
                  % (slot.idx, job["id"], root["status"], dur, len(fitted), counts.get("done", 0),
                     counts.get("split", 0), counts.get("open", 0),
                     ", %d unresolved candidate(s)" % n_unres if n_unres else ""))
-        if self.draining or self.stopping:
+        if job.get("big"):
+            with self.lock:
+                self.send_now = True     # a big job's report at once: the server counts it as held until it arrives
+        if self.draining or self.stopping or job.get("big"):
             self.send_event.set()
         return "ok"
 
@@ -2047,7 +2252,7 @@ class Volunteer:
     def queue_failure(self, job, reason, detail, run_hash):
         """PROTOCOL3 section 3 failure report {"job": id, "failed": reason}: the server counts
         failures per job and quarantines poison jobs (M20/N15)."""
-        el = {"job": job["id"], "job_id": job["id"], "failed": str(reason)[:40], "src_hash": run_hash or self.src_hash,
+        el = {"job": job["id"], "job_id": job["id"], "failed": str(reason)[:40], "src_hash": run_hash or self.hash_for(job),
               "detail": str(detail or "")[:300], "client_version": CLIENT_VERSION, "protocol": PROTOCOL}
         with self.lock:
             self.pending.append(el)
@@ -2154,7 +2359,7 @@ class Volunteer:
                     h = parts[1].strip().lower()
                     if HEX_RE.match(h):
                         run_hash = h
-                        if h != self.src_hash:
+                        if h != self.hash_for(job):
                             hash_mismatch = True
                 elif tag == "REMAINING":
                     p = parts[1].strip() if len(parts) >= 2 else ""
@@ -2251,7 +2456,7 @@ class Volunteer:
             return void("hang", why)
         if hash_mismatch:
             self.fatal_stop(2, "The worker binary changed while the client was running (SRC_HASH %s, expected %s). "
-                            "Restart the client." % (run_hash, self.src_hash))
+                            "Restart the client." % (run_hash, self.hash_for(job)))
             return RunResult("none", "hash_changed")
         if summary is None:
             with self.lock:
@@ -2300,7 +2505,7 @@ class Volunteer:
                 # Interrupted before expanding its root: the whole subtree is still pending and a
                 # tree listing the seed itself as a child is invalid. No result; a failure only when
                 # the worker split on its own timer without progress (a window too short for its root).
-                if stopped or probe_run:
+                if stopped or probe_run or slot.yield_requested:     # (a hand-back for a big job is ours too)
                     if not probe_run:
                         self.log("%s was interrupted before expanding its root; not reported (node stays untouched)" % where)
                     return RunResult("none", "not_expanded")
@@ -2372,7 +2577,9 @@ class Volunteer:
             try:
                 with self.lock:
                     winding = self.stopping or self.draining
-                    due = self.pending and (winding or time.time() - self.last_send_at >= self.fparam("batch_interval_s", 10))
+                    due = self.pending and (winding or self.send_now or time.time() - self.last_send_at >= self.fparam("batch_interval_s", 10))
+                    if due:
+                        self.send_now = False
                     if winding and not self.pending and self.sender_may_exit:
                         return
                 if self.no_send:
@@ -2727,6 +2934,20 @@ class Volunteer:
 
     def set_exit(self, value):
         """Exit preference for the next lease request (None = any). Returns (ok, message)."""
+        if value == "big":
+            if self.big_base is None:
+                return False, ("big jobs need the big worker: build it in the backsearch directory with "
+                               "./build_pgo.sh --big --no-torch, then restart the client")
+            if not self.big_ready():
+                return False, "the campaign does not accept this big worker (hash %s) as a big build" % (self.big_hash or "?")[:16]
+            with self.lock:
+                self.big_on = True
+                self.exit_pref = None
+                self.exit_applied = True
+                self.exit_pending = False
+                self.exit_fallback = False
+            self.log("preference: big jobs (one per %d workers, alone, whenever the campaign has any)" % BIG_WORKER_EQUIV)
+            return True, None
         if value is None or value == "":
             ex = None
         else:
@@ -2740,6 +2961,7 @@ class Volunteer:
             if ex < 0:
                 return False, "exit must be >= 0"
         with self.lock:
+            self.big_on = False
             self.exit_pref = ex
             self.exit_applied = ex is None
             self.exit_pending = ex is not None       # until the next lease response settles it (M58)
@@ -2893,8 +3115,9 @@ class Volunteer:
                 if s.job is None:
                     continue
                 cur = s.cur or {}
+                # `exit` lets the dashboard mark the exit cell on the wall (outlined when a block sits on it)
                 b = {"depth": cur.get("depth", 0), "cur": (cur.get("code") or "")[:BOARD_CAP],
-                     "best": (s.best or {}).get("depth", 0)}
+                     "best": (s.best or {}).get("depth", 0), "exit": s.job.get("exit")}
                 out.append(b)
         return out[:self.workers]
 
@@ -3235,7 +3458,6 @@ class Volunteer:
                                                              "split_after_nodes", "release")},
                 "phase": self.phase_name,
                 "keep_going": bool(getattr(self.args, "keep_going", False)),
-                "stop_on_close": not getattr(self.args, "no_stop_on_close", False),
                 "window_now": self.window_now,
                 "hold_cap": HOLD_PER_WORKER * n_active,
                 "mean_job_s": round(self.mean_job_s(), 1),
@@ -3250,6 +3472,9 @@ class Volunteer:
                 "time": now,
                 # section 8
                 "exit_pref": self.exit_pref,
+                "big": {"on": self.big_on, "available": self.big_base is not None, "ready": self.big_ready(),
+                        "hash": self.big_hash, "waiting": self.big_open, "here": self.big_count(), "slots": self.big_slots(),
+                        "equiv": BIG_WORKER_EQUIV},
                 "exit_applied": self.exit_applied,
                 "exit_pending": self.exit_pending,
                 "exit_fallback": self.exit_fallback,
@@ -3489,21 +3714,22 @@ class Volunteer:
                 if s.stop_pending and s.proc and now - s.run_started_at > 5.0:
                     s.saw_output = True      # silent for 5 s: assume it is up and signal it
                     self._send_stop(s)
+                big = bool(s.job and s.job.get("big"))
                 if s.proc and s.state == "running" and not s.frozen and not s.watchdog_fired and not self.paused:
                     quiet_since = max(s.last_line_at, s.split_at)
-                    overrun = now > s.split_at + max(600.0, s.split_after_s)
-                    if now - quiet_since > slack or overrun:
+                    overrun = now > s.split_at + max(BIG_WATCHDOG_S * 2 if big else 600.0, s.split_after_s)
+                    if now - quiet_since > (max(slack, BIG_WATCHDOG_S) if big else slack) or overrun:
                         why = ("no output for %.0f s after its split time" % (now - quiet_since) if not overrun
                                else "still running %.0f s after its split time" % (now - s.split_at))
                         self.log("!!! worker %d (job %s): %s; sending SIGINT, then SIGKILL after %.0f s. "
-                                 "The run is void (hang)." % (s.idx, s.job and s.job["id"], why, grace))
+                                 "The run is void (hang)." % (s.idx, s.job and s.job["id"], why, max(grace, BIG_GRACE_S) if big else grace))
                         s.watchdog_fired = True
                         s.watchdog_why = "watchdog: " + why
                         self._signal(s, signal.SIGCONT)
                         self._signal(s, signal.SIGINT)
                         s.state = "finishing"
                         s.stop_sent_at = now
-                if s.state == "finishing" and s.proc and s.stop_sent_at and now - s.stop_sent_at > grace:
+                if s.state == "finishing" and s.proc and s.stop_sent_at and now - s.stop_sent_at > (max(grace, BIG_GRACE_S) if big else grace):
                     if s.watchdog_fired:
                         self.log("!!! worker %d did not exit within %.0f s of SIGINT; killing it" % (s.idx, grace))
                     else:
@@ -3518,12 +3744,6 @@ class Volunteer:
                     self._signal(s, signal.SIGCONT)
                     self._signal(s, signal.SIGKILL)
                     s.stop_sent_at = 0.0
-            if self.ui_close_at and now - self.ui_close_at > 3.0:
-                if self.ui_last_poll < self.ui_close_at:
-                    self.ui_close_at = 0.0
-                    threading.Thread(target=self.request_stop, args=("browser window closed", True), daemon=True).start()
-                else:
-                    self.ui_close_at = 0.0
 
     # ------------------------------------------------------------ local GUI
     def start_ui(self):
@@ -3630,10 +3850,7 @@ class Volunteer:
                 if path == "/workers":
                     n = vol.set_workers(body.get("workers") if isinstance(body, dict) else None)
                     return self._send(200, {"ok": True, "workers": n, "pending": True})
-                if path == "/close":
-                    if not vol.args.no_stop_on_close:
-                        with vol.lock:
-                            vol.ui_close_at = time.time()
+                if path == "/close":       # 3.0/3.1 panels still post this when they unload; closing the page no longer stops
                     return self._send(200, {"ok": True})
                 self._send(404, {"error": "not_found"})
 
@@ -3670,6 +3887,11 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="search processes, one core and about 0.5 GB of memory each (default: half the logical cores)")
     ap.add_argument("--exit", type=int, default=None, help="prefer jobs of this exit (default: any)")
+    ap.add_argument("--prefer-big", action="store_true",
+                    help="run big jobs whenever the campaign has any: one per 10 workers, alone, on the big worker "
+                         "(./build_pgo.sh --big --no-torch; up to ~5 GB each); ordinary jobs otherwise")
+    ap.add_argument("--big-worker", default=os.path.join(".", "backsearch_worker_big"),
+                    help="the big worker binary (default ./backsearch_worker_big in the backsearch directory)")
     ap.add_argument("--server", default=os.environ.get("VOLUNTEER_SERVER", DEFAULT_SERVER))
     ap.add_argument("--port", type=int, default=8765, help="local GUI port (127.0.0.1 only)")
     ap.add_argument("--worker", default=os.path.join(".", "backsearch_worker_nt"),
@@ -3680,7 +3902,8 @@ def main():
                     help="when the campaign is complete (or none is running), wait for the next one and join it")
     ap.add_argument("--no-ui", action="store_true", help="do not serve the local GUI")
     ap.add_argument("--no-browser", action="store_true", help="serve the GUI but do not open a browser")
-    ap.add_argument("--no-stop-on-close", action="store_true", help="closing the browser tab does not stop the client")
+    # closing the page never stops the client since 3.2.0; the flag is still accepted so old command lines keep working
+    ap.add_argument("--no-stop-on-close", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--reregister", action="store_true", help="ignore the stored token and register anew")
     ap.add_argument("--verbose-workers", action="store_true", help="let workers write their stderr to the terminal")
     # test and tuning knobs (not for volunteers)
@@ -3703,6 +3926,7 @@ def main():
         vol.src_hash = vol.read_version()
         vol.log("worker %s (pinned copy of %s) hash %s, protocol %s"
                 % (" ".join(vol.worker_base), vol.worker_src, vol.src_hash, vol.worker_info.get("PROTOCOL")))
+        vol.pin_big_worker()
         code = vol.main_loop()
     finally:
         vol.kill_all_workers()

@@ -4,7 +4,7 @@
 three components (worker, client, server). Change it here first, then the code.
 
 - It describes the `campaign2` branches: worker sources with SRC_HASH `c3ee5d2b…` (project45 9430640, the
-  release candidate), client 3.1.0 (`v2/volunteer.py`), server PathologyRecords `campaign2` (3ec0a4f).
+  release candidate), client 3.2.0 (`v2/volunteer.py`; 3.2.0: closing the panel no longer stops the client, boards carry `exit`), server PathologyRecords `campaign2` (3ec0a4f).
 - `PROTOCOL3.md` is the change record: the protocol-3 contract as written on 2026-09-24 from the review
   (`REVIEW-2026-09-24.md`, issue ids M*/N*/C*/H*, one detail file per issue in `review_issues/`). Everything
   in it is folded in here; §10 lists where the implementation differs from what it says.
@@ -339,14 +339,14 @@ lease.
     `stopping:true` releases every lease of the token at once.
   - `me` is the volunteer's statistics (by name); `exits` per exit: roots, roots covered, counts, CPU, best,
     clean, exact and the forecast `progress` (these may be null for a few seconds after a campaign is created).
-- `POST /api/v2/lease {token, n, exit?}` → `{jobs:[{id, exit, seed, depth, split_after_s?, dup?}], lease_s,
-  split_after_s, absorb_total_s, window_mode, endgame?, held, cap, exit_fallback, stolen, reclaimed,
-  campaign_state}` (§3.6).
+- `POST /api/v2/lease {token, n, exit?, big?, big_hash?, big_only?}` → `{jobs:[{id, exit, seed, depth,
+  split_after_s?, dup?, big?}], lease_s, split_after_s, absorb_total_s, window_mode, endgame?, held, cap,
+  exit_fallback, stolen, reclaimed, big_open, big_held?, campaign_state}` (§3.6; big jobs §3.9).
 - `POST /api/v2/report` (one tree report) and `POST /api/v2/reports {token, reports:[…]}` (a batch of up to
   1,000 tree reports and failure reports, applied in one transaction) → per element a result, plus
   `campaign_state` (§3.4).
 - `GET /api/v2/status`: the dashboard (per-exit counts, CPU-hours, best levels, active clients and their
-  boards, hashes, totals including re-checks, forecast). `GET /api/v2/campaign`: the open campaign.
+  boards, hashes, totals without re-checks, forecast). `GET /api/v2/campaign`: the open campaign.
   `GET /api/v2/campaigns`: completed campaigns (search tree only; re-checks listed apart).
   `GET /api/v2/audit[?campaign=ID][&exit=E]`: the audit (§3.5), also for closed and complete campaigns;
   503 `warming_up` for a few seconds after a campaign is created.
@@ -388,7 +388,7 @@ lease.
 
 Per exit, from the job tree (computed off the request path, §3.7):
 - **clean** = at least one root; every root covered (§1.3); no job done under a hash that is no longer
-  whitelisted; no fingerprint mismatch; nothing quarantined (duplicates included); no verify mismatch; and the
+  whitelisted; no fingerprint mismatch; no search-tree job quarantined (re-checks never block); no verify mismatch; and the
   root count equals LAYERINFO's `roots[exit]`.
 - **best** = the maximum of the jobs' levels, the listing's `shallow_best` and the true lengths of resolved
   candidates (`best_source` says which).
@@ -432,6 +432,9 @@ Per exit, from the job tree (computed off the request path, §3.7):
   when that client has had nothing else to do for 600 s. Its window is max(window, min(7,200 s, 3 × the
   original's run)), so a long original is re-run whole. It is compared only when both are done under the same
   hash; a mismatch blocks clean until `v2_jobs resolve` decides. `v2_jobs drop-dup` cancels pending ones.
+  Since 2026-09-27 re-checks are silent: a lease request carries at most one (oldest first) ahead of ordinary
+  work; no job count, waiting list or dashboard indicator includes them; a pending or quarantined one never
+  holds clean, exact, completion or publishing; completion cancels the ones left.
 - **Failures and quarantine**: a job with 3 failures from at least 2 clients, or 5 in total, becomes
   `quarantined`: never leased, blocks clean, listed by the audit. A valid report still finishes it;
   `v2_jobs release [--all]` reopens.
@@ -459,7 +462,8 @@ Per exit, from the job tree (computed off the request path, §3.7):
   exit, each with depth == tokens ≥ K (a deeper root ends in one walk run from token K on) and within the caps,
   no duplicates, no malformed or merged lines. `--dry` runs every check. A real run closes the open campaign
   (`--close-others`), creates the new one and inserts every root in one transaction.
-- `v2_hashes.js list | add HASH | remove HASH [--reissue]`.
+- `v2_hashes.js list | add HASH [--big] | remove HASH [--reissue]`. `--big` marks a big build (§3.9);
+  `remove` takes a hash off both lists.
   - `remove` alone only takes the hash off the whitelist. New reports under it are refused (409
     `unknown_hash`), and every job finished under it stops counting as covered: the audit lists those jobs as
     unknown-hash, and the exit stays unclean (§3.5), so the campaign cannot complete and v2_finish refuses to
@@ -469,6 +473,8 @@ Per exit, from the job tree (computed off the request path, §3.7):
     hash are reset to open, everything below them becomes `superseded` (their levels dropped), and duplicates of
     retired rows are retired. That work is searched again. The tool prints the CPU-hours to redo and the open
     candidates recorded on retired rows.
+- `v2_jobs.js release --all --big` reopens the quarantined jobs whose last failure is `unknown_chain` as big
+  jobs (§3.9); `release JOB --big` one of them.
 - `v2_jobs.js quarantined | failures | release [--all] | mismatches | resolve | recheck | rerun JOB | drop-dup |
   candidates | candidate ID MOVES | solve-candidates`: what blocks an exit, and how to clear it.
 - `v2_resolve.js`: solves the open candidates deeper than each exit's best (and the contradicted ones) with
@@ -477,18 +483,51 @@ Per exit, from the job tree (computed off the request path, §3.7):
 - `v2_finish.js [--solve]` (a dry run), then `--publish`: for each exact exit, solve the champion with solver6
   at the offline budget, check that its length equals the maximum, store the champion, add the proof
   (attributed "Collective"), and re-check every overlapping proof. It is idempotent; it refuses non-exact
-  exits, pending duplicates, contradicted candidates and `--min-walls` campaigns. `--accept-unverified` only
+  exits, contradicted candidates and `--min-walls` campaigns (pending re-checks do not hold it). `--accept-unverified` only
   overrides a solver that gives up; `--force-conflict` records a proof that disagrees with a nested-class proof.
   A 6x6 0-hole campaign publishes as "any number of blocks": all 7,350 6x6 levels with 33 or 34 blocks and no
   holes have a longest optimal solution of 2 moves.
 - The finishing order: `v2_jobs candidates` → `v2_resolve` → `v2_verify` → `v2_finish --solve` →
   `v2_finish --publish` (all re-runnable; `server/ops/README.md`).
 
-## 4. Client (`v2/volunteer.py` 3.1.0, Python 3.9+, stdlib only)
+### 3.9 Big jobs (2026-09-28)
+
+- **Why.** An ordinary worker's solver stops a check at 1,048,576 pending entries (and a 16M-slot table); after 8
+  inconclusive checks in a row the run ends as `unknown_chain` (§2.6). On campaign #2 about 500 exit-2 jobs did
+  so for every client and were quarantined. Rerun with the caps raised 8x / 4x, 22 of 24 sampled ones finished in
+  under 2 s: their root check needed 1.06 to 3.3 million entries and found a shortcut.
+- **The big build**: `build_pgo.sh --big` = the release sources with `-DHP64_SIZE=(1<<24) -DHTP_SIZE=(1<<27)`,
+  so its SRC_HASH is fixed and deterministic (campaign #2: `5eb8eb70…`). One big run can use up to about 5 GB;
+  the tables grow only as a check needs them. The owner whitelists it with `v2_hashes add HASH --big`; the
+  campaign lists it in `big_hashes` (register and heartbeat `campaign`).
+- **Becoming big.** A failure `unknown_chain` of an ordinary job under an ordinary build: the job becomes big
+  (`jobs.big = 1`), reopens, and counts no failure toward quarantine (the caps are the same for every client of
+  a build). Under a big build it is quarantined at once (then only the offline resolver can decide it). Split
+  children of a big job are ordinary again; a re-check of a result reported under a big build is big.
+- **Leasing.** Ordinary leases, re-checks, the tail and work stealing never touch big jobs. A request with
+  `big: true` and a `big_hash` in `big_hashes` (else 400) gets big jobs first, originals before re-checks,
+  largest estimate first: at most max(1, floor(workers / 10)) running plus one queued ahead (most take a second, and
+  a finished one counts until its report arrives), each with the campaign's full
+  `split_after_s` (never a ramp window, which would split it into ordinary children at once). While it holds
+  one it gets nothing else; with none open it gets ordinary work, unless `big_only: true` (a probe). Every
+  lease response carries `big_open`.
+- **Client (3.2.0).** `--prefer-big` (or "Big jobs" in the panel) with `--big-worker` (default
+  `backsearch_worker_big`, pinned like the worker; refused unless its KNOBS pending cap is ≥ 2^24 and its hash
+  is in `big_hashes`). When a big job arrives, the queued ordinary jobs are dropped (released by omission) and
+  every running ordinary window ends after its current run, which SIGINT makes hand back its unexplored part
+  (a run interrupted before expanding its root leaves the job untouched, never a failure). The big job starts
+  once no ordinary job runs; ordinary jobs wait while a big one is queued or running. A big job's report or failure
+  is sent at once, and an empty big lease while big jobs wait retries after 2 s. With no big job left it
+  runs ordinary work and asks for big jobs again only BIG_SWITCH_S (600 s) after the last one ended, or when
+  idle; with a full queue it sends a `big_only` probe every 60 s. A big run gets 900 s of watchdog silence
+  after its split time and 600 s to answer SIGINT. `unknown_chain` never starts a slot's failure backoff.
+- **Dashboard.** `totals.big_waiting` and per exit `big` (waiting or running); the Take part panel explains it.
+
+## 4. Client (`v2/volunteer.py` 3.2.0, Python 3.9+, stdlib only)
 
 ```
 python3 v2/volunteer.py --name "Your name" [--workers N] [--exit E] [--server URL] [--port 8765]
-        [--outbox DIR] [--keep-going] [--no-ui | --no-browser] [--no-stop-on-close] [--reregister]
+        [--outbox DIR] [--keep-going] [--no-ui | --no-browser] [--reregister]
 ```
 It runs from `backsearch/`. The defaults: half the logical cores, the worker `./backsearch_worker_nt`, the
 outbox `v2/volunteer_outbox`.
@@ -534,7 +573,7 @@ outbox `v2/volunteer_outbox`.
   not exact yet, and roots covered. The panel shows the same with "you can close this window", and the client
   **exits 0**. `--keep-going` waits for the next campaign (polling every 60 s) and joins it. A stored token of
   a completed campaign delivers its outbox, shows the summary once, then registers.
-- **Stop and pause.** Stop, Ctrl-C once, SIGHUP or closing the panel (unless `--no-stop-on-close`) sends every
+- **Stop and pause.** Stop, Ctrl-C once or SIGHUP sends every
   worker SIGINT, reports what they print, sends a final heartbeat `stopping:true, holding:[], running:[]` (the
   server releases every lease at once) and exits. A second Ctrl-C writes pending reports to the outbox and
   exits at once. Pause freezes the workers (SIGSTOP) and heartbeats `paused:true`; Resume thaws them. Ctrl-Z
@@ -582,18 +621,26 @@ a test runs one worker at a time.
      monolithic canonical set at depth ≥ K, nothing lost or extra; no process of the test survives it; the
      owner's databases are untouched.
    - `--e2e` runs one client without disruptions to completion (exit 0).
-3. **Gates** (`node --test server/test/v2_gates.test.js`, in PathologyRecords): 60 tests of the server:
+   - **Big jobs** (`v2/test_big.py ORDINARY BIG`, two CPU slots): the real server, clients and workers on 4x4
+     with at most 3 holes (layer 2); ORDINARY is a knob build with a 32-entry pending cap
+     (`-DHP64_SIZE='(1<<5)'`), BIG a `--big` build. Client A runs ordinary only; B `--prefer-big` with 2 workers.
+     Asserts: complete, both clients exit by themselves; jobs became big (86 on the reference run) with
+     `unknown_chain` the only failure and nothing quarantined; every big job finished by B under the big hash;
+     every exit clean with the monolithic best (exact except for the tiny build's own open candidates, the
+     offline resolver's job); no backoff; no other `!!!`.
+3. **Gates** (`node --test server/test/v2_gates.test.js`, in PathologyRecords): 62 tests of the server:
    register and queue, the version gate, the allowlist, seeding checks, lease order and caps, windows,
    stealing, reclaim and release, tree and candidate validation, failures and quarantine, duplicates and
    mismatches, the hash re-issue, completion, the stats worker, the tools, HTTP 413/400/426/429/503.
 4. **Fingerprint duplicates**: covered by the gates and the chaos test (§3.6).
-5. **Client** (`v2/test_client.sh [tests]`, fake server + fake worker; tests a-x, y, z, pw and ui; ui needs
+5. **Client** (`v2/test_client.sh [tests]`, fake server + fake worker; tests a-x, y, z, pw, ui and bg; ui needs
    node): stop, kill -9 and orphans, pause/resume and the panel's controls, dying workers, batching, 410 and
    426, completion and `--keep-going`, a second instance, the extra allowlist, fold-back, failure reports, the
    watchdog, 413 halving, unresolved forwarding, grant dedupe, the empty root, units, the exit check, the outbox
    after a server restart, sleep across the split time, grace kill and endgame, absorption order, lease sizing,
-   pause with fewer workers, the panel script. Run in groups of about a minute, e.g. `a e h s t ui`,
-   `b c g k q`, `d f j l m`, `n o p u v`, `w x i r`, `y z pw`.
+   pause with fewer workers, the panel script, big jobs (bg: two running windows hand back when a big job
+   arrives, it runs alone on the big worker, then ordinary work resumes). Run in groups of about a minute, e.g.
+   `a e h s t ui`, `b c g k q`, `d f j l m`, `n o p u v`, `w x i r`, `y z pw`, `bg`.
 6. **Dedup-key sensitivity** (`v2/test_dkey.py WORKER`, ~50 s): test builds keep 20 bits of the dedup hash, so
    distinct states collide thousands of times per run. With the 32-bit check value compared, levels and counts
    must equal the tested worker's; with it disabled, the same runs must lose states and levels.
@@ -912,3 +959,6 @@ Known gaps (not done; none affects exactness):
   the first protocol-3 release (406e5500).
 - 2026-09-25: the protocol-3 stages (worker W1-W4, client C1-C2, server S1-S3, tests T1-T2) folded into this
   file; release candidate c3ee5d2b.
+- 2026-09-28: big jobs (§3.9, client 3.2.0, `build_pgo.sh --big`); fingerprint re-checks silent (§3.6);
+  closing the panel no longer stops the client; the dashboard forecast is censoring-aware (a Kaplan-Meier mean of
+  subtree cost per depth for every unfinished job); the wall shows only board images.

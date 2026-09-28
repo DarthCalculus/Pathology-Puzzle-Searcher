@@ -103,7 +103,7 @@
   <div class="row">
     <div><label>Name (fixed after registration)<input type="text" id="name" readonly></label></div>
     <div><label for="workers">Workers</label><div class="row" style="gap:6px"><input type="number" id="workers" min="1" max="32"> <button class="secondary" id="applyWorkers">Apply</button></div><div class="note" id="workersNote"></div></div>
-    <div><label>Exit to work on</label><select id="exitSel"><option value="">Any exit</option></select></div>
+    <div><label>Work on</label><select id="exitSel"><option value="">Any exit</option></select></div>
     <div class="row" style="gap:8px"><button id="pauseBtn">Pause</button><button id="resumeBtn" class="secondary">Resume</button><button id="stopBtn" class="danger">Stop</button></div>
   </div>
   <div id="pendingBox"></div>
@@ -151,7 +151,7 @@
     <dt>A job</dt><dd>One node of the search tree and everything below it, named by its <i>seed path</i> (a list of backward moves such as <code>U2,R3,L1</code>). Any worker given the same seed explores exactly the same subtree, so nothing depends on who runs it or when.</dd>
     <dt>Windows and splitting</dt><dd>A worker keeps a job for a window of <span id="windowLen">30 min</span> (the server shortens it near the end of a campaign; each window uses the length current when it starts). A job that outlives its window prints the exact list of subtrees it has not finished; those become new jobs and the parent is marked split. The pieces are disjoint and together they are precisely the unexplored part, so nothing is lost or repeated. Trivial pieces are finished on this machine and never reach the server.</dd>
     <dt>Pausing</dt><dd>Pause freezes the worker processes (SIGSTOP). They keep their memory, and while this client stays online their jobs stay reserved <span id="pausedMax2">for up to 12 h after each lease</span>. A paused laptop that also sleeps or goes offline for longer than that loses them; the work is simply done by someone else.</dd>
-    <dt>Stopping</dt><dd>Stop asks each worker to hand back its remaining work. That takes seconds: the worker prints its remaining subtrees, the client reports them, and only then exits. <span id="closeText">Closing this tab also stops the client.</span></dd>
+    <dt>Stopping</dt><dd>Stop asks each worker to hand back its remaining work. That takes seconds: the worker prints its remaining subtrees, the client reports them, and only then exits. Closing this tab does not stop the client: it keeps working until you press Stop or Ctrl-C in its terminal, and you can reopen the page at any time.</dd>
     <dt>When the campaign is complete</dt><dd>The client stops asking for work, delivers its last reports, shows the result here and in the terminal, and exits by itself (with <code>--keep-going</code> it waits for the next campaign instead).</dd>
     <dt>Changing the worker count</dt><dd>Extra workers finish their current job and then retire; new workers start with the next lease (within <span id="batchLen">10 s</span>).</dd>
     <dt>Leases</dt><dd>A job is reserved for the client that took it for <span id="leaseLen">1.0 h</span>, renewed by every heartbeat. If that client vanishes (crash, power loss), the job simply returns to the pool afterwards and someone else picks it up. The client keeps at most two jobs per worker, so nothing waits here that another volunteer could run.</dd>
@@ -304,7 +304,7 @@ function renderWorkerFacts(f, s, phase, retiring, st) {
   }
   const top = f.children[0], live = f.children[1];
   const html = `<div><b>Worker ${s.idx + 1}</b> <span class="k">· ${esc(phase)}${esc(retiring)}${s.pid ? ' · pid ' + esc(s.pid) : ''}</span></div>` +
-    (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)} <span class="k">exit</span> ${esc(s.exit)}</div>` +
+    (s.job_id != null ? `<div><span class="k">job</span> #${esc(s.job_id)}${s.big ? ' <b>big</b>' : ''} <span class="k">exit</span> ${esc(s.exit)}</div>` +
       `<div class="seed">${esc(s.seed || '(exit root)')}</div>` +
       (s.cur_seed && s.cur_seed !== s.seed ? `<div class="seed k">now ${esc(s.cur_seed)}</div>` : '') : '');
   if (top._html !== html && !selectionIn(top)) setHTML(top, html);
@@ -362,14 +362,15 @@ $('workers').addEventListener('blur', () => {
 $('applyWorkers').onclick = applyWorkers;
 $('exitSel').addEventListener('focus', () => { exitEditing = true; });
 $('exitSel').addEventListener('blur', () => { exitEditing = false; });
-$('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; const r = await post('/exit', { exit: v === '' ? null : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
+$('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; const r = await post('/exit', { exit: v === '' ? null : v === 'big' ? 'big' : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
 $('pauseBtn').onclick = () => { hold('pauseBtn'); post('/pause'); };
 $('resumeBtn').onclick = () => { hold('resumeBtn'); post('/resume'); };
 $('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands back its remaining work (seconds), then the client exits.')) { hold('stopBtn'); post('/stop'); } };
 
 function renderExitSelector(st) {
   const exits = Array.isArray(st.campaign_exits) ? st.campaign_exits : Object.keys(st.exits || {}).map(Number);
-  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open, x.exact]; }));
+  const big = st.big || {};
+  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open, x.exact]; })) + '|' + [big.available, big.ready, big.waiting].join(',');
   if (key !== exitOptions && !exitEditing) {
     exitOptions = key;
     const sel = $('exitSel'); sel.innerHTML = '<option value="">Any exit</option>';
@@ -379,8 +380,13 @@ function renderExitSelector(st) {
       o.textContent = x ? `Exit ${e} — ${x.roots_covered ?? '?'}/${x.roots ?? '?'} roots covered, ${x.open} open${x.open === 0 ? ' (no open jobs)' : ''}` : `Exit ${e}`;
       sel.appendChild(o);
     }
+    if (big.available) {       // big jobs: only with the big worker (build_pgo.sh --big)
+      const o = document.createElement('option'); o.value = 'big';
+      o.textContent = big.ready ? `Big jobs — ${big.waiting == null ? 'none known yet' : big.waiting + ' waiting'} (one per ${big.equiv || 10} workers, alone)` : 'Big jobs (the campaign does not accept this big worker)';
+      sel.appendChild(o);
+    }
   }
-  if (!exitEditing) $('exitSel').value = st.exit_pref == null ? '' : String(st.exit_pref);
+  if (!exitEditing) $('exitSel').value = big.on ? 'big' : st.exit_pref == null ? '' : String(st.exit_pref);
 }
 
 /* the top banner: completion first (the feature the volunteer must not miss), then stop / pause states */
@@ -421,7 +427,13 @@ function render(st) {
   const pf = st.pending_flags || {};
   setHTML($('pendingBox'), ['stop', 'pause', 'workers', 'exit'].filter(k => pf[k]).map(k => `<div class="working">${esc(pf[k])}</div><br>`).join(''));
   const fb = $('fallback');
-  if (st.exit_pref != null && st.exit_fallback && !st.exit_pending) {
+  const bg = st.big || {};
+  if (bg.on) {
+    fb.hidden = false;
+    setText(fb, !bg.ready ? 'Big jobs are selected, but the campaign does not accept this big worker as a big build, so this client runs ordinary jobs.'
+      : bg.here ? `Running big job(s) on the big worker: the other workers wait, because a big job can use about ${bg.equiv || 10} workers' memory (up to ~5 GB). ${bg.waiting ?? '?'} more waiting on the server.`
+      : `Big jobs preferred: ${bg.waiting ? bg.waiting + ' waiting on the server; the next lease takes one (running windows hand back their work first, at most every 10 minutes).' : 'none waiting right now, so this client runs ordinary jobs and checks again at every lease.'}`);
+  } else if (st.exit_pref != null && st.exit_fallback && !st.exit_pending) {
     fb.hidden = false; setText(fb, `Exit ${st.exit_pref} had no open jobs at the last lease, so this client got jobs of other exits. Your preference stays and is tried again at every lease.`);
   } else fb.hidden = true;
 
@@ -442,7 +454,6 @@ function render(st) {
   if (w) setText($('windowLen'), fmtDur(w) + (st.window_now && st.window_now.mode && st.window_now.mode !== 'full' ? ` (now: ${st.window_now.mode})` : ''));
   if (c.lease_s) setText($('leaseLen'), fmtDur(c.lease_s));
   if (c.batch_interval_s) setText($('batchLen'), fmtDur(c.batch_interval_s));
-  setText($('closeText'), st.stop_on_close === false ? 'This client was started with --no-stop-on-close: closing this tab does not stop it.' : 'Closing this tab also stops the client (start it with --no-stop-on-close to keep it running without the page).');
 
   /* 2. workers: one card per slot, updated in place */
   const box = $('workersBox');
@@ -553,8 +564,6 @@ async function poll() {
   finally { clearTimeout(timer); inFlight = false; freshness(); }
 }
 setInterval(poll, 250); poll();
-/* Window close = Stop (DESIGN 4) unless --no-stop-on-close. The client waits 3 s for a new /state poll (a reload) before stopping. */
-window.addEventListener('pagehide', () => { try { fetch('/close', { method: 'POST', keepalive: true, headers: { 'X-Volunteer': SECRET }, body: '{}' }); } catch (e) {} });
 </script>
 </body>
 </html>

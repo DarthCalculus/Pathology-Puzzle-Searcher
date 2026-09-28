@@ -21,6 +21,7 @@ same in every run (reproducible tests).
 
 Environment knobs
   FAKE_SRC_HASH             hash to claim (default a fixed fake value)
+  FAKE_SRC_HASH_BIG         the hash a copy named *big* claims (default b160...0), with a big build's KNOBS
   FAKE_SEED                 RNG seed salt (default 1)
   FAKE_MIN_S / FAKE_MAX_S   run duration range in seconds (default 1 / 4); deeper seeds
                             (more tokens than 8) run shorter so that a split tree terminates
@@ -155,14 +156,16 @@ def ext_tokens(k, width):
 
 def main():
     args = parse_args(sys.argv[1:])
-    src_hash = os.environ.get("FAKE_SRC_HASH", DEFAULT_HASH)
+    # a copy whose file name contains "big" plays the big build (build_pgo.sh --big): its own hash and a big pending cap
+    big = "big" in os.path.basename(sys.argv[0])
+    src_hash = os.environ.get("FAKE_SRC_HASH_BIG", "b16" + "0" * 61) if big else os.environ.get("FAKE_SRC_HASH", DEFAULT_HASH)
     if args["version"]:
         out("SRC_HASH\t" + src_hash)
         out("GIT_SHA\t")
         out("PROTOCOL\t3")
         out("LIMITS\t" + json.dumps({"path_tok_max": PATH_TOK_MAX, "max_ncells": 64, "max_blocks": 32, "state_bits": 128},
                                      separators=(",", ":")))
-        out("KNOBS\t{}")
+        out("KNOBS\t" + ('{"HP64_SIZE":16777216,"HTP_SIZE":134217728}' if big else "{}"))
         return 0
 
     out("SRC_HASH\t" + src_hash)
