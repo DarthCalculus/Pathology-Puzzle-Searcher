@@ -150,9 +150,7 @@ console.log(JSON.stringify(out));""", a.server_dir, os.path.join(T, 'data'), str
             problems.append('client A ran a big job')
         if 'BIG job' not in lb:
             problems.append('client B never ran a big job')
-        yields = [int(m) for m in re.findall(r'big job: \d+ queued ordinary job\(s\) handed back, (\d+) running', lb)]
-        if not any(yields):
-            problems.append('client B never handed back a running ordinary window for a big job (%d big leases)' % len(yields))
+        # (the hand-back of running ordinary windows is test_client.sh bg: here the 4x4 jobs take under a second)
         if 'backing off' in la + lb:
             problems.append('a client backed off (unknown_chain must not count as a failure streak)')
         for n, text in (('A', la), ('B', lb)):
