@@ -131,6 +131,10 @@ def main():
         if bad_big:
             problems.append('big job(s) finished by someone else or under another hash: %s' % bad_big[:5])
         nbig_done = q("SELECT COUNT(*) FROM jobs WHERE campaign_id = ? AND big = 1 AND status IN ('done', 'split')", cid)[0][0]
+        checks = q("SELECT status, COUNT(*) FROM jobs WHERE campaign_id = ? AND check_of IS NOT NULL GROUP BY status", cid)
+        verdicts = q("SELECT outcome, COUNT(*) FROM reports r JOIN jobs j ON j.id = r.job_id WHERE j.campaign_id = ? AND j.check_of IS NOT NULL GROUP BY outcome", cid)
+        if not checks:
+            problems.append('no check job was issued (the tiny-cap worker should leave candidates deeper than the best)')
         r = subprocess.run(['node', '-e', """
 const { openJobsDB } = require(process.argv[1] + '/lib/jobs.js');
 const J = openJobsDB(process.argv[2]);
@@ -141,9 +145,8 @@ console.log(JSON.stringify(out));""", a.server_dir, os.path.join(T, 'data'), str
         aud = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else {}
         for e in exits:
             x = aud.get(str(e), {})
-            # not exact only for the ordinary (tiny-cap) worker's own unresolved candidates: the offline resolver's job
-            exact_ok = x.get('exact') or (x.get('open_deeper', 0) > 0 and not x.get('contradicted') and not x.get('levelless'))
-            if not (x.get('clean') and exact_ok and x.get('best') == mono[e]):
+            # exact: the server turns every candidate deeper than an exit's best into a check job, which the big client settles
+            if not (x.get('clean') and x.get('exact') and x.get('best') == mono[e]):
                 problems.append('exit %d audit %s, monolithic best %s' % (e, x, mono[e]))
         la, lb = (open(os.path.join(T, 'client_%s.log' % n), errors='replace').read() for n in 'AB')
         if 'BIG job' in la:
@@ -157,7 +160,7 @@ console.log(JSON.stringify(out));""", a.server_dir, os.path.join(T, 'data'), str
             bang = [l for l in text.splitlines() if '!!!' in l and 'unknown_chain' not in l]
             if bang:
                 problems.append('client %s logged: %s' % (n, bang[:3]))
-        say('%d big job(s), %d finished by B under %s...; failures %s; audit %s' % (nbig, nbig_done, h_big[:8], reasons, aud))
+        say('%d big job(s), %d finished by B under %s...; check jobs %s, verdicts %s; failures %s; audit %s' % (nbig, nbig_done, h_big[:8], checks, verdicts, reasons, aud))
     finally:
         for p in procs:
             if p.poll() is None:

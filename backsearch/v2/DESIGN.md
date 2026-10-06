@@ -524,7 +524,17 @@ Per exit, from the job tree (computed off the request path, §3.7):
   runs ordinary work and asks for big jobs again only BIG_SWITCH_S (600 s) after the last one ended, or when
   idle; with a full queue it sends a `big_only` probe every 60 s. A big run gets 900 s of watchdog silence
   after its split time and 600 s to answer SIGINT. `unknown_chain` never starts a slot's failure backoff.
-- **Dashboard.** `totals.big_waiting` and per exit `big` (waiting or running); the Take part panel explains it.
+- **Check jobs** (2026-10-05). Every open unresolved candidate deeper than its exit's best (or contradicted) becomes a
+  big job of its own (`jobs.check_of` = the candidate), seeded at the candidate's path, issued by the minute sweeper
+  and before a campaign may complete, leased to big builds before other big jobs (deepest first) with a 1-s window
+  and no absorption. Only its root counts: the root pruned resolves the candidate `invalid` (a shorter solution; its
+  length is left unknown, and a later shallower sighting opens it again), the root accepted resolves it `valid` at
+  its depth and records the level, a root still inconclusive under the big caps quarantines the check job and leaves
+  the candidate open. Check jobs are never part of the coverage tree (audit, roots, forecast) and add no children;
+  they count as waiting/running jobs of their exit but not as big jobs shown. On campaign #2's exit 2, the big build
+  settled all 41 candidates deeper than 98 at the root (each a shorter solution) in 0.3 to 6.3 s.
+- **Dashboard.** `totals.big_waiting` and per exit `big` (waiting or running, check jobs not included). The per-exit
+  check mark only says an exit has nothing waiting or running.
 - **Wall boards** (3.2.1): each board's `exit` is set by the server from its job: the board's `job` (3.2.1), else
   the i-th id of the heartbeat's `running` list, which every client builds in the same slot order as its boards
   (skipped when the two lengths differ). The dashboard and the panel draw undecided cells as walls and ring the
