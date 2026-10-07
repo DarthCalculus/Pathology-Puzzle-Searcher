@@ -339,8 +339,9 @@ lease.
     `stopping:true` releases every lease of the token at once.
   - `me` is the volunteer's statistics (by name); `exits` per exit: roots, roots covered, counts, CPU, best,
     clean, exact and the forecast `progress` (these may be null for a few seconds after a campaign is created).
-- `POST /api/v2/lease {token, n, exit?, root?, big?, big_hash?, big_only?}` (`root`: a root seed of `exit`, whose jobs
-  come first; `root_fallback` in the answer when other jobs were granted too) → `{jobs:[{id, exit, seed, depth,
+- `POST /api/v2/lease {token, n, exit?, root?, big?, big_hash?, big_only?}` (`root`: a move path of `exit` that is a root, a
+  prefix of roots or a path inside a root; every job whose seed is it or starts with it comes first; `root_fallback`
+  in the answer when other jobs were granted too) → `{jobs:[{id, exit, seed, depth,
   split_after_s?, dup?, big?}], lease_s, split_after_s, absorb_total_s, window_mode, endgame?, held, cap,
   exit_fallback, stolen, reclaimed, big_open, big_held?, campaign_state}` (§3.6; big jobs §3.9).
 - `POST /api/v2/report` (one tree report) and `POST /api/v2/reports {token, reports:[…]}` (a batch of up to
