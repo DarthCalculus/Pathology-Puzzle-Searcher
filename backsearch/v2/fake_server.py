@@ -354,6 +354,14 @@ class Store:
         pref = body.get("exit")
         if pref is not None and (not isinstance(pref, int) or pref not in camp["exits"]):
             return 400, {"error": "exit is not part of the campaign"}
+        root = body.get("root")         # like jobs.js: a root of the preferred exit first (its seed and every seed below it)
+        if root is not None:
+            if pref is None:
+                return 400, {"error": "root needs an exit"}
+            if not any(j["campaign_id"] == camp["id"] and j["exit"] == pref and j["parent_id"] is None and j["seed"] == root
+                       for j in self.jobs.values()):
+                return 400, {"error": "root is not a root of that exit"}
+        under = lambda j: root is not None and (j["seed"] == root or j["seed"].startswith(root + ","))
         n = max(0, min(camp["lease_cap"], int(body.get("n", 1))))
         # big jobs (like jobs.js): only a big build asks; one per 10 workers held, and nothing else while it holds one
         big_req = body.get("big") is True
@@ -398,7 +406,7 @@ class Store:
             if pref is not None:
                 order.sort(key=lambda kv: kv[0] != pref)
             for ex, lst in order:
-                for j in sorted(lst, key=lambda j: (-j["depth"], j["created_at"], j["id"])):
+                for j in sorted(lst, key=lambda j: (not under(j), -j["depth"], j["created_at"], j["id"])):
                     if len(granted) >= n:
                         break
                     self._lease(j, c, camp, t)
@@ -436,6 +444,10 @@ class Store:
             res["window_mode"] = "endgame" if self.opts.lease_absorb_total_s == 0 else "full"
         if fallback:
             res["exit_fallback"] = True
+        if root is not None:
+            res["root"] = root
+            res["root_fallback"] = any(not under(self.jobs[g["id"]]) for g in granted)
+            self.stats["root_leases"] = self.stats.get("root_leases", 0) + sum(1 for g in granted if under(self.jobs[g["id"]]))
         return 200, res
 
     def window_now(self, camp):
@@ -859,6 +871,7 @@ class Store:
                      "failure_reasons": self.failure_reasons, "last_heartbeat": self.last_heartbeat,
                      "client_versions": sorted(self.client_versions),
                      "candidates": self.candidates[:50],
+                     "root_seeds": [[j["exit"], j["seed"]] for j in js if j["parent_id"] is None],
                      "report_log": [r for r in self.report_log if self.jobs[r["job_id"]]["campaign_id"] == camp["id"]][:100],
                      "fail_counts": {str(j["id"]): j["fail_count"] for j in js if j["fail_count"]},
                      "clean": bool(roots) and not uncovered and counts["quarantined"] == 0}

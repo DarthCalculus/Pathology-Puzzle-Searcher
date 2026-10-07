@@ -51,7 +51,7 @@ try:
 except ImportError:          # native Windows: no advisory locks (WSL has them)
     fcntl = None
 
-CLIENT_VERSION = "3.2.1"
+CLIENT_VERSION = "3.3.0"
 PROTOCOL = 3
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -672,6 +672,8 @@ class Volunteer:
         self.reregistered = False
         self.outbox_meta = {}            # path -> {"jobs": [...], "created_at": t, "campaign_id": id}
         self.exit_pref = None if getattr(args, "prefer_big", False) else args.exit   # None = any exit
+        self.root_pref = getattr(args, "root", None)     # with exit_pref: one root of that exit first (its move path)
+        self.root_fallback = False
         self.big_on = bool(getattr(args, "prefer_big", False))   # prefer big jobs (the panel's "Big jobs")
         self.big_base = None             # argv prefix of the pinned big worker, when there is one
         self.big_src = None
@@ -1144,6 +1146,7 @@ class Volunteer:
             pref = self.exit_pref
             if pref is not None and allowed and pref not in allowed:
                 self.exit_pref = None
+                self.root_pref = None
                 self.exit_applied = True
                 bad = True
             else:
@@ -1718,8 +1721,12 @@ class Volunteer:
             if probe:
                 body["big_only"] = True
             pref = None
+        with self.lock:
+            root = self.root_pref if pref is not None else None
         if pref is not None:
             body["exit"] = pref
+            if root:
+                body["root"] = root
         try:
             res = self.api.post("/api/v2/lease", body)
         except ApiError as e:
@@ -1738,6 +1745,13 @@ class Volunteer:
                 self.log("the server refused the big worker (%s); big jobs are off until the panel turns them on again" % e.error)
                 with self.lock:
                     self.big_on = False
+                self.last_lease_at = 0.0
+            elif e.status == 400 and root and "root" in str(e.error or ""):
+                with self.lock:
+                    if self.root_pref == root:
+                        self.root_pref = None
+                        self.root_fallback = False
+                self.log("the server refused root %s of exit %d (%s); working on exit %d" % (root, pref, e.error, pref))
                 self.last_lease_at = 0.0
             elif e.status == 400 and pref is not None and "exit" in str(e.error or ""):
                 with self.lock:
@@ -1811,6 +1825,11 @@ class Volunteer:
                 fresh.append(g)
             if dups:
                 self.stats["grants_deduped"] += len(dups)
+            if root and self.root_pref == root and good:
+                rf = bool(res.get("root_fallback"))
+                if rf and not self.root_fallback:
+                    self.log("root %s of exit %d had no open jobs at this lease; this client also took other jobs" % (root, pref))
+                self.root_fallback = rf
             if pref is not None and self.exit_pref == pref:
                 # M58: the first lease response after a change settles it: applied (a job of that exit
                 # came), or no open job there (jobs of other exits came: the server's fallback or stolen
@@ -2933,7 +2952,15 @@ class Volunteer:
         slot.stop_sent_at = time.time()
 
     def set_exit(self, value):
-        """Exit preference for the next lease request (None = any). Returns (ok, message)."""
+        """Exit preference for the next lease request (None = any). Returns (ok, message). Any choice other than
+        "root" (the panel's entry for the --root preference) replaces the root preference."""
+        if value == "root":
+            return (True, None) if self.root_pref else (False, "no root preference is set")
+        with self.lock:
+            if self.root_pref:
+                self.log("root preference %s cleared by the panel" % self.root_pref)
+            self.root_pref = None
+            self.root_fallback = False
         if value == "big":
             if self.big_base is None:
                 return False, ("big jobs need the big worker: build it in the backsearch directory with "
@@ -3472,6 +3499,8 @@ class Volunteer:
                 "time": now,
                 # section 8
                 "exit_pref": self.exit_pref,
+                "root_pref": self.root_pref,
+                "root_fallback": self.root_fallback,
                 "big": {"on": self.big_on, "available": self.big_base is not None, "ready": self.big_ready(),
                         "hash": self.big_hash, "waiting": self.big_open, "here": self.big_count(), "slots": self.big_slots(),
                         "equiv": BIG_WORKER_EQUIV},
@@ -3887,6 +3916,8 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="search processes, one core and about 0.5 GB of memory each (default: half the logical cores)")
     ap.add_argument("--exit", type=int, default=None, help="prefer jobs of this exit (default: any)")
+    ap.add_argument("--root", default=None,
+                    help="with --exit: prefer jobs of this root of that exit, given as its move path (e.g. R2,D2,L2,L2)")
     ap.add_argument("--prefer-big", action="store_true",
                     help="run big jobs whenever the campaign has any: one per 10 workers, alone, on the big worker "
                          "(./build_pgo.sh --big --no-torch; up to ~5 GB each); ordinary jobs otherwise")
@@ -3914,6 +3945,13 @@ def main():
     args = ap.parse_args()
     if args.workers < 1:
         ap.error("--workers must be at least 1")
+    if args.root is not None:
+        if args.exit is None:
+            ap.error("--root needs --exit (the exit the root belongs to)")
+        root = ",".join(t for t in re.split(r"[\s,]+", args.root.strip().upper()) if t)
+        if not root or not SEED_RE.match(root):
+            ap.error("--root must be a move path like R2,D2,L2,L2")
+        args.root = root
 
     vol = Volunteer(args)
     vol.install_signals()

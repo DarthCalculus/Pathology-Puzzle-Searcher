@@ -1239,7 +1239,32 @@ PY
   stop_server; done_test 120
 }
 
-ALL="a b c d e f g h i j k l m n o p q r s t u v w x y z pw ui bg"
+test_rt() {
+  say "test rt: --root (with --exit): that root's jobs first; refused or replaced cleanly"
+  start_server 8 60 4 --exits 0 || return
+  local root; root=$(aq "a['root_seeds'][3][1]")
+  "$PY" "$HERE/volunteer.py" --name Tester --server "$SERVER" --worker "$HERE/fake_worker.py" --root "$root" --no-ui >/dev/null 2>"$TMP/rt0.log"; rc=$?
+  [ "$rc" = 2 ] && grep -q "needs --exit" "$TMP/rt0.log" && ok "--root without --exit is refused" || bad "rc $rc: $(tail -1 "$TMP/rt0.log")"
+  FAKE_MIN_S=20 FAKE_MAX_S=30 start_client rt.log --workers 1 --no-browser --exit 0 --root "$(echo "$root" | tr 'A-Z' 'a-z')" || return
+  wait_log rt.log "worker 0: job [0-9]+ exit 0 window .* seed $root\$" 20 && ok "the first job is the root itself ($root)" || bad "first job: $(grep 'worker 0: job' "$TMP/rt.log" | head -1)"
+  [ "$(stat root_leases)" -ge 1 ] && ok "the server counted a lease under the root" || bad "no root lease counted"
+  [ "$(state_field "s['root_pref']")" = "$root" ] && ok "the panel shows the root preference" || bad "panel root_pref $(state_field "s['root_pref']")"
+  sec=$(ui_secret "$UPORT")
+  http_post "http://127.0.0.1:$UPORT/exit" '{"exit": "root"}' "$sec" >/dev/null
+  [ "$(state_field "s['root_pref']")" = "$root" ] && ok "picking the root entry keeps it" || bad "the root entry dropped it"
+  http_post "http://127.0.0.1:$UPORT/exit" '{"exit": 0}' "$sec" >/dev/null
+  [ "$(state_field "s['root_pref']")" = "None" ] && ok "any other choice replaces the root preference" || bad "root_pref still $(state_field "s['root_pref']")"
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 30; CLIENT_PID=""
+  rm -rf "$TMP/outbox"
+  FAKE_MIN_S=20 FAKE_MAX_S=30 start_client rt2.log --workers 1 --no-ui --exit 0 --root U3,U3,U3,U3,U3,U3,U3,U3 || return
+  wait_log rt2.log "refused root" 20 && ok "an unknown root is refused and dropped" || bad "no refusal logged"
+  wait_log rt2.log "worker 0: job [0-9]+ exit 0" 20 && ok "the client then works on the exit" || bad "no job after the refusal"
+  kill -INT "$CLIENT_PID"; wait_rc "$CLIENT_PID" 30; CLIENT_PID=""
+  no_bang rt.log
+  stop_server; done_test 90
+}
+
+ALL="a b c d e f g h i j k l m n o p q r s t u v w x y z pw ui bg rt"
 which="${*:-all}"
 [ "$which" = all ] && which="$ALL"
 start=$(date +%s)

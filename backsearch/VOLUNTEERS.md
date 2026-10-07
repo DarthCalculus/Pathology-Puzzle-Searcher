@@ -75,7 +75,10 @@ without opening it).
   The panel says when the campaign limits the number.
 * **Exit**: choose which exit position to work on, or leave "Any exit". It
   applies to the next lease; if that exit has no open jobs, the client takes
-  jobs of other exits and says so.
+  jobs of other exits and says so. To work on one root of an exit (a bar of the
+  site's "Longest level per root" chart, whose box shows its exit and moves),
+  start the client with `--exit 14 --root R2,D2,L2,L2`; choosing anything else in
+  the panel replaces it.
 * **Big jobs** (client 3.2.0): a few jobs need more solver memory than an
   ordinary worker allows. The first time one runs out, the server turns it into
   a *big job*, which only a machine with the big worker gets. If you have 8 GB

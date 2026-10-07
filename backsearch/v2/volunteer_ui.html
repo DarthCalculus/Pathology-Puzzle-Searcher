@@ -365,7 +365,7 @@ $('workers').addEventListener('blur', () => {
 $('applyWorkers').onclick = applyWorkers;
 $('exitSel').addEventListener('focus', () => { exitEditing = true; });
 $('exitSel').addEventListener('blur', () => { exitEditing = false; });
-$('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; const r = await post('/exit', { exit: v === '' ? null : v === 'big' ? 'big' : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
+$('exitSel').addEventListener('change', async () => { const v = $('exitSel').value; if (v === 'root') { exitEditing = false; return; } const r = await post('/exit', { exit: v === '' ? null : v === 'big' ? 'big' : Number(v) }); if (r && r.error) alert(r.error); exitEditing = false; });
 $('pauseBtn').onclick = () => { hold('pauseBtn'); post('/pause'); };
 $('resumeBtn').onclick = () => { hold('resumeBtn'); post('/resume'); };
 $('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands back its remaining work (seconds), then the client exits.')) { hold('stopBtn'); post('/stop'); } };
@@ -373,7 +373,7 @@ $('stopBtn').onclick = () => { if (confirm('Stop the client? Each worker hands b
 function renderExitSelector(st) {
   const exits = Array.isArray(st.campaign_exits) ? st.campaign_exits : Object.keys(st.exits || {}).map(Number);
   const big = st.big || {};
-  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open, x.exact]; })) + '|' + [big.available, big.ready, big.waiting].join(',');
+  const key = exits.join(',') + '|' + JSON.stringify(exits.map(e => { const x = (st.exits || {})[String(e)] || {}; return [x.roots_covered, x.roots, x.open, x.exact]; })) + '|' + [big.available, big.ready, big.waiting].join(',') + '|' + (st.root_pref || '') + '|' + st.exit_pref;
   if (key !== exitOptions && !exitEditing) {
     exitOptions = key;
     const sel = $('exitSel'); sel.innerHTML = '<option value="">Any exit</option>';
@@ -383,13 +383,18 @@ function renderExitSelector(st) {
       o.textContent = x ? `Exit ${e} — ${x.roots_covered ?? '?'}/${x.roots ?? '?'} roots covered, ${x.open} open${x.open === 0 ? ' (no open jobs)' : ''}` : `Exit ${e}`;
       sel.appendChild(o);
     }
+    if (st.root_pref && st.exit_pref != null) {   // --root (with --exit): shown while it holds; any other choice replaces it
+      const o = document.createElement('option'); o.value = 'root';
+      o.textContent = `Exit ${st.exit_pref}, root ${st.root_pref}`;
+      sel.appendChild(o);
+    }
     if (big.available) {       // big jobs: only with the big worker (build_pgo.sh --big)
       const o = document.createElement('option'); o.value = 'big';
       o.textContent = big.ready ? `Big jobs — ${big.waiting == null ? 'none known yet' : big.waiting + ' waiting'} (one per ${big.equiv || 10} workers, alone)` : 'Big jobs (the campaign does not accept this big worker)';
       sel.appendChild(o);
     }
   }
-  if (!exitEditing) $('exitSel').value = big.on ? 'big' : st.exit_pref == null ? '' : String(st.exit_pref);
+  if (!exitEditing) $('exitSel').value = big.on ? 'big' : st.root_pref && st.exit_pref != null ? 'root' : st.exit_pref == null ? '' : String(st.exit_pref);
 }
 
 /* the top banner: completion first (the feature the volunteer must not miss), then stop / pause states */
@@ -436,6 +441,8 @@ function render(st) {
     setText(fb, !bg.ready ? 'Big jobs are selected, but the campaign does not accept this big worker as a big build, so this client runs ordinary jobs.'
       : bg.here ? `Running big job(s) on the big worker: the other workers wait, because a big job can use about ${bg.equiv || 10} workers' memory (up to ~5 GB). ${bg.waiting ?? '?'} more waiting on the server.`
       : `Big jobs preferred: ${bg.waiting ? bg.waiting + ' waiting on the server; the next lease takes one (running windows hand back their work first, at most every 10 minutes).' : 'none waiting right now, so this client runs ordinary jobs and checks again at every lease.'}`);
+  } else if (st.root_pref && st.root_fallback) {
+    fb.hidden = false; setText(fb, `Root ${st.root_pref} of exit ${st.exit_pref} had no open jobs at the last lease, so this client also took other jobs. Your preference stays and is tried again at every lease.`);
   } else if (st.exit_pref != null && st.exit_fallback && !st.exit_pending) {
     fb.hidden = false; setText(fb, `Exit ${st.exit_pref} had no open jobs at the last lease, so this client got jobs of other exits. Your preference stays and is tried again at every lease.`);
   } else fb.hidden = true;
